@@ -1,0 +1,49 @@
+{
+  "name": "@t3tools/provider-pi-native",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    "./catalog": {
+      "types": "./src/catalog/index.ts",
+      "import": "./src/catalog/index.ts"
+    },
+    "./client": {
+      "types": "./src/client.ts",
+      "import": "./src/client.ts"
+    },
+    "./settings": {
+      "types": "./src/settings.ts",
+      "import": "./src/settings.ts"
+    },
+    "./server": {
+      "types": "./src/server.ts",
+      "import": "./src/server.ts"
+    },
+    "./testing": {
+      "types": "./src/testing.ts",
+      "import": "./src/testing.ts"
+    }
+  },
+  "scripts": {
+    "typecheck": "effect-tsgo tsrs --noEmit",
+    "test": "vp test run --config ../../vite.config.ts --dir ."
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "1.6.0",
+    "@earendil-works/pi-ai": "1.6.0",
+    "@earendil-works/pi-schema": "1.6.0",
+    "@t3tools/contracts": "workspace:*",
+    "@t3tools/provider-core": "workspace:*",
+    "@t3tools/shared": "workspace:*",
+    "effect": "catalog:",
+    "undici": "catalog:"
+  },
+  "devDependencies": {
+    "@effect/platform-node": "catalog:",
+    "@effect/vitest": "catalog:",
+    "@t3tools/provider-testing": "workspace:*",
+    "@types/node": "catalog:",
+    "vite-plus": "catalog:"
+  }
+}
