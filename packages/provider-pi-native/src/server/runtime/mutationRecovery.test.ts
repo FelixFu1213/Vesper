@@ -12,29 +12,30 @@ const patchReason = (command: string): string | undefined => {
 const isPatch = (command: string): boolean => detectShellFilePatch(command).isPatch;
 
 describe("MutationRecoveryTracker", () => {
-  it("grants one free retry for the first recoverable failure", () => {
+  it("grants one free retry per recoverable code", () => {
     const tracker = new MutationRecoveryTracker();
     expect(MAX_STRIKES).toBe(3);
 
     const state = tracker.recordFailure(file, "EDIT_TAG_MISMATCH");
     expect(state).toMatchObject({ strikes: 0, freeRetryUsed: true, hardStop: false });
     expect(state.message).toContain("One free retry");
+
+    const other = tracker.recordFailure(file, "EDIT_LINES_UNSEEN");
+    expect(other).toMatchObject({ strikes: 0, hardStop: false });
   });
 
-  it("counts strikes after the free retry and hard-stops at three", () => {
+  it("counts strikes after a code's free retry and hard-stops at three", () => {
     const tracker = new MutationRecoveryTracker();
-    tracker.recordFailure(file, "EDIT_LINES_UNSEEN");
+    tracker.recordFailure(file, "EDIT_TAG_MISMATCH");
 
-    const second = tracker.recordFailure(file, "EDIT_LINES_UNSEEN");
-    expect(second).toMatchObject({ strikes: 1, hardStop: false });
+    const first = tracker.recordFailure(file, "EDIT_TAG_MISMATCH");
+    expect(first).toMatchObject({ strikes: 1, hardStop: false });
 
-    const third = tracker.recordFailure(file, "EDIT_TAG_UNKNOWN");
-    expect(third).toMatchObject({ strikes: 2, hardStop: false });
-
-    const fourth = tracker.recordFailure(file, "EDIT_TAG_MISMATCH");
-    expect(fourth).toMatchObject({ strikes: 3, hardStop: true });
-    expect(fourth.message).toContain("Stop mutating");
-    expect(fourth.message).toContain("ask the user");
+    tracker.recordFailure(file, "EDIT_PARSE_FAILED");
+    const stopped = tracker.recordFailure(file, "EDIT_RANGE_INVALID");
+    expect(stopped).toMatchObject({ strikes: 3, hardStop: true });
+    expect(stopped.message).toContain("Stop mutating");
+    expect(stopped.message).toContain("ask the user");
 
     const fifth = tracker.recordFailure(file, "EDIT_TAG_MISMATCH");
     expect(fifth).toMatchObject({ strikes: 3, hardStop: true });
@@ -49,7 +50,7 @@ describe("MutationRecoveryTracker", () => {
     expect(unlabelled.strikes).toBe(2);
   });
 
-  it("resets strikes and the free retry after a success", () => {
+  it("resets strikes and every per-code grace after a success", () => {
     const tracker = new MutationRecoveryTracker();
     tracker.recordFailure(file, "EDIT_TAG_MISMATCH");
     tracker.recordFailure(file, "EDIT_TAG_MISMATCH");

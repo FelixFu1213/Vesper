@@ -158,6 +158,10 @@ describe("read-only tools", () => {
         await expect(test.evaluate("TodoRead", {})).resolves.toMatchObject({
           allowed: true,
         });
+        await expect(test.evaluate("Skill", { id: "review" })).resolves.toMatchObject({
+          allowed: true,
+          risk: "read",
+        });
         expect(test.requests).toHaveLength(0);
       }
       const planMode = harness({ workspace, attachments, interactionMode: "plan" });
@@ -330,6 +334,7 @@ describe("plan mode", () => {
         true,
       );
       expect((await test.evaluate("Task", { prompt: "look around" })).allowed).toBe(true);
+      expect((await test.evaluate("Skill", { id: "review" })).allowed).toBe(true);
       expect((await test.evaluate("mcp__t3-code__list_threads", {})).allowed).toBe(true);
 
       const write = await test.evaluate("Write", { path: inWorkspace(workspace, "a.ts") });

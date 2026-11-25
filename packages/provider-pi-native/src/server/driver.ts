@@ -18,6 +18,7 @@ import * as Schema from "effect/Schema";
 
 import { PiNativeSettings } from "../settings.ts";
 import { type PiNativeAdapterV2DriverEnv, PiNativeAdapterV2Driver } from "./adapter.ts";
+import { discoverPiNativeSkills } from "./runtime/skillsDiscovery.ts";
 import {
   buildInitialPiNativeProviderSnapshot,
   checkPiNativeProviderStatus,
@@ -102,6 +103,11 @@ export const PiNativeDriver: ProviderDriver<PiNativeSettings, PiNativeDriverEnv>
       ),
     );
     const textGeneration = yield* makePiNativeTextGeneration(effectiveConfig);
+    // The instance's own environment decides HOME, so a configured provider home wins.
+    const discoveryEnvironment: NodeJS.ProcessEnv = {
+      ...process.env,
+      ...Object.fromEntries(environment.map((entry) => [entry.name, entry.value])),
+    };
 
     return {
       instanceId,
@@ -111,6 +117,22 @@ export const PiNativeDriver: ProviderDriver<PiNativeSettings, PiNativeDriverEnv>
       accentColor,
       enabled,
       snapshot,
+      // The `$` composer menu is workspace-scoped, so project and user skills are
+      // discovered per cwd instead of living in the machine snapshot.
+      snapshotForCwd: (cwd) =>
+        !effectiveConfig.enabled
+          ? snapshot.getSnapshot
+          : Effect.all([
+              snapshot.getSnapshot,
+              Effect.promise(() =>
+                discoverPiNativeSkills({ cwd, environment: discoveryEnvironment }),
+              ),
+            ]).pipe(
+              Effect.map(([machineSnapshot, discovery]) => ({
+                ...machineSnapshot,
+                skills: [...discovery.serverSkills],
+              })),
+            ),
       orchestrationAdapter,
       textGeneration,
     } satisfies ProviderInstance;
