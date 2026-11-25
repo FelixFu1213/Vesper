@@ -884,6 +884,69 @@ describe("NativePiSessionRuntime", () => {
   });
 });
 
+/** Request-only reminders never reach the transcript, so they are counted in the request. */
+const reminderMessages = (messages: ReadonlyArray<{ readonly content?: unknown }>): number =>
+  messages.filter((message) => {
+    const content = message.content;
+    return typeof content === "string"
+      ? content.includes("<context_budget>")
+      : JSON.stringify(content ?? "").includes("<context_budget>");
+  }).length;
+
+describe("NativePiSessionRuntime context budget", () => {
+  it("reminds the model once per checkpoint window and not again on the next turn", async () => {
+    const harness = await makeRuntime({
+      settings: settings({
+        modelBindings: [
+          {
+            id: "default",
+            contextWindow: 20_000,
+            maxTokens: 2_000,
+            thinkingLevels: [],
+            defaultThinkingLevel: null,
+          },
+        ],
+      }),
+      steps: [scriptedTextResponse("one"), scriptedTextResponse("two")],
+    });
+
+    await harness.runtime.runTurn({ text: "a".repeat(4 * 4_000) });
+    const first = harness.streamFn.calls[0]?.context.messages ?? [];
+    assert.equal(reminderMessages(first), 1);
+
+    await harness.runtime.runTurn({ text: "again" });
+    const second = harness.streamFn.calls[1]?.context.messages ?? [];
+    assert.equal(reminderMessages(second), 0);
+    await harness.runtime.dispose();
+  });
+
+  it("reports why a compaction summary was abandoned", async () => {
+    const harness = await makeRuntime({
+      settings: settings({ autoCompact: true }),
+      steps: [
+        scriptedErrorResponse("prompt is too long: 250000 tokens > 200000 maximum"),
+        scriptedTextResponse("I could not summarize this conversation."),
+        scriptedTextResponse("recovered answer"),
+      ],
+    });
+
+    const outcome = await harness.runtime.runTurn({ text: "start" });
+    assert.equal(outcome.status, "completed");
+    assert.deepStrictEqual(streamTexts(harness.events), ["recovered answer"]);
+
+    const completed = harness.events.filter(
+      (event) => event.type === "compaction" && event.status === "completed",
+    );
+    assert.isAbove(completed.length, 0);
+    const reason = completed.at(-1);
+    assert.include(
+      reason?.type === "compaction" ? (reason.failureReason ?? "") : "",
+      "no recognizable sections",
+    );
+    await harness.runtime.dispose();
+  });
+});
+
 describe("parseCompactionSummary", () => {
   it("reads the five sections of a summary block", () => {
     const parsed = parseCompactionSummary(
