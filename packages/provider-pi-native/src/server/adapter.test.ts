@@ -92,8 +92,15 @@ const gatedStream = () => {
   }> = [];
   const queued: ScriptedTurn[] = [];
   let requests = 0;
+  let resolveFirstRequest: () => void = () => undefined;
+  // The adapter owns no runtime until its first provider request, and a steer sent
+  // before that is declined, so a test that steers waits for this.
+  const firstRequest = new Promise<void>((resolve) => {
+    resolveFirstRequest = resolve;
+  });
   const streamFn: StreamFn = (model) => {
     requests += 1;
+    resolveFirstRequest();
     const stream = createAssistantMessageEventStream();
     const turn = queued.shift();
     if (turn === undefined) waiting.push({ model, stream });
@@ -102,6 +109,7 @@ const gatedStream = () => {
   };
   return {
     streamFn,
+    firstRequest,
     requestCount: () => requests,
     release: (turn: ScriptedTurn) => {
       const next = waiting.shift();
@@ -662,6 +670,7 @@ describe("makePiNativeAdapterV2", () => {
         "provider_turn.updated",
         (event) => event.providerTurn.status === "running",
       );
+      yield* Effect.promise(() => gated.firstRequest);
       yield* harness.runtime.steerTurn({
         threadId,
         runId: RunId.make("run-1"),
@@ -1095,6 +1104,49 @@ describe("makePiNativeAdapterV2", () => {
     }).pipe(Effect.provide(testLayer())),
   );
 
+  it.effect("tracks a background Bash job as pending work and stops it by native id", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        steps: [
+          scriptedToolCallResponse([
+            { name: "Bash", arguments: { command: "sleep 30", runInBackground: true } },
+          ]),
+          scriptedTextResponse("job started"),
+        ],
+      });
+      yield* startTurnOn(harness);
+      const terminal = yield* harness.takeEvent("turn.terminal");
+      assert.equal(terminal.status, "completed");
+
+      assert.isTrue(yield* harness.runtime.hasPendingBackgroundWork!);
+      assert.isTrue(
+        yield* harness.runtime.hasPendingBackgroundWorkForThread!(harness.providerThread, {
+          includeSubagents: false,
+        }),
+      );
+      // Reading `all` is deterministic: the pending event precedes the turn terminal.
+      const pending = harness.all.flatMap((event) =>
+        event.type === "background_work.updated" ? [event.pending] : [],
+      );
+      assert.deepEqual(pending, [true]);
+
+      const unknown = yield* harness.runtime.stopSubagent!({
+        providerThread: harness.providerThread,
+        nativeTaskId: "bash:bash-404",
+      });
+      assert.isUndefined(unknown);
+
+      const stopped = yield* harness.runtime.stopSubagent!({
+        providerThread: harness.providerThread,
+        nativeTaskId: "bash:bash-1",
+      });
+      assert.equal(stopped?.status, "cancelled");
+      const settled = yield* harness.takeEvent("background_work.updated");
+      assert.isFalse(settled.pending);
+      assert.isFalse(yield* harness.runtime.hasPendingBackgroundWork!);
+    }).pipe(Effect.provide(testLayer())),
+  );
+
   it.effect("reports the resolved model on the provider turn and passes app context through", () =>
     Effect.gen(function* () {
       const streamFn = createScriptedStreamFn([scriptedTextResponse("context seen")], {
@@ -1357,6 +1409,75 @@ describe("makePiNativeAdapterV2", () => {
       assert.equal(requests[1]?.reasoning, undefined);
       assert.equal(requests[2]?.reasoning, "high");
       assert.equal(requests[3]?.reasoning, undefined);
+    }).pipe(Effect.provide(testLayer())),
+  );
+
+  it.effect("loads /skill:<id> for its turn and rejects a skill the workspace lacks", () =>
+    Effect.gen(function* () {
+      const cwd = yield* Effect.promise(makeWorkspace);
+      const folder = NodePath.join(cwd, ".agents", "skills", "review");
+      yield* Effect.promise(async () => {
+        await NodeFSP.mkdir(folder, { recursive: true });
+        await NodeFSP.writeFile(
+          NodePath.join(folder, "SKILL.md"),
+          "---\nname: Review\ndescription: Reviews changes\n---\n\nRead the diff first.\n",
+          "utf8",
+        );
+      });
+      const requests: Array<{ readonly text: string; readonly activation: string | null }> = [];
+      const streamFn: StreamFn = async (model, context) => {
+        const user = context.messages.filter((message) => message.role === "user").at(-1);
+        const last = context.messages.filter((message) => message.role === "system").at(-1);
+        const sections =
+          last !== undefined && typeof last === "object" && "sections" in last
+            ? ((last as { readonly sections?: Record<string, string | null> }).sections ?? {})
+            : {};
+        requests.push({
+          text:
+            user !== undefined && typeof user.content === "string"
+              ? user.content
+              : JSON.stringify(user?.content ?? ""),
+          activation: sections["tool_activation"] ?? null,
+        });
+        return renderScriptedTurn(model, scriptedTextResponse("done"), 0);
+      };
+      const harness = yield* makeHarness({
+        streamFn,
+        cwd,
+        policy: runtimePolicy({ cwd }),
+      });
+
+      yield* startTurnWithText(harness, 1, "/skill:review check main");
+      assert.equal((yield* harness.takeEvent("turn.terminal")).status, "completed");
+      assert.equal(requests[0]?.text, "check main");
+      assert.match(requests[0]?.activation ?? "", /<skill_content id="review"/u);
+      assert.match(requests[0]?.activation ?? "", /Read the diff first\./u);
+
+      yield* startTurnWithText(harness, 2, "/skill:missing");
+      assert.equal((yield* harness.takeEvent("turn.terminal")).status, "completed");
+      // The catalog also carries the machine's user skills, so only its shape is fixed.
+      assert.isTrue(
+        assistantTexts(harness).some(
+          (text) =>
+            text.startsWith('Unknown skill "missing". Available skills: ') &&
+            text.includes("review"),
+        ),
+      );
+
+      // A skill added to the workspace mid-session works immediately on `/skill:<id>`.
+      const dynamicDir = NodePath.join(cwd, ".agents", "skills", "dynamic");
+      yield* Effect.promise(async () => {
+        await NodeFSP.mkdir(dynamicDir, { recursive: true });
+        await NodeFSP.writeFile(
+          NodePath.join(dynamicDir, "SKILL.md"),
+          "---\nname: Dynamic\n---\n\nDynamic body.\n",
+          "utf8",
+        );
+      });
+      yield* startTurnWithText(harness, 3, "/skill:dynamic run now");
+      assert.equal((yield* harness.takeEvent("turn.terminal")).status, "completed");
+      assert.match(requests[1]?.activation ?? "", /<skill_content id="dynamic"/u);
+      assert.match(requests[1]?.activation ?? "", /Dynamic body\./u);
     }).pipe(Effect.provide(testLayer())),
   );
 });

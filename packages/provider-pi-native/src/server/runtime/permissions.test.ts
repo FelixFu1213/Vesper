@@ -70,6 +70,7 @@ const harness = (
   options: {
     readonly workspace: string;
     readonly attachments: string;
+    readonly scratch?: string;
   } & EngineOptions,
 ): EngineHarness => {
   const requests: Array<ToolApprovalRequest> = [];
@@ -86,6 +87,7 @@ const harness = (
     sandbox: new WorkspaceSandbox({
       cwd: options.workspace,
       readOnlyRoots: [options.attachments],
+      ...(options.scratch === undefined ? {} : { scratchRoots: [options.scratch] }),
     }),
     requestApproval: async (request) => {
       requests.push(request);
@@ -155,6 +157,10 @@ describe("read-only tools", () => {
         });
         await expect(test.evaluate("TodoRead", {})).resolves.toMatchObject({
           allowed: true,
+        });
+        await expect(test.evaluate("Skill", { id: "review" })).resolves.toMatchObject({
+          allowed: true,
+          risk: "read",
         });
         expect(test.requests).toHaveLength(0);
       }
@@ -328,6 +334,7 @@ describe("plan mode", () => {
         true,
       );
       expect((await test.evaluate("Task", { prompt: "look around" })).allowed).toBe(true);
+      expect((await test.evaluate("Skill", { id: "review" })).allowed).toBe(true);
       expect((await test.evaluate("mcp__t3-code__list_threads", {})).allowed).toBe(true);
       expect((await test.evaluate("ToolSearch", { query: "SubmitPlan" })).allowed).toBe(true);
 
@@ -356,6 +363,60 @@ describe("attachments", () => {
       expect(decision.allowed).toBe(false);
       expect(decision.reason).toContain("read-only");
       expect(test.requests).toHaveLength(0);
+    });
+  });
+});
+
+describe("session scratch", () => {
+  it("auto-allows scratch writes without a prompt outside plan mode", async () => {
+    await withDirectories(async ({ workspace, attachments, outside }) => {
+      const target = NodePath.join(outside, "draft.ts");
+      for (const runtimeMode of ["approval-required", "auto-accept-edits", "auto"] as const) {
+        const test = harness({
+          workspace,
+          attachments,
+          scratch: outside,
+          runtimeMode,
+          decisions: ["decline"],
+        });
+        for (const toolName of ["Write", "Edit"]) {
+          const decision = await test.evaluate(toolName, { path: target });
+          expect(decision.allowed).toBe(true);
+          expect(decision.risk).toBe("file_edit");
+        }
+        expect(test.requests).toHaveLength(0);
+      }
+    });
+  });
+
+  it("still denies scratch writes in plan mode", async () => {
+    await withDirectories(async ({ workspace, attachments, outside }) => {
+      const test = harness({
+        workspace,
+        attachments,
+        scratch: outside,
+        interactionMode: "plan",
+        runtimeMode: "full-access",
+        decisions: ["accept"],
+      });
+      const decision = await test.evaluate("Write", { path: NodePath.join(outside, "draft.ts") });
+      expect(decision.allowed).toBe(false);
+      expect(decision.reason).toContain("Plan mode is read-only");
+      expect(test.requests).toHaveLength(0);
+    });
+  });
+
+  it("keeps reads of scratch paths available in plan mode", async () => {
+    await withDirectories(async ({ workspace, attachments, outside }) => {
+      const test = harness({
+        workspace,
+        attachments,
+        scratch: outside,
+        interactionMode: "plan",
+      });
+      const decision = await test.evaluate("Read", { path: NodePath.join(outside, "draft.ts") });
+      expect(decision.allowed).toBe(true);
+      expect(decision.risk).toBe("read");
     });
   });
 });

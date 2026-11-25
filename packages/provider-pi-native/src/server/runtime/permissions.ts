@@ -35,6 +35,7 @@ const PLAN_MODE_ALLOWED_TOOLS: ReadonlySet<string> = new Set([
   "Read",
   "Glob",
   "Grep",
+  "Skill",
   "asktool",
   "SubmitPlan",
   "UpdateGoalStatus",
@@ -52,6 +53,7 @@ const READ_ONLY_TOOL_NAMES: ReadonlySet<string> = new Set([
   "Read",
   "Glob",
   "Grep",
+  "Skill",
   "TodoWrite",
   "TodoRead",
   "SubmitPlan",
@@ -347,6 +349,11 @@ export class PermissionEngine {
           `Plan mode is read-only: ${toolName} cannot run until the plan is approved, and it was not sent for approval.`,
         );
       }
+    }
+
+    // Scratch writes cannot touch the project; the resolver still runs above.
+    if ((toolName === "Write" || toolName === "Edit") && resolution?.classification === "scratch") {
+      return allow("file_edit", "Session scratch files are outside the project.");
     }
 
     const readOnly = READ_ONLY_TOOL_NAMES.has(toolName) || mcpReadOnly;

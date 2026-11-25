@@ -95,6 +95,23 @@ describe("Pi Native presentation", () => {
     }),
   );
 
+  it.effect("publishes the workspace skills it was given", () =>
+    Effect.gen(function* () {
+      const draft = yield* checkPiNativeProviderStatus(settings({ apiKey: "sk-test" }), {
+        skills: [
+          {
+            name: "review",
+            displayName: "Review",
+            path: "/tmp/app/.agents/skills/review/SKILL.md",
+            scope: "project",
+            enabled: true,
+          },
+        ],
+      });
+      expect(draft.skills.map((skill) => skill.name)).toEqual(["review"]);
+    }),
+  );
+
   it.effect("builds an initial snapshot without probing anything", () =>
     Effect.gen(function* () {
       const draft = yield* buildInitialPiNativeProviderSnapshot(settings());
