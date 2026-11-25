@@ -1408,6 +1408,21 @@ describe("makePiNativeAdapterV2", () => {
             text.includes("review"),
         ),
       );
+
+      // A skill added to the workspace mid-session works immediately on `/skill:<id>`.
+      const dynamicDir = NodePath.join(cwd, ".agents", "skills", "dynamic");
+      yield* Effect.promise(async () => {
+        await NodeFSP.mkdir(dynamicDir, { recursive: true });
+        await NodeFSP.writeFile(
+          NodePath.join(dynamicDir, "SKILL.md"),
+          "---\nname: Dynamic\n---\n\nDynamic body.\n",
+          "utf8",
+        );
+      });
+      yield* startTurnWithText(harness, 3, "/skill:dynamic run now");
+      assert.equal((yield* harness.takeEvent("turn.terminal")).status, "completed");
+      assert.match(requests[1]?.activation ?? "", /<skill_content id="dynamic"/u);
+      assert.match(requests[1]?.activation ?? "", /Dynamic body\./u);
     }).pipe(Effect.provide(testLayer())),
   );
 });

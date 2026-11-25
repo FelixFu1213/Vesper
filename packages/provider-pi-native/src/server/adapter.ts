@@ -1720,33 +1720,40 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
           ? null
           : parsePiNativeWorkflowCommand(turn.input.message.text);
         // `/skill:<id>` loads that skill for the turn; a `$<id>` mention does the same in the runtime.
-        const skillCommand = continuation
+        let resolvedSkillCommand = continuation
           ? null
           : parsePiNativeSkillCommand(turn.input.message.text);
-        if (skillCommand !== null) {
-          const available = runtime.skills
-            .filter((skill) => skill.enabled)
-            .map((skill) => skill.id)
-            .sort((left, right) => left.localeCompare(right));
-          if (!available.includes(skillCommand.skillId)) {
+        if (resolvedSkillCommand !== null) {
+          await runtime.refreshSkills();
+          const enabled = runtime.skills.filter((skill) => skill.enabled);
+          const matched =
+            enabled.find((skill) => skill.id === resolvedSkillCommand?.skillId) ??
+            enabled.find(
+              (skill) => skill.id.toLowerCase() === resolvedSkillCommand?.skillId.toLowerCase(),
+            );
+          if (matched === undefined) {
+            const available = enabled
+              .map((skill) => skill.id)
+              .sort((left, right) => left.localeCompare(right));
             emitDirectAssistantReply(
               turn,
               available.length === 0
-                ? `Unknown skill "${skillCommand.skillId}". No skills are installed for this workspace.`
-                : `Unknown skill "${skillCommand.skillId}". Available skills: ${available.join(", ")}.`,
+                ? `Unknown skill "${resolvedSkillCommand.skillId}". No skills are installed for this workspace.`
+                : `Unknown skill "${resolvedSkillCommand.skillId}". Available skills: ${available.join(", ")}.`,
             );
             await finishTurn(turn, { status: "completed", failure: null, outputTruncated: false });
             return;
           }
+          resolvedSkillCommand = { ...resolvedSkillCommand, skillId: matched.id };
         }
         const text = await Effect.runPromiseWith(services)(
           providerMessageTextWithAttachmentPaths({
             text:
-              skillCommand === null
+              resolvedSkillCommand === null
                 ? (workflowCommand?.promptText ?? turn.input.message.text)
-                : skillCommand.args === ""
-                  ? `Use the ${skillCommand.skillId} skill for this task.`
-                  : skillCommand.args,
+                : resolvedSkillCommand.args === ""
+                  ? `Use the ${resolvedSkillCommand.skillId} skill for this task.`
+                  : resolvedSkillCommand.args,
             attachments: turn.input.message.attachments,
             resolveAttachmentPath: hostService.resolveAttachmentPath,
             ...(hostService.resolveExtractedTextPath === undefined
@@ -1779,7 +1786,7 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
                 workflowDirective: workflowCommand.systemDirective,
                 boostThinking: workflowCommand.boostThinking,
               }),
-          ...(skillCommand === null ? {} : { skillIds: [skillCommand.skillId] }),
+          ...(resolvedSkillCommand === null ? {} : { skillIds: [resolvedSkillCommand.skillId] }),
         });
         await finishTurn(turn, outcome);
       } catch (cause) {

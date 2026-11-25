@@ -88,17 +88,21 @@ const byUnambiguousName = (
 export const loadPiNativeSkill = async (
   skills: ReadonlyArray<PiNativeSkillDef>,
   requested: string,
+  options?: { readonly allowModelDisabled?: boolean | undefined },
 ): Promise<PiNativeSkillLoadResult> => {
   const wanted = requested.trim();
-  const available = availableSkillIds(skills);
+  const eligible = skills.filter(
+    (skill) =>
+      skill.enabled && (options?.allowModelDisabled === true || !skill.disableModelInvocation),
+  );
+  const available = availableSkillIds(eligible);
   if (wanted === "") {
     return { ok: false, message: "A skill id is required.", available };
   }
-  const enabled = skills.filter((skill) => skill.enabled);
   const skill =
-    enabled.find((candidate) => candidate.id === wanted) ??
-    enabled.find((candidate) => candidate.id.toLowerCase() === wanted.toLowerCase()) ??
-    byUnambiguousName(enabled, wanted);
+    eligible.find((candidate) => candidate.id === wanted) ??
+    eligible.find((candidate) => candidate.id.toLowerCase() === wanted.toLowerCase()) ??
+    byUnambiguousName(eligible, wanted);
   if (skill === undefined) {
     return { ok: false, message: `Unknown skill "${wanted}".`, available };
   }

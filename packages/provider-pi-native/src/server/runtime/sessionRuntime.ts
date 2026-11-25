@@ -1045,7 +1045,8 @@ export class NativePiSessionRuntime {
     });
     return {
       ...sections,
-      // Explicitly null out cleared tool_activation so SystemTranscriptManager emits a reset delta and re-arms future turns.
+      // Explicitly null out cleared skills / tool_activation so revoking the last skill clears the header too.
+      skills: sections.skills ?? null,
       tool_activation: sections.tool_activation ?? null,
     };
   }
@@ -1064,7 +1065,7 @@ export class NativePiSessionRuntime {
     ];
     const documents: Array<string> = [];
     for (const id of requested) {
-      const loaded = await loadPiNativeSkill(this.#skills, id);
+      const loaded = await loadPiNativeSkill(this.#skills, id, { allowModelDisabled: true });
       if (!loaded.ok) continue;
       documents.push(formatPiNativeSkillContent(loaded.skill, loaded.body));
     }

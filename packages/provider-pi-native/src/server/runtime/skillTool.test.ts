@@ -139,4 +139,25 @@ describe("createSkillTool", () => {
     expect(loaded.ok).toBe(false);
     expect(loaded.ok ? "" : loaded.message).toContain("cannot be read");
   });
+
+  it("blocks model calls to disable-model-invocation skills while allowing explicit user loads", async () => {
+    const { skills } = await catalog({
+      review: "---\nname: Review\n---\n\nModel visible.\n",
+      manual:
+        "---\nname: Manual Only\ndisable-model-invocation: true\n---\n\nUser triggered only.\n",
+    });
+    const tool = createSkillTool({ skills: () => skills });
+
+    const modelAttempt = await run(tool, { id: "manual" });
+    expect(modelAttempt.isError).toBe(true);
+    expect(modelAttempt.details).toEqual({
+      loaded: false,
+      requested: "manual",
+      available: ["review"],
+    });
+
+    const userAttempt = await loadPiNativeSkill(skills, "manual", { allowModelDisabled: true });
+    expect(userAttempt.ok).toBe(true);
+    if (userAttempt.ok) expect(userAttempt.body).toBe("User triggered only.");
+  });
 });
