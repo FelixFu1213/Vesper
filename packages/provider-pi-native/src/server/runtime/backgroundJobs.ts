@@ -95,7 +95,7 @@ export const createHeadTailCapture = (maxBytes: number): StreamCapture => {
       const combined = head + chunk;
       trimmed = true;
       tail = combined.slice(-half);
-      head = combined.slice(0, Math.max(0, combined.length - half));
+      head = combined.slice(0, Math.min(half, Math.max(0, combined.length - half)));
       return;
     }
     tail = (tail + chunk).slice(-half);
@@ -185,6 +185,7 @@ interface JobRecord {
   readonly child: BackgroundJobProcess;
   readonly notifyOnExit: boolean;
   readonly settled: PromiseWithResolvers<BackgroundJobSnapshot>;
+  readonly waiters: Set<() => void>;
   state: BackgroundJobStatus;
   endedAtMs: number | null;
   exitCode: number | null;
@@ -217,7 +218,6 @@ export class BackgroundJobManager {
   readonly #onJobExited: ((snapshot: BackgroundJobSnapshot) => void) | undefined;
   readonly #jobs = new Map<string, JobRecord>();
   readonly #finished: Array<string> = [];
-  readonly #waiters = new Set<() => void>();
   #sequence = 0;
 
   constructor(options: BackgroundJobManagerOptions = {}) {
@@ -261,10 +261,6 @@ export class BackgroundJobManager {
     };
   }
 
-  #notifyWaiters(): void {
-    for (const waiter of this.#waiters) waiter();
-  }
-
   #signal(record: JobRecord, signal: NodeJS.Signals): void {
     const pid = record.child.pid;
     if (pid !== undefined) {
@@ -295,7 +291,8 @@ export class BackgroundJobManager {
     }
     const snapshot = this.#snapshot(record);
     record.settled.resolve(snapshot);
-    this.#notifyWaiters();
+    for (const waiter of record.waiters) waiter();
+    record.waiters.clear();
     this.#onJobUpdated?.(snapshot);
     if (record.notifyOnExit) this.#onJobExited?.(snapshot);
   }
@@ -334,6 +331,7 @@ export class BackgroundJobManager {
       child,
       notifyOnExit: input.notifyOnExit === true,
       settled: Promise.withResolvers<BackgroundJobSnapshot>(),
+      waiters: new Set(),
       state: "running",
       endedAtMs: null,
       exitCode: null,
@@ -378,13 +376,13 @@ export class BackgroundJobManager {
       const finish = (): void => {
         if (finished) return;
         finished = true;
-        this.#waiters.delete(finish);
+        record.waiters.delete(finish);
         if (timer !== undefined) clearTimeout(timer);
         signal?.removeEventListener("abort", finish);
         resolve(this.#snapshot(record));
       };
       let timer: NodeJS.Timeout | undefined;
-      this.#waiters.add(finish);
+      record.waiters.add(finish);
       signal?.addEventListener("abort", finish, { once: true });
       if (timeoutMs <= 0) {
         finish();

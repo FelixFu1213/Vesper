@@ -203,6 +203,28 @@ describe("resolveTurnShell", () => {
     expect(shell.id).toBe("cmd");
     expect(shell.args).toEqual(["/c"]);
   });
+
+  it("allows non-bash Windows shells when T3_PI_BASH is set and honors valid overrides for bash", () => {
+    const powershell = resolveTurnShell({
+      platform: "win32",
+      environment: windowsEnvironment({ T3_PI_BASH: "C:\\Missing\\bash.exe" }),
+      isFile: files(["C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"]),
+    });
+    expect(powershell.id).toBe("windows-powershell");
+
+    const customBash = resolveTurnShell({
+      platform: "win32",
+      configuredId: "bash",
+      environment: windowsEnvironment({ T3_PI_BASH: "C:\\Custom\\bash.exe" }),
+      isFile: files([
+        "C:\\Custom\\bash.exe",
+        "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+      ]),
+    });
+    expect(customBash.id).toBe("bash");
+    expect(customBash.executable).toBe("C:\\Custom\\bash.exe");
+    expect(customBash.args).toEqual(["-c"]);
+  });
 });
 
 describe("probeLoginShellPath", () => {

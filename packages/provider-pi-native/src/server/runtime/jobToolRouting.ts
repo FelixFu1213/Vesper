@@ -219,11 +219,11 @@ export const createJobToolRouting = (deps: JobToolRoutingDeps): JobToolRouting =
       try {
         const snapshot = await manager.wait(job.id, budgetMs, controller.signal);
         const status =
-          controller.signal.aborted || signal?.aborted === true
-            ? "interrupted"
-            : snapshot.state === "running"
-              ? "timeout"
-              : "completed";
+          snapshot.state !== "running"
+            ? "completed"
+            : controller.signal.aborted || signal?.aborted === true
+              ? "interrupted"
+              : "timeout";
         return observation(snapshot, status);
       } finally {
         waitControllers.delete(controller);
@@ -277,14 +277,14 @@ export const createJobToolRouting = (deps: JobToolRoutingDeps): JobToolRouting =
             { stoppedTaskIds: [], subagents: [] },
           );
         }
-        const targets = delegationTargets(params);
+        const targets = [
+          ...new Set([
+            ...(params.taskId === undefined ? [] : [params.taskId]),
+            ...(params.delegationIds ?? []),
+          ]),
+        ];
         if (targets.length === 0) {
-          return await delegates.stop.execute(
-            toolCallId,
-            params.taskId === undefined ? {} : { taskId: params.taskId },
-            signal,
-            onUpdate,
-          );
+          return await delegates.stop.execute(toolCallId, {}, signal, onUpdate);
         }
         const stopped: Array<string> = [];
         const records: unknown[] = [];

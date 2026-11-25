@@ -43,6 +43,7 @@ interface HarnessOptions {
   readonly threadId?: string;
   readonly sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   readonly shell?: PiNativeToolDeps["shell"];
+  readonly resolveShell?: PiNativeToolDeps["resolveShell"];
   readonly maxOutputBytes?: number;
   readonly maxGlobResults?: number;
   readonly onGoalStatusUpdate?: PiNativeToolDeps["onGoalStatusUpdate"];
@@ -87,6 +88,7 @@ const withDirectory = async (body: (make: HarnessFactory) => Promise<void>): Pro
       ...(options.threadId === undefined ? {} : { threadId: options.threadId }),
       ...(options.sleep === undefined ? {} : { sleep: options.sleep }),
       ...(options.shell === undefined ? {} : { shell: options.shell }),
+      ...(options.resolveShell === undefined ? {} : { resolveShell: options.resolveShell }),
       ...(options.scratch === undefined ? {} : { scratch: options.scratch }),
       ...(options.backgroundJobs === undefined ? {} : { backgroundJobs: options.backgroundJobs }),
       ...(options.maxOutputBytes === undefined ? {} : { maxOutputBytes: options.maxOutputBytes }),
@@ -633,6 +635,13 @@ describe("Bash", () => {
         const scratch = new SessionScratchDir({ sessionId: "thread-1", baseRoot: base });
         const harness = make({ scratch, scratchRoots: [scratch.path] });
 
+        const workspaceWrite = await harness.tool("Write").execute("call-0", {
+          path: "workspace-file.txt",
+          content: "workspace",
+        });
+        expect(workspaceWrite.isError).toBeUndefined();
+        expect(scratch.created).toBe(false);
+
         const write = await harness.tool("Write").execute("call-1", {
           path: NodePath.join(scratch.path, "draft.txt"),
           content: "draft",
@@ -648,6 +657,25 @@ describe("Bash", () => {
       } finally {
         await NodeFSP.rm(base, { recursive: true, force: true });
       }
+    });
+  });
+
+  it("prefers explicit shell override over resolveShell", async () => {
+    await withDirectory(async (make) => {
+      const harness = make({
+        shell: { command: process.execPath, args: ["-e"] },
+        resolveShell: () => ({
+          id: "bash",
+          dialect: "posix",
+          executable: "/nonexistent/resolved-shell",
+          args: ["-c"],
+        }),
+      });
+      const result = await harness.tool("Bash").execute("call-1", {
+        command: "process.stdout.write('override-ok')",
+      });
+      expect(result.isError).toBeUndefined();
+      expect(result.details.stdout).toBe("override-ok");
     });
   });
 });

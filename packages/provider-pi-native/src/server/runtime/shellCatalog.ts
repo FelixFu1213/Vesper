@@ -190,6 +190,7 @@ const discoverUnixShells = (
 const discoverWindowsShells = (
   environment: NodeJS.ProcessEnv,
   isFile: (absolute: string) => boolean,
+  override: string | undefined,
 ): {
   readonly executables: Map<CommandShellId, string>;
   readonly searched: ReadonlyArray<string>;
@@ -256,6 +257,10 @@ const discoverWindowsShells = (
     "cmd.exe";
   executables.set("cmd", cmd);
 
+  if (override !== undefined) {
+    searched.push(override);
+    if (isFile(override)) executables.set("bash", override);
+  }
   // A Git Bash install is the same bash users configure explicitly on Windows.
   if (gitBash !== undefined) executables.set("bash", executables.get("bash") ?? gitBash);
   return { executables, searched };
@@ -267,7 +272,7 @@ const discoverShells = (input?: ShellDiscoveryOptions): ShellDiscovery => {
   const isFile = input?.isFile ?? isExecutableFile;
   const bashOverride = nonEmpty(environment.T3_PI_BASH) ?? nonEmpty(environment.PI_DESKTOP_BASH);
   if (platform === "win32") {
-    const discovered = discoverWindowsShells(environment, isFile);
+    const discovered = discoverWindowsShells(environment, isFile, bashOverride);
     return { executables: discovered.executables, bashOverride, searched: discovered.searched };
   }
   const discovered = discoverUnixShells(environment, isFile, bashOverride, platform);
@@ -340,7 +345,7 @@ export const resolveTurnShell = (input?: ResolveTurnShellInput): TurnShell => {
   const discovered = discoverShells(input);
   const requestedId =
     effective?.id ?? catalog.configuredId ?? defaultCommandShellForPlatform(platform);
-  if (discovered.bashOverride !== undefined && requestedId !== "git-bash") {
+  if (discovered.bashOverride !== undefined && requestedId === "bash") {
     const bash = discovered.executables.get("bash");
     if (bash !== discovered.bashOverride) {
       throw Object.assign(

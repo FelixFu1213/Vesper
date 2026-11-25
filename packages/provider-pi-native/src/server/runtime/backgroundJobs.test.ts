@@ -166,6 +166,14 @@ describe("stream captures", () => {
     expect(capture.text().endsWith("ghij")).toBe(true);
   });
 
+  it("caps a large initial chunk to half head and half tail", () => {
+    const capture = createHeadTailCapture(10);
+    capture.push("a".repeat(250) + "b".repeat(250));
+    capture.end();
+    expect(capture.truncated()).toBe(true);
+    expect(capture.text()).toBe(`${"a".repeat(5)}\n\n[output truncated]\n\n${"b".repeat(5)}`);
+  });
+
   it("keeps only the tail of a background stream", () => {
     const capture = createTailCapture(4);
     capture.push("abcdefgh");
@@ -234,6 +242,29 @@ describe("BackgroundJobManager", () => {
     const snapshot = await manager.wait(started.job.id, 1_000, controller.signal);
     expect(snapshot.state).toBe("running");
     expect(spawned[0]?.kills).toEqual([]);
+  });
+
+  it("does not wake a wait when an unrelated background job exits", async () => {
+    const { manager, spawned } = makeManager();
+    const first = manager.start(startInput("first"));
+    const second = manager.start(startInput("second"));
+    let resolved = false;
+    const waiting = manager.wait(second.job.id, 60_000).then((snapshot) => {
+      resolved = true;
+      return snapshot;
+    });
+
+    spawned[0]?.close(0);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(resolved).toBe(false);
+    expect(manager.get(first.job.id)?.state).toBe("exited");
+
+    spawned[1]?.close(0);
+    const settled = await waiting;
+    expect(resolved).toBe(true);
+    expect(settled.job.id).toBe(second.job.id);
+    expect(settled.state).toBe("exited");
   });
 
   it("stops with SIGTERM and reports the settled state", async () => {

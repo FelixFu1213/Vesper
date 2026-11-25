@@ -382,6 +382,19 @@ describe("TaskStop routing", () => {
     expect(stop.calls).toEqual([{ taskId: "sub-1" }, { taskId: "sub-2" }]);
   });
 
+  it("stops both taskId and delegationIds when both are passed", async () => {
+    const { manager } = makeJobs();
+    const { delegates, stop } = makeDelegates();
+    const routing = createJobToolRouting({ backgroundJobs: manager, delegates });
+    await toolNamed(routing.tools, "TaskStop").execute(
+      "call-1",
+      { taskId: "sub-1", delegationIds: ["sub-2", "sub-1"] },
+      undefined,
+      undefined,
+    );
+    expect(stop.calls).toEqual([{ taskId: "sub-1" }, { taskId: "sub-2" }]);
+  });
+
   it("explains that no subagent was stopped when subagents are disabled", async () => {
     const { manager } = makeJobs();
     const routing = createJobToolRouting({ backgroundJobs: manager });

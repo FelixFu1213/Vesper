@@ -1880,6 +1880,9 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
         firstRunOrdinal: state.providerThread.firstRunOrdinal ?? Math.max(1, turnInput.runOrdinal),
         lastRunOrdinal: Math.max(1, turnInput.runOrdinal),
       });
+      if (state.runtime?.hasRunningBackgroundJobs === true) {
+        updateBackgroundWork(turn);
+      }
       updateSession("running", null);
       void run(turn);
     };

@@ -761,7 +761,6 @@ export const createPiNativeTools = (deps: PiNativeToolDeps): ReadonlyArray<Agent
       parameters: WRITE_PARAMS,
       execute: async (_toolCallId, params) => {
         try {
-          await deps.scratch?.ensureCreated();
           const resolution = await deps.sandbox.resolvePath(params.path, "write");
           if (resolution.denied) {
             return fail(
@@ -770,6 +769,9 @@ export const createPiNativeTools = (deps: PiNativeToolDeps): ReadonlyArray<Agent
                 error: resolution.writeDeniedReason ?? "read-only path",
               },
             );
+          }
+          if (resolution.classification === "scratch") {
+            await deps.scratch?.ensureCreated();
           }
           const target = resolution.resolvedPath;
           return await deps.locks.withWriteLock(target, async () => {
@@ -799,12 +801,14 @@ export const createPiNativeTools = (deps: PiNativeToolDeps): ReadonlyArray<Agent
     execute: async (_toolCallId, params) => {
       let target = params.path;
       try {
-        await deps.scratch?.ensureCreated();
         const resolution = await deps.sandbox.resolvePath(params.path, "write");
         if (resolution.denied) {
           return fail(resolution.writeDeniedReason ?? `${resolution.resolvedPath} is read-only.`, {
             error: resolution.writeDeniedReason ?? "read-only path",
           });
+        }
+        if (resolution.classification === "scratch") {
+          await deps.scratch?.ensureCreated();
         }
         target = resolution.resolvedPath;
         return await deps.locks.withWriteLock(
@@ -1040,15 +1044,15 @@ export const createPiNativeTools = (deps: PiNativeToolDeps): ReadonlyArray<Agent
       let turnShell: TurnShell;
       try {
         turnShell =
-          deps.resolveShell !== undefined
-            ? deps.resolveShell()
-            : deps.shell !== undefined
-              ? {
-                  id: "bash",
-                  dialect: "posix",
-                  executable: deps.shell.command,
-                  args: deps.shell.args,
-                }
+          deps.shell !== undefined
+            ? {
+                id: "bash",
+                dialect: "posix",
+                executable: deps.shell.command,
+                args: deps.shell.args,
+              }
+            : deps.resolveShell !== undefined
+              ? deps.resolveShell()
               : resolveTurnShell({
                   ...(deps.environment === undefined ? {} : { environment: deps.environment }),
                   ...(deps.platform === undefined ? {} : { platform: deps.platform }),
