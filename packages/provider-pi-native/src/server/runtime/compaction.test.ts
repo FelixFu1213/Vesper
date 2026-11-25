@@ -7,10 +7,14 @@ import { estimateAgentMessagesTokens } from "./contextBudget.ts";
 import {
   buildCompactionCheckpoint,
   buildRetainedTailFallback,
+  compactSubagentMessages,
   installCompactionCheckpoint,
   renderCompactionSummary,
   sanitizeRetainedMessages,
+  SUBAGENT_CONTEXT_OVERFLOW,
+  type CompactedSubagentContext,
   type CompactionSummarySections,
+  type SubagentContextUpdate,
 } from "./compaction.ts";
 
 const TIMESTAMP = 1_700_000_000_000;
@@ -351,5 +355,163 @@ describe("installCompactionCheckpoint", () => {
       context: "thread context",
     });
     assert.equal(installed.length, 1);
+  });
+});
+
+describe("compaction checkpoint provenance", () => {
+  it("records the message it folded behind and the shape of its tail", async () => {
+    const messages: AgentMessage[] = [
+      systemMessage("base prompt"),
+      user("first question"),
+      textAssistant("first answer"),
+      user("second question"),
+      textAssistant("second answer"),
+    ];
+
+    const checkpoint = await buildCompactionCheckpoint({
+      messages,
+      mode: "completed_turn",
+      model: MODEL,
+      timestamp: TIMESTAMP,
+      pinnedRecentTurns: 1,
+      summarizeFn: () => SUMMARY,
+    });
+
+    assert.equal(checkpoint.throughMessageId, `message-1-assistant-${TIMESTAMP}`);
+    assert.isNull(checkpoint.retainedTailShape);
+    assert.isNull(checkpoint.failureReason);
+    assert.equal(checkpoint.beforeTokens, estimateAgentMessagesTokens(messages));
+    assert.equal(
+      checkpoint.afterTokens,
+      estimateAgentMessagesTokens(installCompactionCheckpoint(messages, checkpoint)),
+    );
+  });
+
+  it("records why a failed summarizer was abandoned and marks the replay shape", async () => {
+    const messages: AgentMessage[] = [systemMessage("base"), user("q"), textAssistant("a")];
+
+    const checkpoint = await buildCompactionCheckpoint({
+      messages,
+      mode: "completed_turn",
+      model: MODEL,
+      timestamp: TIMESTAMP,
+      summarizeFn: () => {
+        throw new Error("summarizer offline");
+      },
+    });
+
+    assert.equal(checkpoint.failureReason, "summarizer offline");
+    assert.isTrue(checkpoint.usedFallback);
+    assert.equal(checkpoint.retainedTailShape, "recent_window");
+    // A replayed recent-window tail is validated, not trusted by shape alone.
+    assert.isAbove(installCompactionCheckpoint(messages, checkpoint).length, 0);
+  });
+
+  it("starts a fresh window without a summary and keeps only the active goal", async () => {
+    const messages: AgentMessage[] = [
+      systemMessage("base prompt"),
+      user("old question"),
+      textAssistant("old answer"),
+      user("new question"),
+    ];
+
+    const checkpoint = await buildCompactionCheckpoint({
+      messages,
+      mode: "fresh_window",
+      model: MODEL,
+      timestamp: TIMESTAMP,
+      summarizeFn: () => SUMMARY,
+    });
+
+    assert.equal(checkpoint.summary, "");
+    assert.equal(checkpoint.chunkCount, 0);
+    assert.isFalse(checkpoint.usedFallback);
+    assert.isNull(checkpoint.throughMessageId);
+    assert.deepEqual(
+      checkpoint.retainedMessages.map((message) => message.role),
+      ["user"],
+    );
+    assert.equal(
+      checkpoint.retainedMessages[0]?.role === "user"
+        ? checkpoint.retainedMessages[0].content
+        : undefined,
+      "new question",
+    );
+  });
+});
+
+const requireContext = (update: SubagentContextUpdate): CompactedSubagentContext => {
+  if (update.status === "overflow") throw new Error(`unexpected overflow: ${update.message}`);
+  return update;
+};
+
+describe("compactSubagentMessages", () => {
+  const WIDE = { ...MODEL, id: "wide-model" };
+  const NARROW = { contextWindow: 4_000, maxTokens: 1_000, id: "narrow-model" };
+
+  it("leaves a delegate below the automatic trigger alone", () => {
+    const messages: AgentMessage[] = [user("short task")];
+    const update = compactSubagentMessages({
+      messages,
+      model: WIDE,
+      taskBrief: "short task",
+      mode: "completed_turn",
+      timestamp: TIMESTAMP,
+    });
+
+    assert.equal(update.status, "unchanged");
+    assert.deepEqual(requireContext(update).messages, messages);
+  });
+
+  it("retains the newest recent window instead of a summary it cannot build", () => {
+    const messages: AgentMessage[] = [user("a".repeat(4 * 80_000)), textAssistant("acknowledged")];
+    const update = compactSubagentMessages({
+      messages,
+      model: WIDE,
+      taskBrief: "the delegated task",
+      mode: "active_turn",
+      timestamp: TIMESTAMP,
+    });
+
+    assert.equal(update.status, "compacted");
+    const context = requireContext(update);
+    assert.isBelow(context.afterTokens, context.beforeTokens);
+    assert.isTrue(context.messages.some((message) => message.role === "user"));
+  });
+
+  it("falls back to the brief plus the newest messages when the window is narrow", () => {
+    const messages: AgentMessage[] = [
+      systemMessage("s".repeat(4 * 1_500)),
+      user("g".repeat(4 * 2_000)),
+      textAssistant("a".repeat(4 * 2_000)),
+    ];
+    const update = compactSubagentMessages({
+      messages,
+      model: NARROW,
+      taskBrief: "the delegated task",
+      mode: "completed_turn",
+      timestamp: TIMESTAMP,
+    });
+
+    assert.equal(update.status, "degraded");
+    assert.deepEqual(
+      requireContext(update).messages.map((message) => message.role),
+      ["system", "user"],
+    );
+  });
+
+  it("reports the structured overflow when even the system prompt cannot fit", () => {
+    const messages: AgentMessage[] = [systemMessage("s".repeat(4 * 2_500)), user("task")];
+    const update = compactSubagentMessages({
+      messages,
+      model: NARROW,
+      taskBrief: "the delegated task",
+      mode: "completed_turn",
+      timestamp: TIMESTAMP,
+    });
+
+    assert.equal(update.status, "overflow");
+    assert.equal(update.status === "overflow" ? update.code : "", SUBAGENT_CONTEXT_OVERFLOW);
+    assert.include(update.status === "overflow" ? update.message : "", "narrow-model");
   });
 });

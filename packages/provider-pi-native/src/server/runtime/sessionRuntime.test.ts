@@ -8,6 +8,8 @@ import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
+import * as HostProcess from "@t3tools/shared/HostProcess";
+
 import { PiNativeSettings } from "../../settings.ts";
 import {
   createScriptedStreamFn,
@@ -25,6 +27,7 @@ import {
   type NativeSessionEvent,
 } from "./sessionRuntime.ts";
 import type { ToolApprovalRequest } from "./permissions.ts";
+import type { PiNativeSkillDef } from "./skillsDiscovery.ts";
 
 const decodeSettings = Schema.decodeSync(PiNativeSettings);
 
@@ -69,6 +72,11 @@ const makeRuntime = async (
     readonly initialGoal?: OrchestrationV2ProviderGoal | null;
     readonly maxGoalChecks?: number;
     readonly streamFn?: StreamFn;
+    readonly threadId?: string;
+    readonly shell?: { readonly command: string; readonly args: ReadonlyArray<string> };
+    readonly skills?: ReadonlyArray<PiNativeSkillDef>;
+    readonly discoverSkills?: () => Promise<ReadonlyArray<PiNativeSkillDef>>;
+    readonly piAgentDir?: string;
   } = {},
 ): Promise<RuntimeHarness> => {
   const events: NativeSessionEvent[] = [];
@@ -90,11 +98,20 @@ const makeRuntime = async (
     requestUserInput: async () => input.answers ?? { answer: "yes" },
     ...(input.initialGoal === undefined ? {} : { initialGoal: input.initialGoal }),
     ...(input.maxGoalChecks === undefined ? {} : { maxGoalChecks: input.maxGoalChecks }),
+    ...(input.threadId === undefined ? {} : { threadId: input.threadId }),
+    ...(input.shell === undefined ? {} : { shell: input.shell }),
+    // A developer's own global AGENTS.md and SYSTEM.md must never reach a test.
+    piAgentDir: input.piAgentDir ?? (await workspace()),
     now: () => 0,
     streamFn: input.streamFn ?? streamFn,
     scheduleTimer: () => () => undefined,
     sleep: async () => undefined,
     ...(input.fetch === undefined ? {} : { fetch: input.fetch }),
+    // A developer's own installed skills must never reach a unit test.
+    discoverSkills:
+      input.discoverSkills !== undefined
+        ? async () => ({ skills: await input.discoverSkills!(), serverSkills: [] })
+        : async () => ({ skills: input.skills ?? [], serverSkills: [] }),
     ...(input.mcpSession === undefined
       ? {}
       : {
@@ -127,6 +144,35 @@ const workspace = async (files: Record<string, string> = {}): Promise<string> =>
   }
   return dir;
 };
+
+const writeFiles = async (root: string, files: Record<string, string>): Promise<void> => {
+  for (const [name, content] of Object.entries(files)) {
+    const target = NodePath.join(root, name);
+    await NodeFSP.mkdir(NodePath.dirname(target), { recursive: true });
+    await NodeFSP.writeFile(target, content, "utf8");
+  }
+};
+
+const isSystem = (message: { readonly role: string }): boolean => message.role === "system";
+
+const systemSections = (message: unknown): Record<string, string | null> =>
+  typeof message === "object" && message !== null && "sections" in message
+    ? ((message as { readonly sections?: Record<string, string | null> }).sections ?? {})
+    : {};
+
+/** Only the system deltas of one request, never the leading system message. */
+const requestDeltas = (
+  messages: ReadonlyArray<unknown>,
+): ReadonlyArray<Record<string, string | null>> =>
+  messages
+    .slice(1)
+    .filter(
+      (message): message is { readonly role: "system" } =>
+        typeof message === "object" &&
+        message !== null &&
+        (message as { readonly role?: unknown }).role === "system",
+    )
+    .map((message) => systemSections(message));
 
 describe("NativePiSessionRuntime", () => {
   it("streams assistant text and reasoning with usage", async () => {
@@ -195,6 +241,7 @@ describe("NativePiSessionRuntime", () => {
         scriptedTextResponse("done"),
       ],
     });
+    harness.runtime.activateTools(["TodoWrite"]);
     await harness.runtime.runTurn({ text: "make a plan" });
     const todo = harness.events.find((event) => event.type === "todo_updated");
     assert.equal(todo?.type === "todo_updated" ? todo.steps.length : 0, 2);
@@ -249,6 +296,7 @@ describe("NativePiSessionRuntime", () => {
         scriptedTextResponse("confirmed after compaction"),
       ],
     });
+    harness.runtime.activateTools(["TodoWrite", "TodoRead"]);
     const outcome = await harness.runtime.runTurn({ text: "track tasks" });
     assert.equal(outcome.status, "completed");
 
@@ -325,6 +373,7 @@ describe("NativePiSessionRuntime", () => {
         scriptedTextResponse("turn 2 done"),
       ],
     });
+    harness.runtime.activateTools(["TodoWrite"]);
     await harness.runtime.runTurn({ text: "first" });
     await harness.runtime.runTurn({ text: "second" });
     assert.equal(harness.runtime.todos.revision, 2);
@@ -365,6 +414,7 @@ describe("NativePiSessionRuntime", () => {
         scriptedTextResponse("parent done"),
       ],
     });
+    harness.runtime.activateTools(["TodoWrite", "TodoRead"]);
     const outcome = await harness.runtime.runTurn({ text: "delegate" });
     assert.equal(outcome.status, "completed");
 
@@ -802,6 +852,121 @@ describe("NativePiSessionRuntime", () => {
     await harness.runtime.dispose();
   });
 
+  it("loads a deferred MCP tool through ToolSearch and calls it on the next step", async () => {
+    const requests: Array<{ readonly method: string; readonly exposure?: string }> = [];
+    let listed = 0;
+    const fetchImpl: typeof globalThis.fetch = async (_input, init) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as {
+        readonly id?: number;
+        readonly method: string;
+        readonly params?: { readonly name?: string };
+      };
+      const headers = Object.fromEntries(new Headers(init?.headers).entries());
+      requests.push({
+        method: body.method,
+        ...(headers["t3-tool-exposure"] === undefined
+          ? {}
+          : { exposure: headers["t3-tool-exposure"] }),
+      });
+      const json = (result: unknown): Response =>
+        new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      if (body.method === "initialize") return json({});
+      if (body.method === "notifications/initialized") {
+        return new Response(null, { status: 202 });
+      }
+      if (body.method === "tools/list") {
+        listed += 1;
+        const threads = {
+          name: "t3_thread_list",
+          description: "List T3 threads",
+          inputSchema: { type: "object", properties: {} },
+          annotations: { readOnlyHint: true },
+        };
+        return json({
+          tools: [
+            { name: "tool_search", description: "Search tools", inputSchema: {} },
+            { name: "orchestrator_capabilities", description: "Capabilities", inputSchema: {} },
+            ...(listed === 1 ? [] : [threads]),
+          ],
+        });
+      }
+      if (body.params?.name === "tool_search") {
+        return new Response(
+          [
+            `data: ${JSON.stringify({
+              jsonrpc: "2.0",
+              method: "notifications/tools/list_changed",
+            })}`,
+            "",
+            `data: ${JSON.stringify({
+              jsonrpc: "2.0",
+              id: body.id,
+              result: { structuredContent: { tools: [{ name: "t3_thread_list" }] } },
+            })}`,
+            "",
+          ].join("\n"),
+          { status: 200, headers: { "content-type": "text/event-stream" } },
+        );
+      }
+      return json({ content: [{ type: "text", text: "threads: none" }] });
+    };
+
+    const harness = await makeRuntime({
+      mcpSession: { endpoint: "http://127.0.0.1:9/mcp", authorizationHeader: "Bearer x" },
+      fetch: fetchImpl,
+      steps: [
+        scriptedToolCallResponse([{ name: "ToolSearch", arguments: { query: "thread" } }]),
+        scriptedToolCallResponse([{ name: "mcp__t3-code__t3_thread_list", arguments: {} }]),
+        scriptedTextResponse("listed"),
+      ],
+    });
+    assert.isTrue(harness.runtime.mcpAvailable);
+    const outcome = await harness.runtime.runTurn({ text: "list the threads" });
+    assert.equal(outcome.status, "completed");
+    assert.deepStrictEqual(toolNames(harness.events), [
+      "ToolSearch",
+      "mcp__t3-code__t3_thread_list",
+    ]);
+    const call = harness.events.findLast((event) => event.type === "tool" && event.phase === "end");
+    assert.equal(call?.type === "tool" ? call.isError === true : true, false);
+    assert.include(call?.type === "tool" ? (call.output ?? "") : "", "threads: none");
+
+    const exposures = requests
+      .map((request) => request.exposure)
+      .filter((value) => value !== undefined);
+    assert.isTrue(exposures.length > 0);
+    assert.isTrue(exposures.every((exposure) => exposure === "deferred"));
+    assert.include(
+      requests.map((request) => request.method),
+      "tools/call",
+    );
+
+    const declared = (index: number): string[] =>
+      (harness.streamFn.calls[index]?.context.messages ?? []).flatMap((message) =>
+        (
+          (message as { readonly toolsAdded?: ReadonlyArray<{ readonly name: string }> })
+            .toolsAdded ?? []
+        ).map((tool) => tool.name),
+      );
+    assert.include(declared(0), "ToolSearch");
+    assert.notInclude(declared(0), "mcp__t3-code__t3_thread_list");
+    assert.include(declared(1), "mcp__t3-code__t3_thread_list");
+    const catalog = (harness.streamFn.calls[1]?.context.messages ?? [])
+      .flatMap((message) =>
+        Object.entries(
+          (message as { readonly sections?: Record<string, string | null> }).sections ?? {},
+        ).filter(([name]) => name === "on_demand_tools"),
+      )
+      .map(([, value]) => value ?? "")
+      .join("\n");
+    assert.include(catalog, "# On-demand tools");
+    assert.include(catalog, "mcp__t3-code__t3_thread_list");
+    await harness.runtime.dispose();
+  });
+
   it("delegates to a subagent and stops it on demand", async () => {
     const harness = await makeRuntime({
       settings: settings({ enableSubagents: true }),
@@ -823,6 +988,57 @@ describe("NativePiSessionRuntime", () => {
     assert.isNotNull(harness.runtime.subagents);
     await harness.runtime.dispose();
   });
+
+  it.skipIf(HostProcess.Platform.defaultValue() === "win32")(
+    "keeps a background Bash job alive past the turn and cleans up on dispose",
+    async () => {
+      const threadId = "pi-native-jobs-thread";
+      const scratchPath = NodePath.join(NodeOS.tmpdir(), "pi-native-scratch", threadId);
+      const harness = await makeRuntime({
+        threadId,
+        shell: { command: "/bin/sh", args: ["-c"] },
+        steps: [
+          scriptedToolCallResponse([
+            { name: "Bash", arguments: { command: "sleep 30", runInBackground: true } },
+          ]),
+          scriptedToolCallResponse([{ name: "TaskList", arguments: {} }]),
+          scriptedTextResponse("job is running"),
+        ],
+      });
+      const outcome = await harness.runtime.runTurn({ text: "start a job" });
+      assert.equal(outcome.status, "completed");
+      assert.isTrue(harness.runtime.hasRunningBackgroundJobs);
+      assert.isTrue((await NodeFSP.stat(scratchPath)).isDirectory());
+
+      // The job tools stay available with subagents disabled and list the Bash job.
+      const listEnd = harness.events.find(
+        (event) => event.type === "tool" && event.phase === "end" && event.toolName === "TaskList",
+      );
+      assert.isDefined(listEnd);
+      const listResult = listEnd as {
+        readonly isError?: boolean;
+        readonly result?: { readonly details?: unknown };
+      };
+      assert.notEqual(listResult.isError, true);
+      const details = listResult.result?.details as {
+        readonly backgroundJobs?: {
+          readonly tasks?: ReadonlyArray<{ readonly job: { readonly id: string } }>;
+        };
+      };
+      assert.equal(details.backgroundJobs?.tasks?.[0]?.job.id, "bash-1");
+
+      assert.isFalse(await harness.runtime.stopBackgroundJob("bash-404"));
+      await harness.runtime.dispose();
+      assert.isFalse(harness.runtime.hasRunningBackgroundJobs);
+      let removed = false;
+      try {
+        await NodeFSP.stat(scratchPath);
+      } catch {
+        removed = true;
+      }
+      assert.isTrue(removed, "dispose removes the session scratch directory");
+    },
+  );
 
   it("continues an active goal autonomously until UpdateGoalStatus completes it", async () => {
     const harness = await makeRuntime({
@@ -935,6 +1151,7 @@ describe("NativePiSessionRuntime", () => {
         scriptedTextResponse("must not run"),
       ],
     });
+    planned.runtime.activateTools(["SubmitPlan"]);
     const plannedOutcome = await planned.runtime.runTurn({ text: "plan it" });
     assert.equal(plannedOutcome.status, "completed");
     assert.deepStrictEqual(streamTexts(planned.events), ["plan ready"]);
@@ -1011,6 +1228,7 @@ describe("NativePiSessionRuntime", () => {
         },
       ],
     });
+    harness.runtime.activateTools(["UpdateGoalStatus"]);
     await harness.runtime.runTurn({ text: "delegate" });
     assert.include(calls[0] ?? [], "UpdateGoalStatus");
     assert.notInclude(calls[1] ?? [], "UpdateGoalStatus");
@@ -1018,15 +1236,211 @@ describe("NativePiSessionRuntime", () => {
     await harness.runtime.dispose();
   });
 
-  it("boosts thinking for one workflow turn and restores it afterwards", async () => {
-    const requests: Array<{ reasoning: string | undefined; activation: string | null }> = [];
-    const streamFn: StreamFn = async (model, context, options) => {
+  it("prompts with one system section per discovered skill", async () => {
+    const skills: ReadonlyArray<PiNativeSkillDef> = [
+      {
+        id: "review",
+        name: "Review",
+        description: "Reviews changes",
+        path: "/workspace/.agents/skills/review/SKILL.md",
+        rootDir: "/workspace/.agents/skills/review",
+        scope: "project",
+        enabled: true,
+        disableModelInvocation: false,
+      },
+      {
+        id: "manual",
+        name: "Manual",
+        path: "/workspace/.agents/skills/manual/SKILL.md",
+        rootDir: "/workspace/.agents/skills/manual",
+        scope: "project",
+        enabled: true,
+        disableModelInvocation: true,
+      },
+    ];
+    const harness = await makeRuntime({ steps: [scriptedTextResponse("ok")], skills });
+    await harness.runtime.runTurn({ text: "hi" });
+    const system = harness.runtime.messages.find((message) => message.role === "system");
+    const sections =
+      system !== undefined && "sections" in system
+        ? ((system as { readonly sections?: Record<string, string | null> }).sections ?? {})
+        : {};
+    assert.deepInclude(sections, {
+      "skill:review": "- `review`: Review (Reviews changes)",
+    });
+    assert.notProperty(sections, "skill:manual");
+    assert.include(
+      harness.runtime.skills.map((skill) => skill.id),
+      "manual",
+    );
+    await harness.runtime.dispose();
+  });
+
+  it("loads a /skill:<id> invocation for one turn and clears it afterwards", async () => {
+    const skills: ReadonlyArray<PiNativeSkillDef> = [
+      {
+        id: "review",
+        name: "Review",
+        path: "/workspace/.agents/skills/review/SKILL.md",
+        rootDir: "/workspace/.agents/skills/review",
+        scope: "project",
+        enabled: true,
+        disableModelInvocation: false,
+      },
+    ];
+    const root = await workspace({
+      "SKILL.md": "---\nname: Review\n---\n\nRead the diff first.\n",
+    });
+    const skill = {
+      ...(skills[0] as PiNativeSkillDef),
+      path: NodePath.join(root, "SKILL.md"),
+      rootDir: root,
+    };
+    const activations: Array<string | null> = [];
+    const streamFn: StreamFn = async (model, context) => {
       const systems = context.messages.filter((message) => message.role === "system");
       const last = systems.at(-1);
       const sections =
         last !== undefined && typeof last === "object" && "sections" in last
           ? ((last as { readonly sections?: Record<string, string | null> }).sections ?? {})
           : {};
+      activations.push(sections["tool_activation"] ?? null);
+      return renderScriptedTurn(model, scriptedTextResponse("ok"), 0);
+    };
+    const harness = await makeRuntime({ streamFn, skills: [skill] });
+
+    await harness.runtime.runTurn({ text: "review this", skillIds: ["review"] });
+    await harness.runtime.runTurn({ text: "plain turn" });
+
+    assert.match(activations[0] ?? "", /<skill_content id="review"/u);
+    assert.match(activations[0] ?? "", /Read the diff first\./u);
+    assert.isNull(activations[1] ?? null);
+    await harness.runtime.dispose();
+  });
+
+  it("activates the skill behind a $<id> mention the composer inserted", async () => {
+    const root = await workspace({
+      "SKILL.md": "---\nname: Review\n---\n\nRead the diff first.\n",
+    });
+    const skills: ReadonlyArray<PiNativeSkillDef> = [
+      {
+        id: "review",
+        name: "Review",
+        path: NodePath.join(root, "SKILL.md"),
+        rootDir: root,
+        scope: "project",
+        enabled: true,
+        disableModelInvocation: false,
+      },
+    ];
+    const activations: Array<string | null> = [];
+    const streamFn: StreamFn = async (model, context) => {
+      const systems = context.messages.filter((message) => message.role === "system");
+      const last = systems.at(-1);
+      const sections =
+        last !== undefined && typeof last === "object" && "sections" in last
+          ? ((last as { readonly sections?: Record<string, string | null> }).sections ?? {})
+          : {};
+      activations.push(sections["tool_activation"] ?? null);
+      return renderScriptedTurn(model, scriptedTextResponse("ok"), 0);
+    };
+    const harness = await makeRuntime({ streamFn, skills });
+
+    await harness.runtime.runTurn({ text: "use $review on this branch" });
+    await harness.runtime.runTurn({ text: "budget is $5" });
+
+    assert.match(activations[0] ?? "", /<skill_content id="review"/u);
+    assert.isNull(activations[1] ?? null);
+    await harness.runtime.dispose();
+  });
+
+  it("declares the Skill tool and loads a skill through it", async () => {
+    const root = await workspace({
+      "SKILL.md": "---\nname: Review\n---\n\nRead the diff first.\n",
+    });
+    const skills: ReadonlyArray<PiNativeSkillDef> = [
+      {
+        id: "review",
+        name: "Review",
+        path: NodePath.join(root, "SKILL.md"),
+        rootDir: root,
+        scope: "project",
+        enabled: true,
+        disableModelInvocation: false,
+      },
+    ];
+    const harness = await makeRuntime({
+      skills,
+      steps: [
+        scriptedToolCallResponse([{ name: "Skill", arguments: { id: "review" } }]),
+        scriptedTextResponse("done"),
+      ],
+    });
+
+    await harness.runtime.runTurn({ text: "review" });
+
+    assert.deepEqual(toolNames(harness.events), ["Skill"]);
+    const loaded = harness.events.find((event) => event.type === "tool" && event.phase === "end");
+    assert.match(
+      loaded?.type === "tool" ? (loaded.output ?? "") : "",
+      /<skill_content id="review"[^>]*>\nRead the diff first\./u,
+    );
+    await harness.runtime.dispose();
+  });
+
+  it("clears the skills header when the last skill is revoked and loads user-only skills on $id", async () => {
+    const root = await workspace({
+      "SKILL.md":
+        "---\nname: Manual\ndisable-model-invocation: true\n---\n\nManual instructions.\n",
+    });
+    let current: ReadonlyArray<PiNativeSkillDef> = [
+      {
+        id: "review",
+        name: "Review",
+        path: "/workspace/.agents/skills/review/SKILL.md",
+        rootDir: "/workspace/.agents/skills/review",
+        scope: "project",
+        enabled: true,
+        disableModelInvocation: false,
+      },
+      {
+        id: "manual",
+        name: "Manual",
+        path: NodePath.join(root, "SKILL.md"),
+        rootDir: root,
+        scope: "project",
+        enabled: true,
+        disableModelInvocation: true,
+      },
+    ];
+    const deltas: Array<Record<string, string | null>> = [];
+    const streamFn: StreamFn = async (model, context) => {
+      const last = context.messages.filter((message) => message.role === "system").at(-1);
+      const sections =
+        last !== undefined && typeof last === "object" && "sections" in last
+          ? ((last as { readonly sections?: Record<string, string | null> }).sections ?? {})
+          : {};
+      deltas.push(sections);
+      return renderScriptedTurn(model, scriptedTextResponse("ok"), 0);
+    };
+    const harness = await makeRuntime({ streamFn, discoverSkills: async () => current });
+
+    await harness.runtime.runTurn({ text: "run $manual" });
+    assert.match(deltas[0]?.tool_activation ?? "", /<skill_content id="manual"/u);
+
+    current = [];
+    await harness.runtime.runTurn({ text: "after removal" });
+    assert.isTrue(Object.hasOwn(deltas[1] ?? {}, "skills"));
+    assert.isNull(deltas[1]?.skills);
+    assert.isTrue(Object.hasOwn(deltas[1] ?? {}, "skill:review"));
+    assert.isNull(deltas[1]?.["skill:review"]);
+    await harness.runtime.dispose();
+  });
+
+  it("boosts thinking for one workflow turn and restores it afterwards", async () => {
+    const requests: Array<{ reasoning: string | undefined; activation: string | null }> = [];
+    const streamFn: StreamFn = async (model, context, options) => {
+      const sections = systemSections(context.messages.filter(isSystem).at(-1));
       requests.push({
         reasoning: (options as { readonly reasoning?: string } | undefined)?.reasoning,
         activation: sections["tool_activation"] ?? null,
@@ -1053,12 +1467,7 @@ describe("NativePiSessionRuntime", () => {
       toolActivation: string | null | undefined;
     }> = [];
     const streamFn: StreamFn = async (model, context) => {
-      const systems = context.messages.filter((message) => message.role === "system");
-      const last = systems.at(-1);
-      const sections =
-        last !== undefined && typeof last === "object" && "sections" in last
-          ? ((last as { readonly sections?: Record<string, string | null> }).sections ?? {})
-          : {};
+      const sections = systemSections(context.messages.filter(isSystem).at(-1));
       requests.push({
         hasToolActivationKey: Object.hasOwn(sections, "tool_activation"),
         toolActivation: sections["tool_activation"],
@@ -1079,6 +1488,174 @@ describe("NativePiSessionRuntime", () => {
     assert.isTrue(requests[1]?.hasToolActivationKey);
     assert.isNull(requests[1]?.toolActivation);
     assert.match(requests[2]?.toolActivation ?? "", /workflow_command name="review"/u);
+    await harness.runtime.dispose();
+  });
+
+  it("clears activated deferred tools across truncateToTurn rollback", async () => {
+    const harness = await makeRuntime({
+      steps: [
+        scriptedToolCallResponse([{ name: "ToolSearch", arguments: { query: "TodoWrite" } }]),
+        scriptedTextResponse("activated"),
+        scriptedToolCallResponse([{ name: "TodoRead", arguments: {} }]),
+        scriptedTextResponse("after rollback"),
+      ],
+    });
+    await harness.runtime.runTurn({ text: "turn one" });
+    harness.runtime.activateTools(["TodoRead"]);
+    harness.runtime.truncateToTurn(0);
+    await harness.runtime.runTurn({ text: "turn after rollback" });
+    const declaredAfterRollback = (harness.streamFn.calls[2]?.context.messages ?? []).flatMap(
+      (message) =>
+        (
+          (message as { readonly toolsAdded?: ReadonlyArray<{ readonly name: string }> })
+            .toolsAdded ?? []
+        ).map((tool) => tool.name),
+    );
+    assert.notInclude(declaredAfterRollback, "TodoWrite");
+    assert.notInclude(declaredAfterRollback, "TodoRead");
+    const blockedEnd = harness.events.findLast(
+      (event) => event.type === "tool" && event.phase === "end",
+    );
+    assert.equal(blockedEnd?.type === "tool" ? blockedEnd.isError === true : false, true);
+    await harness.runtime.dispose();
+  });
+
+  it("leads with the custom system prompt and places the append and project rules after runtime", async () => {
+    const cwd = await workspace();
+    await writeFiles(cwd, { ".pi/SYSTEM.md": "Custom persona.", "AGENTS.md": "Repo rules." });
+    const piAgentDir = await workspace({
+      "SYSTEM.md": "Global persona.",
+      "APPEND_SYSTEM.md": "Global append.",
+      "AGENTS.md": "Global rules.",
+    });
+    const requests: Array<{
+      content: string | null;
+      sections: Record<string, string | null>;
+    }> = [];
+    const streamFn: StreamFn = async (model, context) => {
+      const leading = context.messages[0];
+      requests.push({
+        content: typeof leading?.content === "string" ? leading.content : null,
+        sections: systemSections(leading),
+      });
+      return renderScriptedTurn(model, scriptedTextResponse("ok"), 0);
+    };
+
+    const harness = await makeRuntime({ cwd, piAgentDir, streamFn });
+    await harness.runtime.runTurn({ text: "hi" });
+
+    assert.equal(requests[0]?.content, "Custom persona.");
+    assert.deepStrictEqual(Object.keys(requests[0]?.sections ?? {}), [
+      "runtime",
+      "custom_append",
+      "project_instructions",
+      "on_demand_tools",
+    ]);
+    assert.equal(requests[0]?.sections["custom_append"], "Global append.");
+    assert.include(requests[0]?.sections["project_instructions"] ?? "", "Global rules.");
+    assert.include(requests[0]?.sections["project_instructions"] ?? "", "Repo rules.");
+    await harness.runtime.dispose();
+  });
+
+  it("adds a nested AGENTS.md once a tool reaches its directory, and only when the chain changes", async () => {
+    const cwd = await workspace();
+    await writeFiles(cwd, {
+      "AGENTS.md": "root rules",
+      "pkg/AGENTS.md": "package rules",
+      "pkg/note.txt": "hello\n",
+      "pkg/other.txt": "again\n",
+    });
+    const scripted = createScriptedStreamFn(
+      [
+        scriptedToolCallResponse([
+          { name: "Read", arguments: { path: "pkg/note.txt" } },
+          { name: "Read", arguments: { path: "pkg/other.txt" } },
+        ]),
+        scriptedTextResponse("done"),
+        scriptedTextResponse("again"),
+      ],
+      { now: () => 0 },
+    );
+    const deltas: Array<Record<string, string | null>> = [];
+    const streamFn: StreamFn = async (model, context, options) => {
+      deltas.push(...requestDeltas(context.messages));
+      return scripted(model, context, options);
+    };
+
+    const harness = await makeRuntime({ cwd, streamFn });
+    await harness.runtime.runTurn({ text: "look at pkg" });
+    await harness.runtime.runTurn({ text: "keep going" });
+
+    const instructionDeltas = deltas.filter(
+      (sections) => sections["project_instructions"] !== undefined,
+    );
+    assert.lengthOf(instructionDeltas, 1);
+    assert.deepStrictEqual(Object.keys(instructionDeltas[0] ?? {}), ["project_instructions"]);
+    assert.include(instructionDeltas[0]?.["project_instructions"] ?? "", "root rules");
+    assert.include(instructionDeltas[0]?.["project_instructions"] ?? "", "package rules");
+    await harness.runtime.dispose();
+  });
+});
+
+/** Request-only reminders never reach the transcript, so they are counted in the request. */
+const reminderMessages = (messages: ReadonlyArray<{ readonly content?: unknown }>): number =>
+  messages.filter((message) => {
+    const content = message.content;
+    return typeof content === "string"
+      ? content.includes("<context_budget>")
+      : JSON.stringify(content ?? "").includes("<context_budget>");
+  }).length;
+
+describe("NativePiSessionRuntime context budget", () => {
+  it("reminds the model once per checkpoint window and not again on the next turn", async () => {
+    const harness = await makeRuntime({
+      settings: settings({
+        modelBindings: [
+          {
+            id: "default",
+            contextWindow: 20_000,
+            maxTokens: 2_000,
+            thinkingLevels: [],
+            defaultThinkingLevel: null,
+          },
+        ],
+      }),
+      steps: [scriptedTextResponse("one"), scriptedTextResponse("two")],
+    });
+
+    await harness.runtime.runTurn({ text: "a".repeat(4 * 4_000) });
+    const first = harness.streamFn.calls[0]?.context.messages ?? [];
+    assert.equal(reminderMessages(first), 1);
+
+    await harness.runtime.runTurn({ text: "again" });
+    const second = harness.streamFn.calls[1]?.context.messages ?? [];
+    assert.equal(reminderMessages(second), 0);
+    await harness.runtime.dispose();
+  });
+
+  it("reports why a compaction summary was abandoned", async () => {
+    const harness = await makeRuntime({
+      settings: settings({ autoCompact: true }),
+      steps: [
+        scriptedErrorResponse("prompt is too long: 250000 tokens > 200000 maximum"),
+        scriptedTextResponse("I could not summarize this conversation."),
+        scriptedTextResponse("recovered answer"),
+      ],
+    });
+
+    const outcome = await harness.runtime.runTurn({ text: "start" });
+    assert.equal(outcome.status, "completed");
+    assert.deepStrictEqual(streamTexts(harness.events), ["recovered answer"]);
+
+    const completed = harness.events.filter(
+      (event) => event.type === "compaction" && event.status === "completed",
+    );
+    assert.isAbove(completed.length, 0);
+    const reason = completed.at(-1);
+    assert.include(
+      reason?.type === "compaction" ? (reason.failureReason ?? "") : "",
+      "no recognizable sections",
+    );
     await harness.runtime.dispose();
   });
 });

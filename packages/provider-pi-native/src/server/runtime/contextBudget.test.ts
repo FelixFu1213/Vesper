@@ -4,12 +4,15 @@ import { assert, describe, it } from "@effect/vitest";
 
 import {
   computeContextBudget,
-  ContextEstimateCalibration,
+  ContextBudgetReminderTracker,
+  contextReminderThreshold,
   estimateAgentMessagesTokens,
   estimateAgentMessageTokens,
   estimateCjkAwareTextTokens,
   evaluateContextPressure,
+  projectContextRequest,
 } from "./contextBudget.ts";
+import { ContextEstimateCalibration } from "./contextCalibration.ts";
 
 const MODEL = { contextWindow: 200_000, maxTokens: 8_000 };
 
@@ -117,57 +120,77 @@ describe("estimateAgentMessageTokens", () => {
   });
 });
 
-describe("ContextEstimateCalibration", () => {
-  it("starts at 1 and only grows after three agreeing upward samples", () => {
-    const calibration = new ContextEstimateCalibration();
-    assert.equal(calibration.multiplier, 1);
+describe("projectContextRequest", () => {
+  it("charges system, tools, and messages, and anchors on the newest usage block", () => {
+    const messages: AgentMessage[] = [
+      { role: "system", content: "abcd", timestamp: 1 },
+      {
+        ...assistant([{ type: "text", text: "abcd" }]),
+        usage: { ...assistant([]).usage, input: 400, totalTokens: 400 },
+      },
+      user("abcd"),
+    ];
+    const projection = projectContextRequest(messages, [
+      { name: "read", description: "abcd", parameters: { type: "object" } },
+    ]);
 
-    calibration.recordSample(1_000, 1_200);
-    calibration.recordSample(1_000, 1_300);
-    assert.equal(calibration.multiplier, 1);
-
-    calibration.recordSample(1_000, 1_100);
-    assert.equal(calibration.multiplier, 1.2);
-    assert.equal(calibration.calibrate(1_000), 1_200);
+    assert.equal(projection.cost.systemTokens, 1);
+    assert.equal(projection.cost.messageTokens, 2);
+    assert.isAbove(projection.cost.toolTokens, 0);
+    assert.equal(
+      projection.cost.totalTokens,
+      projection.cost.systemTokens + projection.cost.toolTokens + projection.cost.messageTokens,
+    );
+    // The anchor's own usage stands in for the prefix; only the tail is estimated.
+    assert.equal(projection.calibration.lastUsageIndex, 1);
+    assert.equal(projection.calibration.usageTokens, 400);
+    assert.equal(projection.calibration.trailingTokens, 1);
+    assert.isAtLeast(projection.calibration.tokens, projection.calibration.usageTokens);
   });
 
-  it("shrinks at most 15% per step and never below 85%", () => {
-    const calibration = new ContextEstimateCalibration();
-    calibration.recordSample(1_000, 2_000);
-    calibration.recordSample(1_000, 2_000);
-    calibration.recordSample(1_000, 2_000);
-    assert.equal(calibration.multiplier, 2);
+  it("reports no anchor when the transcript carries no usable usage", () => {
+    const projection = projectContextRequest([user("abcd")], []);
 
-    for (let sample = 0; sample < 3; sample += 1) {
-      calibration.recordSample(1_000, 1_000);
-    }
-    assert.isAtMost(Math.abs(calibration.multiplier - 1.7), 1e-9);
+    assert.isNull(projection.calibration.lastUsageIndex);
+    assert.equal(projection.calibration.trailingTokens, 0);
+    assert.equal(projection.calibration.tokens, 1);
+  });
+});
 
-    for (let step = 0; step < 10; step += 1) {
-      for (let sample = 0; sample < 3; sample += 1) {
-        calibration.recordSample(1_000, 500);
-      }
-    }
-    assert.equal(calibration.multiplier, 0.85);
+describe("ContextBudgetReminderTracker", () => {
+  it("clamps the approach threshold between 8k and 32k", () => {
+    assert.equal(contextReminderThreshold(10_000), 8_000);
+    assert.equal(contextReminderThreshold(200_000), 30_000);
+    assert.equal(contextReminderThreshold(1_000_000), 32_000);
   });
 
-  it("needs three consecutive downward samples and ignores empty input", () => {
-    const calibration = new ContextEstimateCalibration();
+  it("emits each stage at most once per checkpoint window", () => {
+    const tracker = new ContextBudgetReminderTracker();
+    const input = { hardLimit: 200_000, midConversationSystem: true };
 
-    calibration.recordSample(1_000, 500);
-    calibration.recordSample(1_000, 3_000);
-    calibration.recordSample(1_000, 500);
-    calibration.recordSample(1_000, 500);
-    assert.equal(calibration.multiplier, 1);
+    const approach = tracker.select({ ...input, remainingTokens: 25_000 });
+    assert.equal(approach?.stage, "approach");
+    assert.equal(approach?.role, "system");
+    assert.isUndefined(tracker.select({ ...input, remainingTokens: 20_000 }));
 
-    calibration.recordSample(1_000, 500);
-    assert.isBelow(calibration.multiplier, 1);
-    assert.isAtLeast(calibration.multiplier, 0.85);
+    const fallback = tracker.select({ ...input, remainingTokens: 1_500 });
+    assert.equal(fallback?.stage, "fallback");
+    assert.isUndefined(tracker.select({ ...input, remainingTokens: 1_000 }));
 
-    const before = calibration.multiplier;
-    calibration.recordSample(0, 500);
-    calibration.recordSample(500, 0);
-    assert.equal(calibration.multiplier, before);
+    tracker.reset();
+    assert.equal(tracker.select({ ...input, remainingTokens: 25_000 })?.stage, "approach");
+  });
+
+  it("falls back to a synthetic user reminder without mid-conversation system support", () => {
+    const tracker = new ContextBudgetReminderTracker();
+    const reminder = tracker.select({
+      remainingTokens: 25_000,
+      hardLimit: 200_000,
+      midConversationSystem: false,
+    });
+
+    assert.equal(reminder?.role, "user");
+    assert.include(reminder?.text ?? "", "<context_budget>");
   });
 });
 
@@ -176,32 +199,52 @@ describe("evaluateContextPressure", () => {
     const budget = computeContextBudget({ contextWindow: 4_000, maxTokens: 1_000 });
     const messages: AgentMessage[] = [user("a".repeat(1_900 * 4))];
 
-    const approaching = evaluateContextPressure(messages, {
-      contextWindow: 4_000,
-      maxTokens: 1_000,
+    const approaching = evaluateContextPressure({
+      messages,
+      model: { contextWindow: 4_000, maxTokens: 1_000, api: "openai-responses" },
     });
 
     assert.isTrue(approaching.shouldCompact);
     assert.equal(approaching.warningLevel, "approaching");
     assert.equal(approaching.rawTokens, 1_900);
+    assert.equal(approaching.remainingTokens, budget.hardLimit - 1_900);
 
-    const critical = evaluateContextPressure([user("a".repeat(4_000 * 4))], {
-      contextWindow: 4_000,
-      maxTokens: 1_000,
+    const critical = evaluateContextPressure({
+      messages: [user("a".repeat(4_000 * 4))],
+      model: { contextWindow: 4_000, maxTokens: 1_000, api: "openai-responses" },
     });
     assert.equal(critical.warningLevel, "critical");
-    assert.isAtLeast(critical.calibratedTokens, budget.hardLimit);
+    assert.equal(critical.remainingTokens, 0);
+    assert.isTrue(critical.shouldCompact);
+  });
+
+  it("counts advertised tool schemas in the request floor", () => {
+    const model = { contextWindow: 200_000, maxTokens: 8_000, api: "openai-responses" as const };
+    const withoutTools = evaluateContextPressure({ messages: [user("abcd")], model });
+    const withTools = evaluateContextPressure({
+      messages: [user("abcd")],
+      model,
+      tools: [{ name: "read", description: "Read a file.", parameters: { type: "object" } }],
+    });
+
+    assert.equal(withoutTools.requestCost.toolTokens, 0);
+    assert.isAbove(withTools.requestCost.toolTokens, 0);
+    assert.isAbove(withTools.rawTokens, withoutTools.rawTokens);
   });
 
   it("applies the learned calibration to the calibrated estimate", () => {
     const calibration = new ContextEstimateCalibration();
     for (let sample = 0; sample < 3; sample += 1) {
-      calibration.recordSample(1_000, 2_000);
+      calibration.recordAnchored(1_000, 500, 2_000);
     }
-    const pressure = evaluateContextPressure([user("a".repeat(4_000))], MODEL, calibration);
+    const pressure = evaluateContextPressure({
+      messages: [user("a".repeat(1_500 * 4))],
+      model: { ...MODEL, api: "openai-responses" },
+      calibration,
+    });
 
-    assert.equal(pressure.rawTokens, 1_000);
-    assert.equal(pressure.calibratedTokens, 2_000);
+    assert.equal(pressure.rawTokens, 1_500);
+    assert.equal(pressure.calibratedTokens, 1_500);
     assert.equal(pressure.warningLevel, "none");
   });
 });

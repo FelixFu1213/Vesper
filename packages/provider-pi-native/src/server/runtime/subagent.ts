@@ -4,6 +4,7 @@ import {
   Agent,
   type AfterToolCallContext,
   type AfterToolCallResult,
+  type AgentMessage,
   type AgentTool,
   type BeforeToolCallContext,
   type BeforeToolCallResult,
@@ -18,6 +19,8 @@ import {
   type ThinkingLevel,
 } from "@earendil-works/pi-ai";
 import { arr, bool, num, obj, opt, str } from "@earendil-works/pi-schema";
+
+import { compactSubagentMessages } from "./compaction.ts";
 
 export const MAX_SUBAGENT_REPORT_CHARS = 12_000;
 
@@ -42,6 +45,8 @@ export interface SubagentRecord {
   readonly status: SubagentStatus;
   readonly progress?: string;
   readonly result: string | null;
+  /** Structured failure code, when the failure is one the parent can act on. */
+  readonly failureCode?: "SUBAGENT_CONTEXT_OVERFLOW";
   readonly startedAtMs: number;
   readonly completedAtMs: number | null;
   readonly updatedAtMs: number;
@@ -191,6 +196,12 @@ const failureText = (error: unknown): string =>
     ? error.message
     : "The subagent failed without a message.";
 
+/** Only the failures a parent can act on carry a code; everything else is prose. */
+const failureCode = (error: unknown): SubagentRecord["failureCode"] =>
+  error instanceof Error && error.message.startsWith("SUBAGENT_CONTEXT_OVERFLOW:")
+    ? "SUBAGENT_CONTEXT_OVERFLOW"
+    : undefined;
+
 const defaultSleep = (ms: number, signal?: AbortSignal): Promise<void> =>
   new Promise((resolve) => {
     if (signal?.aborted === true) {
@@ -225,6 +236,10 @@ const lastAssistantText = (messages: ReadonlyArray<Message>): string => {
   return text;
 };
 
+/** A child keeps its own budget; the parent's numbers never constrain it. */
+const delegationMode = (messages: ReadonlyArray<AgentMessage>): "active_turn" | "completed_turn" =>
+  messages.at(-1)?.role === "toolResult" ? "active_turn" : "completed_turn";
+
 const makeAgentChildAgent = async (
   input: CreateChildAgentInput,
   options: PiNativeChildAgentOptions | undefined,
@@ -242,6 +257,9 @@ const makeAgentChildAgent = async (
   if (model === undefined) {
     throw new Error("Pi Native has no model configured for subagents.");
   }
+  const state: {
+    overflow: ReturnType<typeof compactSubagentMessages> | null;
+  } = { overflow: null };
   const agent = new Agent({
     sessionId: options.parentSessionId
       ? `${options.parentSessionId}:${input.taskId}`
@@ -256,6 +274,26 @@ const makeAgentChildAgent = async (
     ...(options.getApiKey === undefined ? {} : { getApiKey: options.getApiKey }),
     ...(options.beforeToolCall === undefined ? {} : { beforeToolCall: options.beforeToolCall }),
     ...(options.afterToolCall === undefined ? {} : { afterToolCall: options.afterToolCall }),
+    prepareRequest: (request) => {
+      const update = compactSubagentMessages({
+        messages: request.context.messages,
+        model,
+        taskBrief: input.prompt,
+        mode: delegationMode(request.context.messages),
+        timestamp: request.context.messages.at(-1)?.timestamp ?? 0,
+      });
+      if (update.status === "overflow") {
+        state.overflow = update;
+        return undefined;
+      }
+      if (update.status === "unchanged") return undefined;
+      return {
+        context: {
+          messages: update.messages,
+          ...(request.context.tools === undefined ? {} : { tools: request.context.tools }),
+        },
+      };
+    },
   });
   const unsubscribe = agent.subscribe((event) => {
     if (event.type !== "message_update" || event.message.role !== "assistant") return;
@@ -274,6 +312,10 @@ const makeAgentChildAgent = async (
       } finally {
         input.signal.removeEventListener("abort", onAbort);
         unsubscribe();
+      }
+      const overflow = state.overflow;
+      if (overflow !== null && overflow.status === "overflow") {
+        throw new Error(`${overflow.code}: ${overflow.message}`);
       }
       return lastAssistantText(agent.state.messages);
     },
@@ -324,9 +366,19 @@ export const makeSubagentManager = (deps: SubagentManagerDeps = {}): SubagentMan
     return task.record;
   };
 
-  const settle = (task: SubagentTask, status: SubagentStatus, result: string | null): void => {
+  const settle = (
+    task: SubagentTask,
+    status: SubagentStatus,
+    result: string | null,
+    code?: SubagentRecord["failureCode"],
+  ): void => {
     if (isTerminal(task.record.status)) return;
-    const record = update(task, { status, result, completedAtMs: now() });
+    const record = update(task, {
+      status,
+      result,
+      completedAtMs: now(),
+      ...(code === undefined ? {} : { failureCode: code }),
+    });
     task.settlement.resolve(record);
   };
 
@@ -442,7 +494,12 @@ export const makeSubagentManager = (deps: SubagentManagerDeps = {}): SubagentMan
               settle(task, "cancelled", null);
               return;
             }
-            settle(task, "failed", capSubagentReport(failureText(error), maxReportChars));
+            settle(
+              task,
+              "failed",
+              capSubagentReport(failureText(error), maxReportChars),
+              failureCode(error),
+            );
           },
         )
         .finally(() => task.runDone.resolve());
