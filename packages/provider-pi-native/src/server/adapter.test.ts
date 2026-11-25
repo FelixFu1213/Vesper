@@ -92,8 +92,15 @@ const gatedStream = () => {
   }> = [];
   const queued: ScriptedTurn[] = [];
   let requests = 0;
+  let resolveFirstRequest: () => void = () => undefined;
+  // The adapter owns no runtime until its first provider request, and a steer sent
+  // before that is declined, so a test that steers waits for this.
+  const firstRequest = new Promise<void>((resolve) => {
+    resolveFirstRequest = resolve;
+  });
   const streamFn: StreamFn = (model) => {
     requests += 1;
+    resolveFirstRequest();
     const stream = createAssistantMessageEventStream();
     const turn = queued.shift();
     if (turn === undefined) waiting.push({ model, stream });
@@ -102,6 +109,7 @@ const gatedStream = () => {
   };
   return {
     streamFn,
+    firstRequest,
     requestCount: () => requests,
     release: (turn: ScriptedTurn) => {
       const next = waiting.shift();
@@ -660,6 +668,7 @@ describe("makePiNativeAdapterV2", () => {
         "provider_turn.updated",
         (event) => event.providerTurn.status === "running",
       );
+      yield* Effect.promise(() => gated.firstRequest);
       yield* harness.runtime.steerTurn({
         threadId,
         runId: RunId.make("run-1"),

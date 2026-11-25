@@ -68,6 +68,7 @@ const makeRuntime = async (
     readonly initialGoal?: OrchestrationV2ProviderGoal | null;
     readonly maxGoalChecks?: number;
     readonly streamFn?: StreamFn;
+    readonly piAgentDir?: string;
   } = {},
 ): Promise<RuntimeHarness> => {
   const events: NativeSessionEvent[] = [];
@@ -89,6 +90,8 @@ const makeRuntime = async (
     requestUserInput: async () => input.answers ?? { answer: "yes" },
     ...(input.initialGoal === undefined ? {} : { initialGoal: input.initialGoal }),
     ...(input.maxGoalChecks === undefined ? {} : { maxGoalChecks: input.maxGoalChecks }),
+    // A developer's own global AGENTS.md and SYSTEM.md must never reach a test.
+    piAgentDir: input.piAgentDir ?? (await workspace()),
     now: () => 0,
     streamFn: input.streamFn ?? streamFn,
     scheduleTimer: () => () => undefined,
@@ -126,6 +129,35 @@ const workspace = async (files: Record<string, string> = {}): Promise<string> =>
   }
   return dir;
 };
+
+const writeFiles = async (root: string, files: Record<string, string>): Promise<void> => {
+  for (const [name, content] of Object.entries(files)) {
+    const target = NodePath.join(root, name);
+    await NodeFSP.mkdir(NodePath.dirname(target), { recursive: true });
+    await NodeFSP.writeFile(target, content, "utf8");
+  }
+};
+
+const isSystem = (message: { readonly role: string }): boolean => message.role === "system";
+
+const systemSections = (message: unknown): Record<string, string | null> =>
+  typeof message === "object" && message !== null && "sections" in message
+    ? ((message as { readonly sections?: Record<string, string | null> }).sections ?? {})
+    : {};
+
+/** Only the system deltas of one request, never the leading system message. */
+const requestDeltas = (
+  messages: ReadonlyArray<unknown>,
+): ReadonlyArray<Record<string, string | null>> =>
+  messages
+    .slice(1)
+    .filter(
+      (message): message is { readonly role: "system" } =>
+        typeof message === "object" &&
+        message !== null &&
+        (message as { readonly role?: unknown }).role === "system",
+    )
+    .map((message) => systemSections(message));
 
 describe("NativePiSessionRuntime", () => {
   it("streams assistant text and reasoning with usage", async () => {
@@ -822,12 +854,7 @@ describe("NativePiSessionRuntime", () => {
   it("boosts thinking for one workflow turn and restores it afterwards", async () => {
     const requests: Array<{ reasoning: string | undefined; activation: string | null }> = [];
     const streamFn: StreamFn = async (model, context, options) => {
-      const systems = context.messages.filter((message) => message.role === "system");
-      const last = systems.at(-1);
-      const sections =
-        last !== undefined && typeof last === "object" && "sections" in last
-          ? ((last as { readonly sections?: Record<string, string | null> }).sections ?? {})
-          : {};
+      const sections = systemSections(context.messages.filter(isSystem).at(-1));
       requests.push({
         reasoning: (options as { readonly reasoning?: string } | undefined)?.reasoning,
         activation: sections["tool_activation"] ?? null,
@@ -854,12 +881,7 @@ describe("NativePiSessionRuntime", () => {
       toolActivation: string | null | undefined;
     }> = [];
     const streamFn: StreamFn = async (model, context) => {
-      const systems = context.messages.filter((message) => message.role === "system");
-      const last = systems.at(-1);
-      const sections =
-        last !== undefined && typeof last === "object" && "sections" in last
-          ? ((last as { readonly sections?: Record<string, string | null> }).sections ?? {})
-          : {};
+      const sections = systemSections(context.messages.filter(isSystem).at(-1));
       requests.push({
         hasToolActivationKey: Object.hasOwn(sections, "tool_activation"),
         toolActivation: sections["tool_activation"],
@@ -880,6 +902,81 @@ describe("NativePiSessionRuntime", () => {
     assert.isTrue(requests[1]?.hasToolActivationKey);
     assert.isNull(requests[1]?.toolActivation);
     assert.match(requests[2]?.toolActivation ?? "", /workflow_command name="review"/u);
+    await harness.runtime.dispose();
+  });
+
+  it("leads with the custom system prompt and places the append and project rules after runtime", async () => {
+    const cwd = await workspace();
+    await writeFiles(cwd, { ".pi/SYSTEM.md": "Custom persona.", "AGENTS.md": "Repo rules." });
+    const piAgentDir = await workspace({
+      "SYSTEM.md": "Global persona.",
+      "APPEND_SYSTEM.md": "Global append.",
+      "AGENTS.md": "Global rules.",
+    });
+    const requests: Array<{
+      content: string | null;
+      sections: Record<string, string | null>;
+    }> = [];
+    const streamFn: StreamFn = async (model, context) => {
+      const leading = context.messages[0];
+      requests.push({
+        content: typeof leading?.content === "string" ? leading.content : null,
+        sections: systemSections(leading),
+      });
+      return renderScriptedTurn(model, scriptedTextResponse("ok"), 0);
+    };
+
+    const harness = await makeRuntime({ cwd, piAgentDir, streamFn });
+    await harness.runtime.runTurn({ text: "hi" });
+
+    assert.equal(requests[0]?.content, "Custom persona.");
+    assert.deepStrictEqual(Object.keys(requests[0]?.sections ?? {}), [
+      "runtime",
+      "custom_append",
+      "project_instructions",
+    ]);
+    assert.equal(requests[0]?.sections["custom_append"], "Global append.");
+    assert.include(requests[0]?.sections["project_instructions"] ?? "", "Global rules.");
+    assert.include(requests[0]?.sections["project_instructions"] ?? "", "Repo rules.");
+    await harness.runtime.dispose();
+  });
+
+  it("adds a nested AGENTS.md once a tool reaches its directory, and only when the chain changes", async () => {
+    const cwd = await workspace();
+    await writeFiles(cwd, {
+      "AGENTS.md": "root rules",
+      "pkg/AGENTS.md": "package rules",
+      "pkg/note.txt": "hello\n",
+      "pkg/other.txt": "again\n",
+    });
+    const scripted = createScriptedStreamFn(
+      [
+        scriptedToolCallResponse([
+          { name: "Read", arguments: { path: "pkg/note.txt" } },
+          { name: "Read", arguments: { path: "pkg/other.txt" } },
+        ]),
+        scriptedTextResponse("done"),
+        scriptedTextResponse("again"),
+      ],
+      { now: () => 0 },
+    );
+    const deltas: Array<Record<string, string | null>> = [];
+    const streamFn: StreamFn = async (model, context, options) => {
+      deltas.push(...requestDeltas(context.messages));
+      return scripted(model, context, options);
+    };
+
+    const harness = await makeRuntime({ cwd, streamFn });
+    await harness.runtime.runTurn({ text: "look at pkg" });
+    await harness.runtime.runTurn({ text: "keep going" });
+
+    const instructionDeltas = deltas.filter(
+      (sections) => sections["project_instructions"] !== undefined,
+    );
+    assert.lengthOf(instructionDeltas, 1);
+    assert.deepStrictEqual(Object.keys(instructionDeltas[0] ?? {}), ["project_instructions"]);
+    assert.include(instructionDeltas[0]?.["project_instructions"] ?? "", "root rules");
+    assert.include(instructionDeltas[0]?.["project_instructions"] ?? "", "package rules");
     await harness.runtime.dispose();
   });
 });

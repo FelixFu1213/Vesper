@@ -15,17 +15,49 @@ import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
 
 import {
-  applyHashlineEdits,
-  buildSimpleDiff,
-  computeFileHash,
-  computeLineTag,
+  applyEdit,
+  applyLegacyTextEdit,
+  findRecoveredPath,
+  legacyHashlineEditsToOps,
+  NamedRegisters,
+  type EditResult,
+  type EditSessionState,
+  type LegacyHashlineEdit,
+} from "./editEngine.ts";
+import {
+  computeFileTag,
+  decodeNormalizedFile,
+  detectLineEnding,
+  encodeNormalizedFile,
+  FILE_TAG_PATTERN,
+  formatSectionHeader,
+  normalizeLineEndings,
   splitFileLines,
-  type HashlineEdit,
-} from "./hashline.ts";
+  stripWriteMarkup,
+  type FileAnchorStore,
+  type NormalizedFile,
+} from "./fileAnchorTypes.ts";
+import { buildSimpleDiff } from "./hashline.ts";
 import { detectShellFilePatch, MutationRecoveryTracker } from "./mutationRecovery.ts";
+import {
+  isSensitivePath,
+  sensitivePathDeniedMessage,
+  WORKSPACE_PATH_DENIED,
+} from "./ignoreRules.ts";
 import { PathMutex } from "./pathLock.ts";
 import type { WorkspaceSandbox } from "./sandbox.ts";
-import { SeenLinesTracker } from "./hashline.ts";
+import {
+  canonicalizeToolParams,
+  describeDirectoryReadHint,
+  globFiles,
+  normalizeOutputMode,
+  PATH_PARAM_ALIASES,
+  searchFiles,
+  SEARCH_PARAM_ALIASES,
+  type GrepSearchResult,
+  type SearchFileAnchorSink,
+  type SearchOutputMode,
+} from "./searchTools.ts";
 
 const T3CODE_THREAD_ID_ENV = "T3CODE_THREAD_ID";
 
@@ -33,11 +65,9 @@ const DEFAULT_MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 const DEFAULT_MAX_OUTPUT_BYTES = 64 * 1024;
 const DEFAULT_MAX_GLOB_RESULTS = 500;
 const DEFAULT_MAX_GREP_MATCHES = 200;
-const DEFAULT_MAX_GREP_FILE_BYTES = 1024 * 1024;
 const DEFAULT_BASH_TIMEOUT_MS = 120_000;
 const DEFAULT_MAX_BASH_TIMEOUT_MS = 600_000;
-const MAX_PREVIEW_CHARS = 240;
-const SKIP_DIRECTORIES: ReadonlySet<string> = new Set([".git", "node_modules"]);
+const MAX_LINE_CHARS = 16_384;
 
 const IMAGE_MIME_TYPES: Readonly<Record<string, string>> = {
   ".png": "image/png",
@@ -76,8 +106,21 @@ export const EMPTY_TODO_SNAPSHOT: TodoSnapshot = {
 
 export interface GrepMatch {
   readonly fileName: string;
+  readonly tag: string;
   readonly line: number;
   readonly preview: string;
+  readonly clipped: boolean;
+}
+
+export interface GrepFileListing {
+  readonly fileName: string;
+  readonly tag: string;
+}
+
+export interface GrepCount {
+  readonly fileName: string;
+  readonly tag: string;
+  readonly count: number;
 }
 
 export interface ShellSpec {
@@ -87,7 +130,8 @@ export interface ShellSpec {
 
 export interface PiNativeToolDeps {
   readonly sandbox: WorkspaceSandbox;
-  readonly seen: SeenLinesTracker;
+  readonly anchors: FileAnchorStore;
+  readonly registers: NamedRegisters;
   readonly recovery: MutationRecoveryTracker;
   readonly locks: PathMutex;
   readonly requestUserInput: (
@@ -111,6 +155,8 @@ export interface PiNativeToolDeps {
   readonly maxOutputBytes?: number;
   readonly maxGlobResults?: number;
   readonly maxGrepMatches?: number;
+  readonly globalIgnoreFile?: string | null;
+  readonly rgPath?: string | null;
   readonly defaultBashTimeoutMs?: number;
   readonly maxBashTimeoutMs?: number;
 }
@@ -122,6 +168,7 @@ export interface ReadDetails {
   readonly totalLines: number;
   readonly truncated: boolean;
   readonly image: boolean;
+  readonly tag?: string;
 }
 
 export interface FileChangeDetails {
@@ -131,6 +178,9 @@ export interface FileChangeDetails {
   readonly diffStr: string;
   readonly oldStr: string;
   readonly newStr: string;
+  readonly tag?: string;
+  readonly warnings?: ReadonlyArray<string>;
+  readonly ops?: ReadonlyArray<string>;
 }
 
 export interface GlobDetails {
@@ -141,7 +191,10 @@ export interface GlobDetails {
 
 export interface GrepDetails {
   readonly pattern: string;
+  readonly outputMode: SearchOutputMode;
   readonly matches: ReadonlyArray<GrepMatch>;
+  readonly files: ReadonlyArray<GrepFileListing>;
+  readonly counts: ReadonlyArray<GrepCount>;
   readonly truncated: boolean;
 }
 
@@ -212,102 +265,33 @@ const ok = <T>(message: string, details: T): AgentToolResult<T> => ({
   details,
 });
 
-const readIfExists = async (target: string): Promise<string | undefined> => {
-  try {
-    return await NodeFSP.readFile(target, "utf8");
-  } catch (error) {
-    if (errorCode(error) === "ENOENT") return undefined;
-    throw error;
-  }
-};
-
-const imageMimeType = (target: string): string | undefined =>
-  IMAGE_MIME_TYPES[NodePath.extname(target).toLowerCase()];
-
-const escapeRegExp = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
-
-const globToRegExp = (pattern: string): RegExp => {
-  let source = "";
-  let index = 0;
-  while (index < pattern.length) {
-    const char = pattern.charAt(index);
-    if (char === "*") {
-      if (pattern.charAt(index + 1) === "*") {
-        if (pattern.charAt(index + 2) === "/") {
-          source += "(?:.*/)?";
-          index += 3;
-          continue;
-        }
-        source += ".*";
-        index += 2;
-        continue;
-      }
-      source += "[^/]*";
-      index++;
-      continue;
-    }
-    if (char === "?") {
-      source += "[^/]";
-      index++;
-      continue;
-    }
-    if (char === "{") {
-      const close = pattern.indexOf("}", index);
-      if (close !== -1) {
-        const options = pattern
-          .slice(index + 1, close)
-          .split(",")
-          .map((option) => escapeRegExp(option));
-        source += `(?:${options.join("|")})`;
-        index = close + 1;
-        continue;
-      }
-    }
-    source += escapeRegExp(char);
-    index++;
-  }
-  return new RegExp(`^${source}$`, "u");
-};
-
 const toPosix = (value: string): string => value.split(NodePath.sep).join("/");
 
-const matchesGlob = (matcher: RegExp, pattern: string, relativePath: string): boolean => {
-  const normalized = toPosix(relativePath);
-  return matcher.test(pattern.includes("/") ? normalized : NodePath.basename(normalized));
-};
-
-interface WalkRequest {
-  readonly root: string;
-  readonly isFull: () => boolean;
-  readonly visit: (fullPath: string, relativePath: string) => Promise<void> | void;
-}
-
-const walk = async (request: WalkRequest): Promise<boolean> => {
-  const stack: Array<string> = [request.root];
-  while (stack.length > 0) {
-    if (request.isFull()) return true;
-    const current = stack.pop();
-    if (current === undefined) break;
-    let entries;
-    try {
-      entries = await NodeFSP.readdir(current, { withFileTypes: true });
-    } catch {
+const formatGrepBody = (result: GrepSearchResult, pattern: string, root: string): string => {
+  if (result.files.length === 0) return `No matches for ${pattern} under ${root}.`;
+  const lines: Array<string> = [];
+  for (const file of result.files) {
+    const header = `[${file.path}#${file.tag}]`;
+    if (result.mode === "content") {
+      lines.push(header);
+      for (const hit of file.hits) lines.push(`${hit.line}: ${hit.text}`);
       continue;
     }
-    entries.sort((left, right) => left.name.localeCompare(right.name));
-    for (const entry of entries) {
-      if (request.isFull()) return true;
-      const fullPath = NodePath.join(current, entry.name);
-      if (entry.isDirectory()) {
-        if (!SKIP_DIRECTORIES.has(entry.name)) stack.push(fullPath);
-        continue;
-      }
-      if (!entry.isFile()) continue;
-      await request.visit(fullPath, NodePath.relative(request.root, fullPath));
+    if (result.mode === "filesWithMatches") {
+      lines.push(header);
+      continue;
     }
+    lines.push(`${file.count}  ${header}`);
   }
-  return false;
+  const noun = result.mode === "filesWithMatches" ? "files" : "matches";
+  const summary =
+    result.mode === "filesWithMatches"
+      ? `[${result.files.length} ${noun}${result.truncated ? ", truncated" : ""}]`
+      : `[${result.totalMatches} ${noun} in ${result.files.length} files${result.truncated ? ", truncated" : ""}]`;
+  return `${lines.join("\n")}\n\n${summary}`;
 };
+const imageMimeType = (target: string): string | undefined =>
+  IMAGE_MIME_TYPES[NodePath.extname(target).toLowerCase()];
 
 const toUserInputQuestion = (question: {
   readonly id: string;
@@ -341,7 +325,7 @@ const toUserInputQuestion = (question: {
   ...(question.required === undefined ? {} : { required: question.required }),
 });
 
-const asHashlineEdit = (value: unknown): HashlineEdit | undefined => {
+const asLegacyHashlineEdit = (value: unknown): LegacyHashlineEdit | undefined => {
   const record = asRecord(value);
   if (record === undefined) return undefined;
   if (
@@ -374,13 +358,15 @@ const asHashlineEdit = (value: unknown): HashlineEdit | undefined => {
 };
 
 const READ_PARAMS = obj({
-  path: str({ description: "File path, absolute or relative to the workspace folder." }),
+  path: opt(str({ description: "File path, absolute or relative to the workspace folder." })),
+  file_path: opt(str({ description: "Alias for path." })),
   offset: opt(int({ minimum: 1, description: "First line to read, 1-indexed." })),
   limit: opt(int({ minimum: 1, description: "How many lines to read." })),
 });
 
 const WRITE_PARAMS = obj({
-  path: str({ description: "File path to create or overwrite." }),
+  path: opt(str({ description: "File path to create or overwrite." })),
+  file_path: opt(str({ description: "Alias for path." })),
   content: str({ description: "Full file content after the write." }),
 });
 
@@ -404,22 +390,50 @@ const HASHLINE_EDIT_SCHEMA = union([
 ]);
 
 const EDIT_PARAMS = obj({
-  path: str({ description: "File path to edit." }),
-  edits: opt(arr(HASHLINE_EDIT_SCHEMA, { description: "Hashline edits using tags from Read." })),
-  oldText: opt(str({ description: "Exact text to replace when edits is omitted." })),
-  newText: opt(str({ description: "Replacement text for oldText." })),
+  path: opt(str({ description: "File path to edit. Edit never creates files; use Write." })),
+  file_path: opt(str({ description: "Alias for path." })),
+  tag: opt(
+    str({
+      description:
+        "4 uppercase hex from the latest Read, Grep, Write, or Edit result for this path.",
+    }),
+  ),
+  ops: opt(
+    str({
+      description:
+        'Operation headers and + body rows, newline separated: "PUT 12.=14:", "PUT <3:", "PUT >$", "CUT 7.=9", "PUT 12*", "MV dest.ts", "REM".',
+    }),
+  ),
+  edits: opt(
+    arr(HASHLINE_EDIT_SCHEMA, {
+      description: "Legacy hashline edits; ops is preferred.",
+    }),
+  ),
+  oldText: opt(str({ description: "Legacy compatibility: exact text to replace." })),
+  newText: opt(str({ description: "Legacy compatibility: replacement text for oldText." })),
+  old_string: opt(str({ description: "Legacy compatibility alias for oldText." })),
+  new_string: opt(str({ description: "Legacy compatibility alias for newText." })),
 });
 
 const GLOB_PARAMS = obj({
-  pattern: str({ description: 'Glob such as "**/*.ts".' }),
+  pattern: opt(str({ description: 'Glob such as "**/*.ts".' })),
+  query: opt(str({ description: "Alias for pattern." })),
   path: opt(str({ description: "Directory to search; defaults to the workspace folder." })),
 });
 
 const GREP_PARAMS = obj({
-  pattern: str({ description: "Regular expression to search for." }),
+  pattern: opt(str({ description: "Regular expression to search for." })),
+  query: opt(str({ description: "Alias for pattern." })),
   path: opt(str({ description: "Directory or file to search; defaults to the workspace folder." })),
-  glob: opt(str({ description: "Only search files matching this glob." })),
-  caseSensitive: opt(bool({ description: "Set false for a case-insensitive search." })),
+  include: opt(str({ description: 'Only search files matching this glob, such as "*.ts".' })),
+  glob: opt(str({ description: "Alias for include." })),
+  outputMode: opt(
+    str({ description: "content, filesWithMatches, or count. Defaults to content." }),
+  ),
+  output_mode: opt(str({ description: "Alias for outputMode." })),
+  caseInsensitive: opt(bool({ description: "Set true for a case-insensitive search." })),
+  headLimit: opt(int({ minimum: 1, description: "Maximum matches or files to return." })),
+  head_limit: opt(int({ minimum: 1, description: "Alias for headLimit." })),
 });
 
 const BASH_PARAMS = obj({
@@ -575,8 +589,6 @@ const GOAL_STATUS_PARAMS = obj({
   summary: str({ description: "A concise check or verification summary." }),
 });
 
-const isFull = (count: number, limit: number): boolean => count >= limit;
-
 const isAborted = (signal: AbortSignal | undefined): boolean => signal?.aborted === true;
 
 const defaultShell = (): ShellSpec =>
@@ -599,24 +611,86 @@ export const createPiNativeTools = (deps: PiNativeToolDeps): ReadonlyArray<Agent
     return `Stop mutating ${target}: ${state.strikes} edits failed in a row. Re-read the file and ask the user how to proceed.`;
   };
 
-  const commit = async (
+  const displayPath = (target: string): string => {
+    const cwd = deps.sandbox.cwd;
+    if (cwd === null) return target;
+    const relative = NodePath.relative(cwd, target);
+    return relative === "" || relative.startsWith("..") || NodePath.isAbsolute(relative)
+      ? target
+      : toPosix(relative);
+  };
+
+  const allLines = (text: string): ReadonlySet<number> =>
+    new Set(splitFileLines(text).map((_line, index) => index + 1));
+
+  const readNormalized = async (target: string): Promise<NormalizedFile | undefined> => {
+    try {
+      return decodeNormalizedFile(await NodeFSP.readFile(target));
+    } catch (error) {
+      if (errorCode(error) === "ENOENT") return undefined;
+      throw error;
+    }
+  };
+
+  const emptyReadDetails = (target: string): ReadDetails => ({
+    path: target,
+    startLine: 0,
+    endLine: 0,
+    totalLines: 0,
+    truncated: false,
+    image: false,
+  });
+
+  const commitContent = async (
     target: string,
-    before: string,
-    after: string,
+    beforeText: string,
+    after: NormalizedFile,
   ): Promise<FileChangeDetails> => {
     await NodeFSP.mkdir(NodePath.dirname(target), { recursive: true });
-    await NodeFSP.writeFile(target, after, "utf8");
-    const diff = buildSimpleDiff(target, before, after);
-    deps.seen.recordWrite(target, after);
+    await NodeFSP.writeFile(target, encodeNormalizedFile(after));
+    const diff = buildSimpleDiff(target, beforeText, after.text);
+    const tag = deps.anchors.record(target, after.text, allLines(after.text));
     deps.recovery.recordSuccess(target);
     return {
       fileName: NodePath.basename(target),
       additions: diff.additions,
       deletions: diff.deletions,
       diffStr: diff.diffStr,
-      oldStr: before,
-      newStr: after,
+      oldStr: beforeText,
+      newStr: after.text,
+      tag,
     };
+  };
+
+  const editSession = (): EditSessionState => ({
+    store: deps.anchors,
+    registers: deps.registers,
+  });
+
+  const describeEditFailure = (
+    failure: {
+      readonly code: string;
+      readonly message: string;
+      readonly extras?: {
+        readonly unseenLines?: ReadonlyArray<{
+          readonly line: number;
+          readonly text: string;
+          readonly clipped: boolean;
+        }>;
+      };
+    },
+    target: string,
+  ): string => {
+    const state = deps.recovery.recordFailure(target, failure.code);
+    const reveal = (failure.extras?.unseenLines ?? []).map(
+      (row) => `${row.line}: ${row.text}${row.clipped ? " ..." : ""}`,
+    );
+    return [
+      `${failure.code}: ${failure.message}`,
+      ...(reveal.length === 0 ? [] : ["", ...reveal]),
+      "",
+      state.message,
+    ].join("\n");
   };
 
   const readTool: AgentTool<typeof READ_PARAMS, ReadDetails> = {
@@ -625,21 +699,25 @@ export const createPiNativeTools = (deps: PiNativeToolDeps): ReadonlyArray<Agent
     description:
       "Read a file from the workspace. Text comes back as lineNum:tag|line; use those tags for Edit.",
     parameters: READ_PARAMS,
-    execute: async (_toolCallId, params) => {
+    execute: async (_toolCallId, rawParams) => {
+      const params = canonicalizeToolParams(rawParams, PATH_PARAM_ALIASES);
+      const path = params.path;
+      if (path === undefined) {
+        return fail("A path is required.", emptyReadDetails(""));
+      }
       try {
-        const resolution = await deps.sandbox.resolvePath(params.path, "read");
+        const resolution = await deps.sandbox.resolvePath(path, "read");
         const target = resolution.resolvedPath;
+        if (isSensitivePath(target)) {
+          return fail(sensitivePathDeniedMessage(target), emptyReadDetails(target));
+        }
         return await deps.locks.withReadLock(target, async () => {
           const stat = await NodeFSP.stat(target);
+          if (stat.isDirectory()) {
+            return fail(describeDirectoryReadHint(target), emptyReadDetails(target));
+          }
           if (!stat.isFile()) {
-            return fail(`${target} is not a regular file.`, {
-              path: target,
-              startLine: 0,
-              endLine: 0,
-              totalLines: 0,
-              truncated: false,
-              image: false,
-            });
+            return fail(`${target} is not a regular file.`, emptyReadDetails(target));
           }
           const mimeType = imageMimeType(target);
           if (mimeType !== undefined) {
@@ -675,33 +753,50 @@ export const createPiNativeTools = (deps: PiNativeToolDeps): ReadonlyArray<Agent
             };
           }
 
-          const content = await NodeFSP.readFile(target, "utf8");
+          const file = decodeNormalizedFile(await NodeFSP.readFile(target));
           deps.recovery.recordSuccess(target);
 
-          const lines = splitFileLines(content).lines;
+          const lines = splitFileLines(file.text);
           const totalLines = lines.length;
+          const tag = computeFileTag(file.text);
+          const header = formatSectionHeader(displayPath(target), tag);
           if (totalLines === 0) {
-            return ok("The file is empty.", {
+            deps.anchors.record(target, file.text, new Set());
+            return ok(`${header}\n[file is empty]`, {
               path: target,
               startLine: 0,
               endLine: 0,
               totalLines: 0,
               truncated: false,
               image: false,
+              tag,
             });
           }
           const startLine = Math.min(Math.max(params.offset ?? 1, 1), totalLines);
           const limit = params.limit ?? totalLines - startLine + 1;
           const endLine = Math.min(startLine + Math.max(limit, 1) - 1, totalLines);
-          const slice = lines.slice(startLine - 1, endLine);
-          const formatted = slice
-            .map((line, index) => `${startLine + index}:${computeLineTag(line)}|${line}`)
+          const seen = new Set<number>();
+          const formatted = lines
+            .slice(startLine - 1, endLine)
+            .map((line, index) => {
+              const lineNumber = startLine + index;
+              const chars = [...line];
+              if (chars.length <= MAX_LINE_CHARS) seen.add(lineNumber);
+              return `${lineNumber}:${chars.slice(0, MAX_LINE_CHARS).join("")}`;
+            })
             .join("\n");
-          deps.seen.recordRead(target, startLine, endLine, computeFileHash(content));
+          deps.anchors.record(target, file.text, seen);
+          const clipped = endLine - startLine + 1 - seen.size;
           const truncated = endLine < totalLines || startLine > 1;
-          const body = truncated
-            ? `${formatted}\n\n[lines ${startLine}-${endLine} of ${totalLines}]`
-            : formatted;
+          const footer = [
+            ...(truncated ? [`[lines ${startLine}-${endLine} of ${totalLines}]`] : []),
+            ...(clipped === 0
+              ? []
+              : [`[${clipped} line(s) clipped at ${MAX_LINE_CHARS} characters]`]),
+          ];
+          const body = [header, formatted, ...(footer.length === 0 ? [] : ["", ...footer])].join(
+            "\n",
+          );
           return ok(body, {
             path: target,
             startLine,
@@ -709,17 +804,11 @@ export const createPiNativeTools = (deps: PiNativeToolDeps): ReadonlyArray<Agent
             totalLines,
             truncated,
             image: false,
+            tag,
           });
         });
       } catch (error) {
-        return fail(`Could not read ${params.path}: ${describe(error)}`, {
-          path: params.path,
-          startLine: 0,
-          endLine: 0,
-          totalLines: 0,
-          truncated: false,
-          image: false,
-        });
+        return fail(`Could not read ${path}: ${describe(error)}`, emptyReadDetails(path));
       }
     },
   };
@@ -730,9 +819,17 @@ export const createPiNativeTools = (deps: PiNativeToolDeps): ReadonlyArray<Agent
       label: "Write",
       description: "Create or overwrite a file with the full content, then return the diff.",
       parameters: WRITE_PARAMS,
-      execute: async (_toolCallId, params) => {
+      execute: async (_toolCallId, rawParams) => {
+        const params = canonicalizeToolParams(rawParams, PATH_PARAM_ALIASES);
+        const path = params.path;
+        if (path === undefined)
+          return fail("A path is required.", { error: "A path is required." });
         try {
-          const resolution = await deps.sandbox.resolvePath(params.path, "write");
+          const resolution = await deps.sandbox.resolvePath(path, "write");
+          const target = resolution.resolvedPath;
+          if (isSensitivePath(target)) {
+            return fail(sensitivePathDeniedMessage(target), { error: WORKSPACE_PATH_DENIED });
+          }
           if (resolution.denied) {
             return fail(
               resolution.writeDeniedReason ?? `${resolution.resolvedPath} is read-only.`,
@@ -741,19 +838,24 @@ export const createPiNativeTools = (deps: PiNativeToolDeps): ReadonlyArray<Agent
               },
             );
           }
-          const target = resolution.resolvedPath;
           return await deps.locks.withWriteLock(target, async () => {
             const guard = writeGuard(target);
             if (guard !== undefined) return fail(guard, { error: guard });
-            const before = (await readIfExists(target)) ?? "";
-            const details = await commit(target, before, params.content);
+            const existing = await readNormalized(target);
+            const after: NormalizedFile = {
+              text: normalizeLineEndings(stripWriteMarkup(params.content)),
+              ending: existing?.ending ?? detectLineEnding(params.content),
+              bom: existing?.bom ?? false,
+              utf16: existing?.utf16,
+            };
+            const details = await commitContent(target, existing?.text ?? "", after);
             return ok(
-              `Wrote ${target} (${details.additions} additions, ${details.deletions} deletions).`,
+              `Wrote ${formatSectionHeader(displayPath(target), details.tag ?? "")} (${details.additions} additions, ${details.deletions} deletions).`,
               details,
             );
           });
         } catch (error) {
-          return fail(`Could not write ${params.path}: ${describe(error)}`, {
+          return fail(`Could not write ${path}: ${describe(error)}`, {
             error: describe(error),
           });
         }
@@ -764,97 +866,214 @@ export const createPiNativeTools = (deps: PiNativeToolDeps): ReadonlyArray<Agent
     name: "Edit",
     label: "Edit",
     description:
-      "Change a file with hashline edits that cite the tags from Read, or with one exact oldText replacement.",
+      "Edit one existing file by position. Send the tag from Read, Grep, Write, or your last Edit, plus ops such as `PUT 12.=14:` with `+TEXT` rows, `PUT <3:`, `PUT >$:`, `CUT 7.=9`, `PUT 12*`, `MV dest.ts`, or `REM`. Body rows are the final content only.",
     parameters: EDIT_PARAMS,
-    execute: async (_toolCallId, params) => {
-      let target = params.path;
+    execute: async (_toolCallId, rawParams) => {
+      const params = canonicalizeToolParams(rawParams, PATH_PARAM_ALIASES);
+      const path = params.path;
+      if (path === undefined) {
+        return fail("A path is required.", { error: "A path is required." });
+      }
       try {
-        const resolution = await deps.sandbox.resolvePath(params.path, "write");
+        let resolution = await deps.sandbox.resolvePath(path, "write");
+        if (isSensitivePath(resolution.resolvedPath)) {
+          return fail(sensitivePathDeniedMessage(resolution.resolvedPath), {
+            error: WORKSPACE_PATH_DENIED,
+          });
+        }
         if (resolution.denied) {
           return fail(resolution.writeDeniedReason ?? `${resolution.resolvedPath} is read-only.`, {
             error: resolution.writeDeniedReason ?? "read-only path",
           });
         }
-        target = resolution.resolvedPath;
+        let target = resolution.resolvedPath;
+        const rawTag = params.tag?.trim().toUpperCase() ?? "";
+        let file = await readNormalized(target);
+        if (file === undefined && FILE_TAG_PATTERN.test(rawTag)) {
+          const recovered = findRecoveredPath(deps.anchors, path, target, rawTag);
+          if (recovered !== undefined) {
+            resolution = await deps.sandbox.resolvePath(recovered, "write");
+            if (isSensitivePath(resolution.resolvedPath)) {
+              return fail(sensitivePathDeniedMessage(resolution.resolvedPath), {
+                error: WORKSPACE_PATH_DENIED,
+              });
+            }
+            if (resolution.denied) {
+              return fail(
+                resolution.writeDeniedReason ?? `${resolution.resolvedPath} is read-only.`,
+                { error: resolution.writeDeniedReason ?? "read-only path" },
+              );
+            }
+            target = resolution.resolvedPath;
+            file = await readNormalized(target);
+          }
+        }
+        if (file === undefined) {
+          return fail(`Cannot edit ${target}: the file does not exist. Use Write first.`, {
+            error: "missing file",
+          });
+        }
+        const live = file;
         return await deps.locks.withWriteLock(
           target,
           async (): Promise<AgentToolResult<FileChangeDetails | { readonly error: string }>> => {
             const guard = writeGuard(target);
             if (guard !== undefined) return fail(guard, { error: guard });
-            const before = await readIfExists(target);
-            if (before === undefined) {
-              return fail(`Cannot edit ${target}: the file does not exist. Use Write first.`, {
-                error: "missing file",
+            const session = editSession();
+            const oldText = params.oldText ?? params.old_string;
+            const newText = params.newText ?? params.new_string;
+            const extraWarnings: Array<string> = [];
+            let result: EditResult;
+            if (params.ops !== undefined) {
+              result = applyEdit({
+                path,
+                canonicalPath: target,
+                tag: rawTag,
+                ops: params.ops,
+                text: live.text,
+                session,
               });
-            }
-
-            const rawEdits: unknown = params.edits;
-            if (params.edits !== undefined) {
-              if (!Array.isArray(rawEdits)) {
-                return fail("edits must be an array of hashline edits.", {
+            } else if (oldText !== undefined) {
+              if (newText === undefined) {
+                return fail("oldText needs newText; send ops with the file tag instead.", {
+                  error: "missing newText",
+                });
+              }
+              result = applyLegacyTextEdit({
+                path,
+                canonicalPath: target,
+                text: live.text,
+                oldText,
+                newText,
+                session,
+              });
+            } else if (params.edits !== undefined) {
+              if (!Array.isArray(params.edits)) {
+                return fail("edits must be an array of PUT, CUT, or INS objects.", {
                   error: "invalid edits",
                 });
               }
-              const edits: Array<HashlineEdit> = [];
-              for (const value of rawEdits) {
-                const edit = asHashlineEdit(value);
+              const legacy: Array<LegacyHashlineEdit> = [];
+              for (const value of params.edits) {
+                const edit = asLegacyHashlineEdit(value);
                 if (edit === undefined) {
                   return fail("An edit is not a valid PUT, CUT, or INS object.", {
                     error: "invalid edit",
                   });
                 }
-                edits.push(edit);
+                legacy.push(edit);
               }
-              const applied = applyHashlineEdits(before, edits, {
-                isSeen: (line) => deps.seen.hasSeenRange(target, line, line),
+              const lowered = legacyHashlineEditsToOps(legacy);
+              if ("ok" in lowered) {
+                return fail(`${lowered.code}: ${lowered.message}`, { error: lowered.code });
+              }
+              if (!FILE_TAG_PATTERN.test(rawTag)) {
+                extraWarnings.push(
+                  "edits[] carried no tag; applied to the live file with the provenance gate",
+                );
+              }
+              result = applyEdit({
+                path,
+                canonicalPath: target,
+                tag: FILE_TAG_PATTERN.test(rawTag) ? rawTag : computeFileTag(live.text),
+                ops: lowered.ops,
+                text: live.text,
+                session,
               });
-              if (!applied.ok) {
-                const state = deps.recovery.recordFailure(target, applied.error.code);
-                return fail(`${applied.error.code}: ${applied.error.message}\n\n${state.message}`, {
-                  error: applied.error.code,
-                });
-              }
-              const details = await commit(target, before, applied.content);
-              return ok(
-                `Edited ${target} (${details.additions} additions, ${details.deletions} deletions).`,
-                details,
-              );
-            }
-
-            const { oldText, newText } = params;
-            if (oldText === undefined || newText === undefined) {
-              return fail("Provide edits, or both oldText and newText.", {
+            } else {
+              return fail("Provide ops with tag, edits, or oldText/newText.", {
                 error: "no edit given",
               });
             }
-            if (oldText === "") {
-              return fail("oldText must not be empty; use Write to create a file.", {
-                error: "empty oldText",
+            if (!result.ok) {
+              return fail(describeEditFailure(result, target), { error: result.code });
+            }
+
+            let movedTo: string | undefined;
+            if (result.movedTo !== undefined) {
+              const dest = await deps.sandbox.resolvePath(result.movedTo, "write");
+              if (isSensitivePath(dest.resolvedPath)) {
+                return fail(sensitivePathDeniedMessage(dest.resolvedPath), {
+                  error: WORKSPACE_PATH_DENIED,
+                });
+              }
+              if (dest.denied) {
+                return fail(dest.writeDeniedReason ?? `${dest.resolvedPath} is read-only.`, {
+                  error: dest.writeDeniedReason ?? "read-only path",
+                });
+              }
+              if (dest.resolvedPath === target) {
+                deps.recovery.recordFailure(target, "EDIT_NO_CHANGE");
+                return fail(
+                  `EDIT_NO_CHANGE: MV ${result.movedTo} resolves to ${target}; the source is untouched. Use a distinct destination.`,
+                  { error: "EDIT_NO_CHANGE" },
+                );
+              }
+              movedTo = dest.resolvedPath;
+            }
+
+            if (result.deleteFile) {
+              await NodeFSP.rm(target, { force: true });
+              deps.anchors.invalidatePath(target);
+              deps.recovery.recordSuccess(target);
+              const diff = buildSimpleDiff(target, live.text, "");
+              return ok(`Removed ${formatSectionHeader(displayPath(target), result.tag)}.`, {
+                fileName: NodePath.basename(target),
+                additions: diff.additions,
+                deletions: diff.deletions,
+                diffStr: diff.diffStr,
+                oldStr: live.text,
+                newStr: "",
+                tag: result.tag,
+                warnings: [...extraWarnings, ...result.warnings],
+                ops: result.ops,
               });
             }
-            const occurrences = before.split(oldText).length - 1;
-            if (occurrences === 0) {
-              return fail(
-                `oldText does not appear in ${target}. Re-read the file and copy the text exactly.`,
-                { error: "oldText not found" },
-              );
-            }
-            if (occurrences > 1) {
-              return fail(
-                `oldText appears ${occurrences} times in ${target}. Include more surrounding text so it is unique.`,
-                { error: "oldText is ambiguous" },
-              );
-            }
-            const after = before.replace(oldText, newText);
-            const details = await commit(target, before, after);
-            return ok(
-              `Edited ${target} (${details.additions} additions, ${details.deletions} deletions).`,
-              details,
+
+            await NodeFSP.mkdir(NodePath.dirname(target), { recursive: true });
+            await NodeFSP.writeFile(
+              target,
+              encodeNormalizedFile({
+                text: result.text,
+                ending: live.ending,
+                bom: live.bom,
+                utf16: live.utf16,
+              }),
             );
+            if (movedTo === undefined) {
+              deps.anchors.record(target, result.text, allLines(result.text));
+            } else {
+              await NodeFSP.mkdir(NodePath.dirname(movedTo), { recursive: true });
+              await NodeFSP.rename(target, movedTo);
+              deps.anchors.invalidatePath(target);
+              deps.anchors.record(movedTo, result.text, allLines(result.text));
+              deps.recovery.recordSuccess(movedTo);
+            }
+            deps.recovery.recordSuccess(target);
+
+            const finalPath = movedTo ?? target;
+            const diff = buildSimpleDiff(target, live.text, result.text);
+            const warnings = [...extraWarnings, ...result.warnings];
+            const summary = `Edited ${formatSectionHeader(displayPath(finalPath), result.tag)} (${diff.additions} additions, ${diff.deletions} deletions).`;
+            const blockLines = result.blocks.map(
+              (block) => `[block] ${block.op} -> lines ${block.start}-${block.end}`,
+            );
+            const warningLines = warnings.map((warning) => `[warning] ${warning}`);
+            return ok([summary, ...blockLines, ...warningLines].join("\n"), {
+              fileName: NodePath.basename(finalPath),
+              additions: diff.additions,
+              deletions: diff.deletions,
+              diffStr: diff.diffStr,
+              oldStr: live.text,
+              newStr: result.text,
+              tag: result.tag,
+              warnings,
+              ops: result.ops,
+            });
           },
         );
       } catch (error) {
-        return fail(`Could not edit ${params.path}: ${describe(error)}`, {
+        return fail(`Could not edit ${path}: ${describe(error)}`, {
           error: describe(error),
         });
       }
@@ -864,34 +1083,48 @@ export const createPiNativeTools = (deps: PiNativeToolDeps): ReadonlyArray<Agent
   const globTool: AgentTool<typeof GLOB_PARAMS, GlobDetails> = {
     name: "Glob",
     label: "Glob",
-    description: "Find files by glob under the workspace, skipping .git and node_modules.",
+    description:
+      "Find files by glob under the workspace. Results are ordered newest first and honor workspace ignore rules.",
     parameters: GLOB_PARAMS,
-    execute: async (_toolCallId, params) => {
+    execute: async (_toolCallId, rawParams) => {
+      const params = canonicalizeToolParams(rawParams, SEARCH_PARAM_ALIASES);
+      const pattern = params.pattern;
+      if (pattern === undefined) {
+        return fail("A glob pattern is required.", {
+          pattern: "",
+          files: [],
+          truncated: false,
+        });
+      }
       try {
         const resolution = await deps.sandbox.resolvePath(params.path ?? ".", "read");
         const root = resolution.resolvedPath;
-        const matcher = globToRegExp(params.pattern);
-        const files: Array<string> = [];
-        const truncated = await walk({
+        const stat = await NodeFSP.stat(root);
+        if (!stat.isDirectory()) {
+          return fail(`${root} is not a directory; Glob searches a directory.`, {
+            pattern,
+            files: [],
+            truncated: false,
+          });
+        }
+        const result = await globFiles({
           root,
-          isFull: () => isFull(files.length, maxGlobResults),
-          visit: (_fullPath, relativePath) => {
-            if (matchesGlob(matcher, params.pattern, relativePath)) {
-              files.push(toPosix(relativePath));
-            }
-          },
+          ignoreRoot: deps.sandbox.cwd ?? root,
+          scoped: params.path !== undefined,
+          pattern,
+          limit: maxGlobResults,
+          ...(deps.globalIgnoreFile === undefined
+            ? {}
+            : { globalIgnoreFile: deps.globalIgnoreFile }),
         });
-        const sorted = files
-          .slice(0, maxGlobResults)
-          .sort((left, right) => left.localeCompare(right));
         const body =
-          sorted.length === 0
-            ? `No files match ${params.pattern} under ${root}.`
-            : `${sorted.join("\n")}\n\n[${sorted.length} files${truncated ? ", truncated" : ""}]`;
-        return ok(body, { pattern: params.pattern, files: sorted, truncated });
+          result.files.length === 0
+            ? `No files match ${pattern} under ${root}.`
+            : `${result.files.join("\n")}\n\n[${result.files.length} files${result.truncated ? ", truncated" : ""}]`;
+        return ok(body, { pattern, files: result.files, truncated: result.truncated });
       } catch (error) {
-        return fail(`Could not glob ${params.pattern}: ${describe(error)}`, {
-          pattern: params.pattern,
+        return fail(`Could not glob ${pattern}: ${describe(error)}`, {
+          pattern,
           files: [],
           truncated: false,
         });
@@ -899,78 +1132,92 @@ export const createPiNativeTools = (deps: PiNativeToolDeps): ReadonlyArray<Agent
     },
   };
 
+  const emptyGrepDetails = (pattern: string): GrepDetails => ({
+    pattern,
+    outputMode: "content",
+    matches: [],
+    files: [],
+    counts: [],
+    truncated: false,
+  });
+
   const grepTool: AgentTool<typeof GREP_PARAMS, GrepDetails> = {
     name: "Grep",
     label: "Grep",
-    description: "Search text files for a regular expression, skipping binaries and .git.",
+    description:
+      "Search text files for a regular expression. Results are ordered newest first, honor workspace ignore rules, and can return content, filesWithMatches, or count.",
     parameters: GREP_PARAMS,
-    execute: async (_toolCallId, params) => {
+    execute: async (_toolCallId, rawParams) => {
+      const params = canonicalizeToolParams(rawParams, {
+        ...PATH_PARAM_ALIASES,
+        ...SEARCH_PARAM_ALIASES,
+      });
+      const pattern = params.pattern;
+      if (pattern === undefined) {
+        return fail("A pattern is required.", emptyGrepDetails(""));
+      }
+      let outputMode: SearchOutputMode;
+      try {
+        outputMode = normalizeOutputMode(params.outputMode);
+      } catch (error) {
+        return fail(describe(error), emptyGrepDetails(pattern));
+      }
       try {
         const resolution = await deps.sandbox.resolvePath(params.path ?? ".", "read");
         const root = resolution.resolvedPath;
-        let regex: RegExp;
-        try {
-          regex = new RegExp(params.pattern, params.caseSensitive === false ? "iu" : "u");
-        } catch (error) {
-          return fail(`Invalid pattern: ${describe(error)}`, {
-            pattern: params.pattern,
-            matches: [],
-            truncated: false,
-          });
-        }
-        const globMatcher = params.glob === undefined ? undefined : globToRegExp(params.glob);
-        const matches: Array<GrepMatch> = [];
-
-        const searchFile = async (fullPath: string): Promise<void> => {
-          const stat = await NodeFSP.stat(fullPath);
-          if (stat.size > DEFAULT_MAX_GREP_FILE_BYTES) return;
-          const buffer = await NodeFSP.readFile(fullPath);
-          if (buffer.subarray(0, 8000).includes(0)) return;
-          const lines = buffer.toString("utf8").split(/\r?\n/u);
-          for (let index = 0; index < lines.length; index++) {
-            if (isFull(matches.length, maxGrepMatches)) return;
-            const line = lines[index] ?? "";
-            regex.lastIndex = 0;
-            if (!regex.test(line)) continue;
-            matches.push({
-              fileName: fullPath,
-              line: index + 1,
-              preview: line.trim().slice(0, MAX_PREVIEW_CHARS),
-            });
-          }
+        const anchorSink: SearchFileAnchorSink = {
+          recordContentHits: ({ path, content, lines }) => {
+            deps.anchors.record(path, normalizeLineEndings(content), new Set(lines));
+          },
         };
-
-        const stat = await NodeFSP.stat(root);
-        let truncated = false;
-        if (stat.isFile()) {
-          await searchFile(root);
-        } else {
-          truncated = await walk({
-            root,
-            isFull: () => isFull(matches.length, maxGrepMatches),
-            visit: async (fullPath, relativePath) => {
-              const glob = params.glob;
-              if (globMatcher !== undefined && glob !== undefined) {
-                if (!matchesGlob(globMatcher, glob, relativePath)) return;
-              }
-              await searchFile(fullPath);
-            },
-          });
-        }
-
-        const body =
-          matches.length === 0
-            ? `No matches for ${params.pattern} under ${root}.`
-            : `${matches
-                .map((match) => `${match.fileName}:${match.line}: ${match.preview}`)
-                .join("\n")}\n\n[${matches.length} matches${truncated ? ", truncated" : ""}]`;
-        return ok(body, { pattern: params.pattern, matches, truncated });
-      } catch (error) {
-        return fail(`Could not grep ${params.pattern}: ${describe(error)}`, {
-          pattern: params.pattern,
-          matches: [],
-          truncated: false,
+        const result = await searchFiles({
+          root,
+          ignoreRoot: deps.sandbox.cwd ?? root,
+          scoped: params.path !== undefined,
+          pattern,
+          outputMode,
+          caseInsensitive: params.caseInsensitive === true,
+          headLimit: Math.max(1, params.headLimit ?? maxGrepMatches),
+          anchorSink,
+          ...(params.include === undefined ? {} : { include: params.include }),
+          ...(deps.globalIgnoreFile === undefined
+            ? {}
+            : { globalIgnoreFile: deps.globalIgnoreFile }),
+          ...(deps.rgPath === undefined ? {} : { rgPath: deps.rgPath }),
         });
+        const matches: ReadonlyArray<GrepMatch> =
+          outputMode === "content"
+            ? result.files.flatMap((file) =>
+                file.hits.map((hit) => ({
+                  fileName: file.path,
+                  tag: file.tag,
+                  line: hit.line,
+                  preview: hit.text,
+                  clipped: hit.clipped,
+                })),
+              )
+            : [];
+        const details: GrepDetails = {
+          pattern,
+          outputMode,
+          matches,
+          files:
+            outputMode === "filesWithMatches"
+              ? result.files.map((file) => ({ fileName: file.path, tag: file.tag }))
+              : [],
+          counts:
+            outputMode === "count"
+              ? result.files.map((file) => ({
+                  fileName: file.path,
+                  tag: file.tag,
+                  count: file.count,
+                }))
+              : [],
+          truncated: result.truncated,
+        };
+        return ok(formatGrepBody(result, pattern, root), details);
+      } catch (error) {
+        return fail(`Could not grep ${pattern}: ${describe(error)}`, emptyGrepDetails(pattern));
       }
     },
   };

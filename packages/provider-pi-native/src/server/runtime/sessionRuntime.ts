@@ -61,7 +61,9 @@ import {
   type ContextProjection,
   type ContextRequestTool,
 } from "./contextBudget.ts";
-import { SeenLinesTracker } from "./hashline.ts";
+import { loadCustomSystemPrompt, type CustomSystemPrompt } from "./customSystemPrompt.ts";
+import { NamedRegisters } from "./editEngine.ts";
+import { FileSnapshotStore } from "./fileSnapshotStore.ts";
 import { connectMcpSession, mcpReadOnlyPredicate, type McpAgentTool } from "./mcpBridge.ts";
 import { MutationRecoveryTracker } from "./mutationRecovery.ts";
 import { PathMutex } from "./pathLock.ts";
@@ -70,6 +72,7 @@ import {
   type ToolApprovalRequest,
   type ToolApprovalResponse,
 } from "./permissions.ts";
+import { ProjectInstructionTracker, renderProjectInstructions } from "./projectInstructions.ts";
 import {
   createProviderStreamFn,
   ProviderHttpPool,
@@ -251,6 +254,8 @@ export interface NativePiSessionRuntimeOptions {
   readonly requestUserInput: (input: NativeUserInputRequest) => Promise<Record<string, unknown>>;
   readonly now?: (() => number) | undefined;
   readonly random?: (() => number) | undefined;
+  /** Overrides `~/.pi/agent`, where the global `AGENTS.md` and `SYSTEM.md` files live. */
+  readonly piAgentDir?: string | undefined;
   readonly streamFn?: StreamFn | undefined;
   readonly sleep?: ProviderRetrySleep | undefined;
   readonly scheduleTimer?: ScheduleTimer | undefined;
@@ -581,6 +586,21 @@ const newTurnState = (): ActiveTurnState => ({
   goalChecksThisTurn: 0,
 });
 
+/** The instructions a tool run may widen; only file tools can reveal nested rules. */
+const PATH_SCOPED_INSTRUCTION_TOOLS: ReadonlySet<string> = new Set(["Read", "Write", "Edit"]);
+
+/** Project instructions and prompts are scoped to the thread's main folder. */
+function instructionWorkspaceRoot(policy: ProviderAdapterV2RuntimePolicy): string | null {
+  const cwd = policy.cwd?.trim();
+  if (cwd !== undefined && cwd !== "") return cwd;
+  return policy.workspace?.folders[0]?.path ?? null;
+}
+
+interface ResolvedSessionPrompts {
+  readonly customPrompt: CustomSystemPrompt | undefined;
+  readonly instructions: ProjectInstructionTracker;
+}
+
 /**
  * One in-process Pi agent per native thread. It owns the transcript, tools, permissions,
  * retries, and compaction; the adapter above it only maps its events onto T3 contracts.
@@ -598,7 +618,8 @@ export class NativePiSessionRuntime {
   readonly #now: () => number;
   readonly #sessionId: string;
   readonly #unsubscribe: () => void;
-  #seen = new SeenLinesTracker();
+  #anchors = new FileSnapshotStore();
+  #registers = new NamedRegisters();
   #recovery = new MutationRecoveryTracker();
   #todos: TodoSnapshot = EMPTY_TODO_SNAPSHOT;
   #goal: OrchestrationV2ProviderGoal | null = null;
@@ -619,9 +640,15 @@ export class NativePiSessionRuntime {
   #abortPromise: Promise<void> | null = null;
   #disposed = false;
   #contextText: string | undefined;
+  readonly #instructions: ProjectInstructionTracker;
+  readonly #customAppend: string | undefined;
   #sequence = 0;
 
-  private constructor(options: NativePiSessionRuntimeOptions, binding: ResolvedModelBinding) {
+  private constructor(
+    options: NativePiSessionRuntimeOptions,
+    binding: ResolvedModelBinding,
+    prompts: ResolvedSessionPrompts,
+  ) {
     this.#options = options;
     this.#now = options.now ?? (() => host.Date.now());
     this.#sessionId =
@@ -632,6 +659,8 @@ export class NativePiSessionRuntime {
     this.#selection = options.modelSelection;
     this.#policy = options.runtimePolicy;
     this.#contextText = options.contextText;
+    this.#instructions = prompts.instructions;
+    this.#customAppend = prompts.customPrompt?.append;
     const initialGoal = options.initialGoal ?? null;
     this.#goal =
       initialGoal === null
@@ -654,7 +683,8 @@ export class NativePiSessionRuntime {
     });
     this.#baseStreamFn = this.#makeBaseStreamFn();
     this.#systemManager = new SystemTranscriptManager({
-      basePrompt: "",
+      // A custom `SYSTEM.md` owns the persona slot; the operational rules stay in sections.
+      basePrompt: prompts.customPrompt?.replace ?? "",
       sections: this.#desiredSections(),
       timestamp: this.#now(),
     });
@@ -677,9 +707,16 @@ export class NativePiSessionRuntime {
   }
 
   static async create(options: NativePiSessionRuntimeOptions): Promise<NativePiSessionRuntime> {
+    const workspaceRoot = instructionWorkspaceRoot(options.runtimePolicy);
+    const agentDir = options.piAgentDir === undefined ? {} : { agentDir: options.piAgentDir };
+    const instructions = new ProjectInstructionTracker({ workspaceRoot, ...agentDir });
+    // Root instructions belong to the leading system message, so read them before the first request.
+    await instructions.visit();
+    const customPrompt = await loadCustomSystemPrompt({ workspaceRoot, ...agentDir });
     const runtime = new NativePiSessionRuntime(
       options,
       resolvePiNativeModelBinding(options.settings, options.modelSelection),
+      { customPrompt, instructions },
     );
     await runtime.#connectMcp();
     runtime.#rebuildTools();
@@ -814,7 +851,8 @@ export class NativePiSessionRuntime {
   #toolDependencies(): Parameters<typeof createPiNativeTools>[0] {
     return {
       sandbox: this.#sandbox,
-      seen: this.#seen,
+      anchors: this.#anchors,
+      registers: this.#registers,
       recovery: this.#recovery,
       locks: this.#locks,
       requestUserInput: (questions, signal) =>
@@ -990,6 +1028,7 @@ export class NativePiSessionRuntime {
   }
 
   #desiredSections(contextBudget?: string): SystemSectionMap {
+    const projectInstructions = renderProjectInstructions(this.#instructions.current);
     const sections = buildT3SystemSections({
       harness: "Pi Native",
       model: this.#binding.modelId,
@@ -1008,14 +1047,17 @@ export class NativePiSessionRuntime {
         ? {}
         : { context: this.#contextText }),
       ...(contextBudget === undefined ? {} : { contextBudget }),
+      ...(this.#customAppend === undefined ? {} : { customAppend: this.#customAppend }),
+      ...(projectInstructions === undefined ? {} : { projectInstructions }),
       toolActivation: this.#options.settings.enableSubagents
         ? "<tool_activation>Task, TaskWait, TaskList, and TaskStop delegate self-contained work to in-process subagents.</tool_activation>"
         : "",
     });
     return {
       ...sections,
-      // Explicitly null out cleared tool_activation so SystemTranscriptManager emits a reset delta and re-arms future turns.
+      // Explicitly null empty sections so a cleared one emits a reset delta instead of staying cached.
       tool_activation: sections.tool_activation ?? null,
+      project_instructions: sections.project_instructions ?? null,
     };
   }
 
@@ -1259,8 +1301,20 @@ export class NativePiSessionRuntime {
     }
     const decision = await this.#permissions.evaluate(context.toolCall.name, context.args, signal);
     if (!decision.allowed) return { block: true, reason: decision.reason };
+    await this.#refreshPathInstructions(context.toolCall.name, context.args);
     return undefined;
   };
+
+  /** Nested rules only matter once a turn reaches their directory, so they load there. */
+  async #refreshPathInstructions(toolName: string, args: unknown): Promise<void> {
+    if (!PATH_SCOPED_INSTRUCTION_TOOLS.has(toolName)) return;
+    const workspacePath =
+      typeof args === "object" && args !== null
+        ? (args as { readonly path?: unknown }).path
+        : undefined;
+    if (typeof workspacePath !== "string" || workspacePath.trim() === "") return;
+    await this.#instructions.visit(workspacePath.trim());
+  }
 
   #prepareRequest: PrepareRequest = async (request) => {
     const state = this.#active;
@@ -1821,7 +1875,8 @@ export class NativePiSessionRuntime {
   }
 
   #clearTrackers(): void {
-    this.#seen = new SeenLinesTracker();
+    this.#anchors = new FileSnapshotStore();
+    this.#registers = new NamedRegisters();
     this.#recovery = new MutationRecoveryTracker();
   }
 
