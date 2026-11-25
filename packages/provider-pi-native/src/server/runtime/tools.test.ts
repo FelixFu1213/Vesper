@@ -40,6 +40,8 @@ interface HarnessOptions {
   readonly shell?: PiNativeToolDeps["shell"];
   readonly maxOutputBytes?: number;
   readonly maxGlobResults?: number;
+  readonly globalIgnoreFile?: string | null;
+  readonly rgPath?: string | null;
   readonly onGoalStatusUpdate?: PiNativeToolDeps["onGoalStatusUpdate"];
 }
 
@@ -83,6 +85,8 @@ const withDirectory = async (body: (make: HarnessFactory) => Promise<void>): Pro
       ...(options.shell === undefined ? {} : { shell: options.shell }),
       ...(options.maxOutputBytes === undefined ? {} : { maxOutputBytes: options.maxOutputBytes }),
       ...(options.maxGlobResults === undefined ? {} : { maxGlobResults: options.maxGlobResults }),
+      globalIgnoreFile: options.globalIgnoreFile ?? null,
+      rgPath: options.rgPath ?? null,
     };
     const tools = createPiNativeTools(deps);
     const byName = new Map(tools.map((tool) => [String(tool.name), tool]));
@@ -125,12 +129,16 @@ const writeFile = async (directory: string, name: string, content: string): Prom
 
 const readFile = async (target: string): Promise<string> => NodeFSP.readFile(target, "utf8");
 
+const setModified = async (target: string, seconds: number): Promise<void> => {
+  await NodeFSP.utimes(target, seconds, seconds);
+};
+
 describe("Read", () => {
   it("formats tagged lines and records the range as seen", async () => {
     await withDirectory(async (make) => {
       const harness = make();
       await writeFile(harness.directory, "file.ts", "alpha\nbeta\n");
-      const result = await harness.tool("Read").execute("call-1", { path: "file.ts" });
+      const result = await harness.tool("Read").execute("call-1", { file_path: "file.ts" });
       const expected = `1:${computeLineTag("alpha")}|alpha\n2:${computeLineTag("beta")}|beta`;
       expect(textOf(result)).toBe(expected);
       expect(result.details).toMatchObject({
@@ -191,6 +199,48 @@ describe("Read", () => {
       const missing = await harness.tool("Read").execute("call-1", { path: "missing.txt" });
       expect(missing.isError).toBe(true);
       expect(textOf(missing)).toContain("Could not read");
+    });
+  });
+
+  it("suggests Glob instead of reading a directory", async () => {
+    await withDirectory(async (make) => {
+      const harness = make();
+      await writeFile(harness.directory, "src/a.ts", "alpha\n");
+      const result = await harness.tool("Read").execute("call-1", { path: "src" });
+      expect(result.isError).toBe(true);
+      expect(textOf(result)).toContain("is a directory");
+      expect(textOf(result)).toContain("use Glob");
+      expect(textOf(result)).toContain('pattern="**/*"');
+    });
+  });
+
+  it("denies files on the security denylist", async () => {
+    await withDirectory(async (make) => {
+      const harness = make();
+      await writeFile(harness.directory, ".env", "SECRET=1\n");
+      await writeFile(harness.directory, "certs/server.pem", "key\n");
+      await writeFile(harness.directory, ".env.example", "SECRET=\n");
+
+      for (const name of [".env", "certs/server.pem"]) {
+        const read = await harness.tool("Read").execute("call-1", { path: name });
+        expect(read.isError).toBe(true);
+        expect(textOf(read)).toContain("security denylist");
+
+        const write = await harness.tool("Write").execute("call-2", { path: name, content: "x" });
+        expect(write.isError).toBe(true);
+        expect(textOf(write)).toContain("security denylist");
+
+        const edit = await harness.tool("Edit").execute("call-3", {
+          path: name,
+          oldText: "a",
+          newText: "b",
+        });
+        expect(edit.isError).toBe(true);
+        expect(textOf(edit)).toContain("security denylist");
+      }
+
+      const template = await harness.tool("Read").execute("call-4", { path: ".env.example" });
+      expect(template.isError).toBeUndefined();
     });
   });
 });
@@ -390,7 +440,7 @@ describe("Edit", () => {
 });
 
 describe("Glob and Grep", () => {
-  it("finds files by glob while skipping ignored directories", async () => {
+  it("finds files by glob newest first while skipping ignored directories", async () => {
     await withDirectory(async (make) => {
       const harness = make();
       await writeFile(harness.directory, "a.ts", "");
@@ -398,32 +448,73 @@ describe("Glob and Grep", () => {
       await writeFile(harness.directory, "src/nested/c.md", "");
       await writeFile(harness.directory, "node_modules/skip.ts", "");
       await writeFile(harness.directory, ".git/skip.ts", "");
+      await setModified(harness.dir("a.ts"), 1_000);
+      await setModified(harness.dir("src/nested/c.md"), 2_000);
+      await setModified(harness.dir("src/b.ts"), 3_000);
+      await setModified(harness.dir("node_modules/skip.ts"), 4_000);
 
       const result = await harness.tool("Glob").execute("call-1", { pattern: "**/*.ts" });
-      expect(result.details.files).toEqual(["a.ts", "src/b.ts"]);
+      expect(result.details.files).toEqual([harness.dir("src/b.ts"), harness.dir("a.ts")]);
       expect(result.details.truncated).toBe(false);
 
-      const markdown = await harness.tool("Glob").execute("call-2", { pattern: "**/*.md" });
-      expect(markdown.details.files).toEqual(["src/nested/c.md"]);
+      const markdown = await harness.tool("Glob").execute("call-2", { query: "**/*.md" });
+      expect(markdown.details.files).toEqual([harness.dir("src/nested/c.md")]);
     });
   });
 
-  it("caps glob results", async () => {
+  it("caps glob results after newest-first sorting", async () => {
     await withDirectory(async (make) => {
       const harness = make({ maxGlobResults: 1 });
       await writeFile(harness.directory, "one.ts", "");
       await writeFile(harness.directory, "two.ts", "");
+      await setModified(harness.dir("one.ts"), 2_000);
+      await setModified(harness.dir("two.ts"), 1_000);
       const result = await harness.tool("Glob").execute("call-1", { pattern: "*.ts" });
-      expect(result.details.files).toHaveLength(1);
+      expect(result.details.files).toEqual([harness.dir("one.ts")]);
       expect(result.details.truncated).toBe(true);
     });
   });
 
-  it("grep reports file, line, and preview while skipping binaries", async () => {
+  it("honors workspace ignore files for Glob and Grep", async () => {
+    await withDirectory(async (make) => {
+      const harness = make();
+      await writeFile(harness.directory, ".ignore", "generated\n");
+      await writeFile(harness.directory, "generated/out.ts", "needle\n");
+      await writeFile(harness.directory, "src/keep.ts", "needle\n");
+
+      const glob = await harness.tool("Glob").execute("call-1", { pattern: "**/*.ts" });
+      expect(glob.details.files).toEqual([harness.dir("src/keep.ts")]);
+
+      const grep = await harness.tool("Grep").execute("call-2", { pattern: "needle" });
+      expect(grep.details.matches).toHaveLength(1);
+      expect(grep.details.matches[0]).toMatchObject({ fileName: harness.dir("src/keep.ts") });
+    });
+  });
+
+  it("drops denylisted files from Glob and Grep", async () => {
+    await withDirectory(async (make) => {
+      const harness = make();
+      await writeFile(harness.directory, ".env", "needle\n");
+      await writeFile(harness.directory, "certs/server.pem", "needle\n");
+      await writeFile(harness.directory, ".env.example", "needle\n");
+
+      const glob = await harness.tool("Glob").execute("call-1", { pattern: "**/*" });
+      expect(glob.details.files).toEqual([harness.dir(".env.example")]);
+
+      const grep = await harness.tool("Grep").execute("call-2", { pattern: "needle" });
+      expect(grep.details.matches.map((match: { fileName: string }) => match.fileName)).toEqual([
+        harness.dir(".env.example"),
+      ]);
+    });
+  });
+
+  it("grep reports file, line, tag, and preview while skipping binaries", async () => {
     await withDirectory(async (make) => {
       const harness = make();
       await writeFile(harness.directory, "src/a.ts", "first\nconst needle = 1;\n");
       await writeFile(harness.directory, "src/notes.json", "needle\n");
+      await setModified(harness.dir("src/a.ts"), 2_000);
+      await setModified(harness.dir("src/notes.json"), 1_000);
       await NodeFSP.writeFile(
         NodePath.join(harness.directory, "src/binary.bin"),
         Buffer.from([0x00, 0x6e, 0x65, 0x65, 0x64, 0x6c, 0x65]),
@@ -432,6 +523,7 @@ describe("Glob and Grep", () => {
       const result = await harness.tool("Grep").execute("call-1", { pattern: "needle" });
       const matches = result.details.matches as ReadonlyArray<{
         fileName: string;
+        tag: string;
         line: number;
         preview: string;
       }>;
@@ -441,16 +533,19 @@ describe("Glob and Grep", () => {
         harness.dir("src/notes.json"),
       ]);
       expect(matches[0]).toMatchObject({ line: 2, preview: "const needle = 1;" });
+      for (const match of matches) expect(match.tag).toMatch(/^[0-9A-F]{4}$/u);
+      expect(textOf(result)).toContain(`[${harness.dir("src/a.ts")}#${matches[0]!.tag}]`);
+      expect(textOf(result)).toContain("2: const needle = 1;");
 
       const filtered = await harness.tool("Grep").execute("call-2", {
         pattern: "needle",
-        glob: "*.ts",
+        include: "*.ts",
       });
       expect(filtered.details.matches).toHaveLength(1);
 
       const caseInsensitive = await harness.tool("Grep").execute("call-3", {
         pattern: "NEEDLE",
-        caseSensitive: false,
+        caseInsensitive: true,
       });
       expect(caseInsensitive.details.matches).toHaveLength(2);
 
@@ -459,12 +554,77 @@ describe("Glob and Grep", () => {
     });
   });
 
+  it("supports filesWithMatches and count output modes with aliases", async () => {
+    await withDirectory(async (make) => {
+      const harness = make();
+      await writeFile(harness.directory, "a.ts", "needle\nneedle\n");
+      await writeFile(harness.directory, "b.ts", "needle\n");
+      await setModified(harness.dir("a.ts"), 2_000);
+      await setModified(harness.dir("b.ts"), 1_000);
+
+      const files = await harness.tool("Grep").execute("call-1", {
+        query: "needle",
+        output_mode: "files_with_matches",
+      });
+      expect(files.details.outputMode).toBe("filesWithMatches");
+      expect(files.details.files).toEqual([
+        { fileName: harness.dir("a.ts"), tag: files.details.files[0].tag },
+        { fileName: harness.dir("b.ts"), tag: files.details.files[1].tag },
+      ]);
+
+      const limited = await harness.tool("Grep").execute("call-2", {
+        pattern: "needle",
+        outputMode: "filesWithMatches",
+        head_limit: 1,
+      });
+      expect(limited.details.files).toHaveLength(1);
+      expect(limited.details.truncated).toBe(true);
+
+      const counts = await harness.tool("Grep").execute("call-3", {
+        pattern: "needle",
+        outputMode: "count",
+      });
+      expect(counts.details.counts).toEqual([
+        { fileName: harness.dir("a.ts"), tag: counts.details.counts[0].tag, count: 2 },
+        { fileName: harness.dir("b.ts"), tag: counts.details.counts[1].tag, count: 1 },
+      ]);
+      expect(counts.details.matches).toEqual([]);
+
+      const headLimited = await harness.tool("Grep").execute("call-4", {
+        pattern: "needle",
+        headLimit: 1,
+      });
+      expect(headLimited.details.matches).toHaveLength(1);
+      expect(headLimited.details.truncated).toBe(true);
+    });
+  });
+
+  it("marks unclipped content hits as seen", async () => {
+    await withDirectory(async (make) => {
+      const harness = make();
+      const longLine = `needle${"x".repeat(20_000)}`;
+      await writeFile(harness.directory, "src/a.ts", "alpha\nconst needle = 1;\n");
+      await writeFile(harness.directory, "src/long.ts", `${longLine}\n`);
+
+      const result = await harness.tool("Grep").execute("call-1", { pattern: "needle" });
+      const matches = result.details.matches as ReadonlyArray<{
+        fileName: string;
+        clipped: boolean;
+      }>;
+      expect(matches.find((match) => match.fileName === harness.dir("src/long.ts"))?.clipped).toBe(
+        true,
+      );
+      expect(harness.seen.hasSeenRange(harness.dir("src/a.ts"), 2, 2)).toBe(true);
+      expect(harness.seen.hasSeenRange(harness.dir("src/long.ts"), 1, 1)).toBe(false);
+    });
+  });
+
   it("rejects invalid regular expressions", async () => {
     await withDirectory(async (make) => {
       const harness = make();
       const result = await harness.tool("Grep").execute("call-1", { pattern: "(" });
       expect(result.isError).toBe(true);
-      expect(textOf(result)).toContain("Invalid pattern");
+      expect(textOf(result)).toContain("Invalid regular expression");
     });
   });
 });
