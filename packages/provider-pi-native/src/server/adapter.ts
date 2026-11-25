@@ -2137,7 +2137,10 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
           const turn = findThread(args.providerThread)?.activeTurn ?? null;
           if (turn === null || turn.providerTurn.id !== args.providerTurnId) return;
           if (args.mode === "graceful") {
-            turn.state.runtime?.requestGracefulStop();
+            const result = turn.state.runtime?.requestGracefulStop();
+            if (result?.requested !== true) {
+              turn.interrupted = true;
+            }
             await Promise.race([turn.done, stoppedDeadline(options.scheduleTimer)]);
             return;
           }

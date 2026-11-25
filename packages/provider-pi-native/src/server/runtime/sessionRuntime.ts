@@ -1057,6 +1057,14 @@ export class NativePiSessionRuntime {
 
   /** Status only, so a repeated phase is not resent; the adapter forwards each one as ephemeral. */
   #emitPhase(phase: ProviderAdapterV2TurnPhase, detail?: string): void {
+    const state = this.#active;
+    if (
+      phase !== "stopping" &&
+      state !== null &&
+      (state.gracefulStopRequested || state.interrupted)
+    ) {
+      return;
+    }
     const current = this.#phase;
     if (current !== null && current.phase === phase && current.detail === detail) return;
     this.#phase = detail === undefined ? { phase } : { phase, detail };
@@ -1651,7 +1659,7 @@ export class NativePiSessionRuntime {
     readonly images?: ReadonlyArray<ImageContent> | undefined;
   }): "accepted" | "declined" {
     const state = this.#active;
-    if (state === null || state.gracefulStopRequested) return "declined";
+    if (state === null || state.gracefulStopRequested || state.interrupted) return "declined";
     const message: UserMessage = {
       role: "user",
       content: buildUserContent(input.text, input.images ?? []),
@@ -1713,6 +1721,7 @@ export class NativePiSessionRuntime {
       await this.#recoverErrorOverflow(state);
       input.onLoopSettled?.();
       for (;;) {
+        if (state.interrupted || state.gracefulStopRequested) break;
         const pending = this.#tailRace.splice(0);
         if (pending.length === 0) break;
         for (const entry of pending) {
@@ -1745,7 +1754,7 @@ export class NativePiSessionRuntime {
    */
   async #recoverErrorOverflow(state: ActiveTurnState): Promise<void> {
     const failed = state.lastAssistant;
-    if (state.interrupted || failed?.stopReason !== "error") return;
+    if (state.interrupted || state.gracefulStopRequested || failed?.stopReason !== "error") return;
     if (!this.#shouldRecoverOverflow(failed, state)) return;
     state.overflowRecoveryTried = true;
     this.#emitPhase("recovering");
@@ -1787,7 +1796,7 @@ export class NativePiSessionRuntime {
 
   #outcome(state: ActiveTurnState): NativeTurnOutcome {
     const message = state.lastAssistant;
-    if (state.interrupted || message?.stopReason === "aborted") {
+    if (state.interrupted || state.gracefulStopRequested || message?.stopReason === "aborted") {
       return { status: "interrupted", failure: null, outputTruncated: false };
     }
     if (state.failure !== null) {
@@ -1824,6 +1833,9 @@ export class NativePiSessionRuntime {
     const state = this.#active;
     if (this.#disposed || state === null) return { requested: false };
     state.gracefulStopRequested = true;
+    this.#agent.clearAllQueues();
+    this.#tailRace = [];
+    this.#cancelUnreadSteers(state);
     this.#emitPhase("stopping");
     return { requested: true };
   }

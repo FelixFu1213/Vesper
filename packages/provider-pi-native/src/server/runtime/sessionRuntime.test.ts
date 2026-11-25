@@ -504,6 +504,46 @@ describe("NativePiSessionRuntime", () => {
     await harness.runtime.dispose();
   });
 
+  it("cancels queued steers, keeps stopping phase sticky, and skips tail-race after graceful stop", async () => {
+    const harness = await makeRuntime({
+      steps: [
+        () => {
+          harness.runtime.steer({ messageId: "queued-before-stop", text: "Queued note" });
+          assert.deepStrictEqual(harness.runtime.requestGracefulStop(), { requested: true });
+          assert.equal(
+            harness.runtime.steer({ messageId: "after-stop", text: "more" }),
+            "declined",
+          );
+          return scriptedTextResponse("stopping after this");
+        },
+        scriptedTextResponse("must not run"),
+      ],
+    });
+    const outcome = await harness.runtime.runTurn({
+      text: "start",
+      onLoopSettled: () => {
+        assert.equal(
+          harness.runtime.steer({ messageId: "late-after-stop", text: "too late" }),
+          "declined",
+        );
+      },
+    });
+    assert.equal(outcome.status, "interrupted");
+    assert.equal(harness.streamFn.calls.length, 1);
+    const cancelledSteers = harness.events.filter(
+      (event) =>
+        event.type === "steer" &&
+        event.messageId === "queued-before-stop" &&
+        event.status === "cancelled",
+    );
+    assert.lengthOf(cancelledSteers, 1);
+    const phases = harness.events.flatMap((event) => (event.type === "phase" ? [event.phase] : []));
+    const stoppingIndex = phases.indexOf("stopping");
+    assert.isAtLeast(stoppingIndex, 0);
+    assert.deepStrictEqual(phases.slice(stoppingIndex), ["stopping"]);
+    await harness.runtime.dispose();
+  });
+
   it("nudges an autonomous goal once when a turn only announces the next step", async () => {
     const harness = await makeRuntime({
       initialGoal: { objective: "Ship it", status: "active", checks: 0 },
@@ -582,6 +622,24 @@ describe("NativePiSessionRuntime", () => {
     const outcome = await harness.runtime.runTurn({ text: "start" });
     assert.equal(outcome.status, "interrupted");
     assert.isNull(outcome.failure);
+    await harness.runtime.dispose();
+  });
+
+  it("declines a steer once a turn has been interrupted", async () => {
+    const harness = await makeRuntime({
+      steps: [
+        async () => {
+          await harness.runtime.abort();
+          assert.equal(
+            harness.runtime.steer({ messageId: "after-abort", text: "too late" }),
+            "declined",
+          );
+          return scriptedErrorResponse("aborted by the user", { stopReason: "aborted" });
+        },
+      ],
+    });
+    const outcome = await harness.runtime.runTurn({ text: "start" });
+    assert.equal(outcome.status, "interrupted");
     await harness.runtime.dispose();
   });
 
