@@ -34,6 +34,7 @@ import {
   type SidebarListMarker,
   type SidebarSection,
   resolveSidebarDropVerb,
+  groupSidebarSectionsByProject,
   groupSidebarThreadsByProject,
   resolveSidebarFolderDot,
   sidebarFolderExpansionKeys,
@@ -1809,5 +1810,52 @@ describe("resolveScopedNewThreadProjectRef", () => {
         viewed: viewedWeb,
       }),
     ).toBeNull();
+  });
+});
+
+describe("groupSidebarSectionsByProject", () => {
+  it("groups threads by project and orders pinned, active, then settled within each project", () => {
+    const projectA = ProjectId.make("project-a");
+    const projectB = ProjectId.make("project-b");
+    const projectEmpty = ProjectId.make("project-empty");
+    const groupA = {
+      id: "group-a",
+      memberProjectRefs: [{ environmentId: localEnvironmentId, projectId: projectA }],
+    };
+    const groupB = {
+      id: "group-b",
+      memberProjectRefs: [{ environmentId: localEnvironmentId, projectId: projectB }],
+    };
+    const groupEmpty = {
+      id: "group-empty",
+      memberProjectRefs: [{ environmentId: localEnvironmentId, projectId: projectEmpty }],
+    };
+    const makeThread = (id: string, projectId: ProjectId) =>
+      makeThreadFixture({
+        environmentId: localEnvironmentId,
+        projectId,
+        id: ThreadId.make(id),
+      });
+
+    const grouped = groupSidebarSectionsByProject(
+      [groupA, groupEmpty, groupB],
+      {
+        pinned: [makeThread("a-pin", projectA), makeThread("b-pin", projectB)],
+        active: [makeThread("b-act", projectB), makeThread("a-act", projectA)],
+        settled: [makeThread("a-set", projectA)],
+      },
+      () => false,
+    );
+
+    expect(grouped.map((folder) => folder.group.id)).toEqual(["group-a", "group-b"]);
+    expect(grouped[0]!.entries.map((entry) => `${entry.section}:${entry.thread.id}`)).toEqual([
+      "pinned:a-pin",
+      "active:a-act",
+      "settled:a-set",
+    ]);
+    expect(grouped[1]!.entries.map((entry) => `${entry.section}:${entry.thread.id}`)).toEqual([
+      "pinned:b-pin",
+      "active:b-act",
+    ]);
   });
 });

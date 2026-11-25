@@ -1101,6 +1101,56 @@ export function groupSidebarThreadsByProject<
   return folders.filter((folder) => folder.threads.length > 0 || keepEmpty(folder.group));
 }
 
+export interface SidebarProjectSectionEntry<TThread> {
+  readonly thread: TThread;
+  readonly section: "pinned" | "active" | "settled";
+}
+
+/**
+ * Group pinned, active/running, and settled threads into project folders in `groups` order,
+ * preserving within each project: pinned -> active/running -> settled.
+ */
+export function groupSidebarSectionsByProject<
+  TGroup extends {
+    readonly memberProjectRefs: ReadonlyArray<{
+      readonly environmentId: EnvironmentId;
+      readonly projectId: string;
+    }>;
+  },
+  TThread extends Pick<SidebarThreadSummary, "environmentId" | "projectId">,
+>(
+  groups: readonly TGroup[],
+  sections: {
+    readonly pinned: readonly TThread[];
+    readonly active: readonly TThread[];
+    readonly settled: readonly TThread[];
+  },
+  keepEmpty: (group: TGroup) => boolean,
+): Array<{ group: TGroup; entries: SidebarProjectSectionEntry<TThread>[] }> {
+  const folders = groups.map((group) => ({
+    group,
+    entries: [] as SidebarProjectSectionEntry<TThread>[],
+  }));
+  const folderByProject = new Map<string, (typeof folders)[number]>();
+  for (const folder of folders) {
+    for (const ref of folder.group.memberProjectRefs) {
+      folderByProject.set(`${ref.environmentId}:${ref.projectId}`, folder);
+    }
+  }
+  for (const [section, list] of [
+    ["pinned", sections.pinned],
+    ["active", sections.active],
+    ["settled", sections.settled],
+  ] as const) {
+    for (const thread of list) {
+      folderByProject
+        .get(`${thread.environmentId}:${thread.projectId}`)
+        ?.entries.push({ thread, section });
+    }
+  }
+  return folders.filter((folder) => folder.entries.length > 0 || keepEmpty(folder.group));
+}
+
 export type SidebarV2TopStatusKind =
   | "approval"
   | "done"

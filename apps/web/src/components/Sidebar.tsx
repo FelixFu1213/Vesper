@@ -183,7 +183,7 @@ import {
 import {
   applySidebarThreadDrop,
   filterSidebarV2VisibleThreads,
-  groupSidebarThreadsByProject,
+  groupSidebarSectionsByProject,
   sidebarFolderExpansionKeys,
   buildBulkTitleRegenerationContextMenuItem,
   buildBulkUnpinContextMenuItem,
@@ -503,7 +503,7 @@ function useSidebarThreads(input: {
   // Older settled threads load in pages; the shelf lists them only as far as they are loaded.
   const olderSettledShelf = useOlderSettledShelf({
     scopes: olderSettledScopes([...serverConfigs.keys()], scopedProjectKeys),
-    expanded: settledShelfExpanded,
+    expanded: settledShelfExpanded || folderGroups !== null,
     visibleCount: settledVisibleCount,
   });
   const listedSettledThreads = settledThreads.filter(olderSettledShelf.isListed);
@@ -535,32 +535,45 @@ function useSidebarThreads(input: {
   const projectFolders =
     folderGroups === null
       ? null
-      : groupSidebarThreadsByProject(folderGroups, activeThreads, keepEmpty).map((folder) => {
+      : groupSidebarSectionsByProject(
+          folderGroups,
+          {
+            pinned: pinnedThreads,
+            active: activeThreads,
+            settled: visibleSettledThreads,
+          },
+          keepEmpty,
+        ).map((folder) => {
           const collapsed = !resolveProjectExpanded(
             projectExpandedById,
             sidebarFolderExpansionKeys(folder.group),
           );
+          const visibleEntries = collapsed
+            ? folder.entries.filter((entry) => threadShellKey(entry.thread) === routeRowThreadKey)
+            : folder.entries;
           return {
             group: folder.group,
             collapsed,
+            entries: visibleEntries,
             // A closed folder still shows the open thread, and hints at the rest.
-            threads: collapsed
-              ? routeThreadOnly(folder.threads, routeRowThreadKey)
-              : folder.threads,
+            threads: visibleEntries.map((entry) => entry.thread),
             hiddenThreads: collapsed
-              ? folder.threads.filter((thread) => threadShellKey(thread) !== routeRowThreadKey)
+              ? folder.entries
+                  .filter((entry) => threadShellKey(entry.thread) !== routeRowThreadKey)
+                  .map((entry) => entry.thread)
               : EMPTY_THREADS,
           };
         });
-  const orderedThreads = [
-    ...pinnedThreads,
-    ...(projectFolders === null
-      ? activeThreads
-      : projectFolders.flatMap((folder) => folder.threads)),
-    ...visibleWorkingThreads,
-    ...visibleSnoozedThreads,
-    ...renderedSettledThreads,
-  ];
+  const orderedThreads =
+    projectFolders === null
+      ? [
+          ...pinnedThreads,
+          ...activeThreads,
+          ...visibleWorkingThreads,
+          ...visibleSnoozedThreads,
+          ...renderedSettledThreads,
+        ]
+      : [...projectFolders.flatMap((folder) => folder.threads), ...visibleSnoozedThreads];
   const sectionByThreadKey = new Map<string, SidebarSection>();
   for (const [list, section] of [
     [pinnedThreads, "pinned"],
@@ -1354,12 +1367,11 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
     threads: listedThreads,
     delegatedUnderParent,
     routeRowThreadKey,
-    folderGroups: boringSidebarEnabled
-      ? scopedProjectGroups.length === 0
+    folderGroups:
+      scopedProjectGroups.length === 0
         ? // An archived project keeps a folder for its active threads, below the rest.
           [...scopeGroups, ...projectGroups.filter((project) => project.archived)]
-        : scopedProjectGroups
-      : null,
+        : scopedProjectGroups,
     keepEmptyFolders: (group) =>
       scopedProjectGroups.length > 0 || (group.pinned && !group.archived),
   });
@@ -1976,6 +1988,14 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
         0
     ) {
       return [];
+    }
+    if (hasProjectFolders) {
+      const items: SidebarListItem[] = [{ kind: "marker", marker: "active-placeholder" }];
+      if (snoozedThreads.length > 0) {
+        items.push({ kind: "marker", marker: "snoozed-header" });
+        items.push(...rowsOf(visibleSnoozedThreads, "snoozed"));
+      }
+      return items;
     }
     const items: SidebarListItem[] = [{ kind: "marker", marker: "pinned-header" }];
     const pinnedRows = rowsOf(pinnedThreads, "pinned");
@@ -3599,11 +3619,11 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                                 onContextMenu={handleProjectFolderContextMenu}
                               />,
                             );
-                            for (const thread of folder.threads) {
+                            for (const entry of folder.entries) {
                               items.push(
                                 renderThreadRow(
-                                  thread,
-                                  "active",
+                                  entry.thread,
+                                  entry.section,
                                   sidebarFolderRowId(folder.group.projectKey),
                                 ),
                               );
@@ -3723,7 +3743,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                       }
                       return items;
                     })()}
-                    {settledShelfExpanded && hiddenSettledCount > 0 ? (
+                    {(projectFolders !== null || settledShelfExpanded) && hiddenSettledCount > 0 ? (
                       <li className="list-none">
                         <button
                           type="button"
