@@ -5,7 +5,7 @@ import * as NodePath from "node:path";
 
 export type SandboxAccess = "read" | "write";
 
-export type SandboxClassification = "workspace" | "readonly_attachment" | "external";
+export type SandboxClassification = "workspace" | "scratch" | "readonly_attachment" | "external";
 
 export interface SandboxResolution {
   readonly rawPath: string;
@@ -21,6 +21,8 @@ export interface WorkspaceSandboxOptions {
   readonly cwd: string | null;
   readonly extraRoots?: ReadonlyArray<string>;
   readonly readOnlyRoots?: ReadonlyArray<string>;
+  /** Host-owned per-session scratch space: writable, outside the project, never read-only. */
+  readonly scratchRoots?: ReadonlyArray<string>;
 }
 
 const errorCode = (error: unknown): string | undefined => {
@@ -69,6 +71,7 @@ export class WorkspaceSandbox {
   readonly #cwd: string | null;
   readonly #workspaceRoots: ReadonlyArray<string>;
   readonly #readOnlyRoots: ReadonlyArray<string>;
+  readonly #scratchRoots: ReadonlyArray<string>;
 
   constructor(options: WorkspaceSandboxOptions) {
     this.#cwd = options.cwd === null ? null : canonicalizeSync(options.cwd);
@@ -77,6 +80,7 @@ export class WorkspaceSandbox {
       ...(options.extraRoots ?? []).map(canonicalizeSync),
     ]);
     this.#readOnlyRoots = uniqueRoots((options.readOnlyRoots ?? []).map(canonicalizeSync));
+    this.#scratchRoots = uniqueRoots((options.scratchRoots ?? []).map(canonicalizeSync));
   }
 
   get cwd(): string | null {
@@ -91,7 +95,13 @@ export class WorkspaceSandbox {
     return this.#readOnlyRoots;
   }
 
+  get scratchRoots(): ReadonlyArray<string> {
+    return this.#scratchRoots;
+  }
+
   classify(resolvedPath: string): SandboxClassification {
+    // Scratch is checked first so a data directory inside a workspace stays controlled.
+    if (this.#scratchRoots.some((root) => isInside(resolvedPath, root))) return "scratch";
     if (this.#workspaceRoots.some((root) => isInside(resolvedPath, root))) return "workspace";
     if (this.#readOnlyRoots.some((root) => isInside(resolvedPath, root)))
       return "readonly_attachment";

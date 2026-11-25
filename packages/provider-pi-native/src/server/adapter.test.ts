@@ -1102,6 +1102,49 @@ describe("makePiNativeAdapterV2", () => {
     }).pipe(Effect.provide(testLayer())),
   );
 
+  it.effect("tracks a background Bash job as pending work and stops it by native id", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        steps: [
+          scriptedToolCallResponse([
+            { name: "Bash", arguments: { command: "sleep 30", runInBackground: true } },
+          ]),
+          scriptedTextResponse("job started"),
+        ],
+      });
+      yield* startTurnOn(harness);
+      const terminal = yield* harness.takeEvent("turn.terminal");
+      assert.equal(terminal.status, "completed");
+
+      assert.isTrue(yield* harness.runtime.hasPendingBackgroundWork!);
+      assert.isTrue(
+        yield* harness.runtime.hasPendingBackgroundWorkForThread!(harness.providerThread, {
+          includeSubagents: false,
+        }),
+      );
+      // Reading `all` is deterministic: the pending event precedes the turn terminal.
+      const pending = harness.all.flatMap((event) =>
+        event.type === "background_work.updated" ? [event.pending] : [],
+      );
+      assert.deepEqual(pending, [true]);
+
+      const unknown = yield* harness.runtime.stopSubagent!({
+        providerThread: harness.providerThread,
+        nativeTaskId: "bash:bash-404",
+      });
+      assert.isUndefined(unknown);
+
+      const stopped = yield* harness.runtime.stopSubagent!({
+        providerThread: harness.providerThread,
+        nativeTaskId: "bash:bash-1",
+      });
+      assert.equal(stopped?.status, "cancelled");
+      const settled = yield* harness.takeEvent("background_work.updated");
+      assert.isFalse(settled.pending);
+      assert.isFalse(yield* harness.runtime.hasPendingBackgroundWork!);
+    }).pipe(Effect.provide(testLayer())),
+  );
+
   it.effect("reports the resolved model on the provider turn and passes app context through", () =>
     Effect.gen(function* () {
       const streamFn = createScriptedStreamFn([scriptedTextResponse("context seen")], {

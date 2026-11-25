@@ -62,9 +62,11 @@ import {
   type ContextProjection,
   type ContextRequestTool,
 } from "./contextBudget.ts";
+import { BackgroundJobManager, type BackgroundJobSnapshot } from "./backgroundJobs.ts";
 import { loadCustomSystemPrompt, type CustomSystemPrompt } from "./customSystemPrompt.ts";
 import { NamedRegisters } from "./editEngine.ts";
 import { FileSnapshotStore } from "./fileSnapshotStore.ts";
+import { createJobToolRouting, type JobToolRouting } from "./jobToolRouting.ts";
 import { connectMcpSession, mcpReadOnlyPredicate, type McpAgentTool } from "./mcpBridge.ts";
 import { MutationRecoveryTracker } from "./mutationRecovery.ts";
 import { PathMutex } from "./pathLock.ts";
@@ -86,6 +88,12 @@ import {
   type ProviderRetrySleep,
 } from "./providerRetry.ts";
 import { WorkspaceSandbox } from "./sandbox.ts";
+import {
+  probeLoginShellPath,
+  resolveTurnShell,
+  SessionScratchDir,
+  type TurnShell,
+} from "./shellCatalog.ts";
 import {
   discoverPiNativeSkills,
   piNativeSkillsDigest,
@@ -210,6 +218,11 @@ export interface NativeSessionGoalUpdated {
   readonly goal: OrchestrationV2ProviderGoal | null;
 }
 
+export interface NativeSessionBackgroundJobUpdate {
+  readonly type: "background_job";
+  readonly snapshot: BackgroundJobSnapshot;
+}
+
 export type NativeSessionEvent =
   | NativeSessionStreamUpdate
   | NativeSessionToolUpdate
@@ -220,7 +233,8 @@ export type NativeSessionEvent =
   | NativeSessionSteerUpdate
   | NativeSessionRetryUpdate
   | NativeSessionUsageUpdate
-  | NativeSessionGoalUpdated;
+  | NativeSessionGoalUpdated
+  | NativeSessionBackgroundJobUpdate;
 
 /** T3 reports the goal banner from these, so the loop stops itself after this many checks. */
 const DEFAULT_MAX_GOAL_CHECKS = 8;
@@ -292,6 +306,8 @@ export interface NativePiSessionRuntimeOptions {
   readonly fetch?: typeof globalThis.fetch | undefined;
   readonly shell?: ShellSpec | undefined;
   readonly environment?: NodeJS.ProcessEnv | undefined;
+  /** Test seam for the Unix login-shell PATH probe; defaults to the real, cached probe. */
+  readonly loginShellPath?: (() => Promise<string | null>) | undefined;
   readonly calibration?: ContextEstimateCalibration | undefined;
   /** Discovery seam: tests inject a fixed catalog instead of walking the real filesystem. */
   readonly discoverSkills?:
@@ -648,6 +664,8 @@ export class NativePiSessionRuntime {
   readonly #coalescer: StreamDeltaCoalescer<string>;
   readonly #pool: ProviderHttpPool;
   readonly #sandbox: WorkspaceSandbox;
+  readonly #backgroundJobs: BackgroundJobManager;
+  readonly #scratch: SessionScratchDir;
   readonly #locks = new PathMutex();
   readonly #now: () => number;
   readonly #sessionId: string;
@@ -670,6 +688,10 @@ export class NativePiSessionRuntime {
   #mcpAvailable = false;
   #skills: ReadonlyArray<PiNativeSkillDef>;
   #subagents: SubagentManager | null = null;
+  #jobRouting: JobToolRouting | null = null;
+  #loginShellPathPromise: Promise<string | null> | null = null;
+  #turnShell: TurnShell | null = null;
+  #backgroundNotes: Array<string> = [];
   #active: ActiveTurnState | null = null;
   #tailRace: Array<{ readonly messageId: string; readonly message: UserMessage }> = [];
   #abortPromise: Promise<void> | null = null;
@@ -708,10 +730,17 @@ export class NativePiSessionRuntime {
     this.#goalActiveStartedAtMs = initialGoal?.status === "active" ? this.#now() : null;
     this.#calibration = options.calibration ?? new ContextEstimateCalibration();
     this.#pool = new ProviderHttpPool({ now: this.#now });
+    this.#scratch = new SessionScratchDir({ sessionId: this.#sessionId });
+    this.#backgroundJobs = new BackgroundJobManager({
+      now: this.#now,
+      onJobUpdated: (snapshot) => this.#emit({ type: "background_job", snapshot }),
+      onJobExited: (snapshot) => this.#handleBackgroundJobExit(snapshot),
+    });
     this.#sandbox = new WorkspaceSandbox({
       cwd: options.runtimePolicy.cwd,
       extraRoots: options.runtimePolicy.workspace?.extraRoots ?? [],
       readOnlyRoots: options.readOnlyRoots ?? [],
+      scratchRoots: [this.#scratch.path],
     });
     this.#permissions = this.#makePermissions();
     this.#coalescer = new StreamDeltaCoalescer<string>({
@@ -787,6 +816,17 @@ export class NativePiSessionRuntime {
 
   get subagents(): SubagentManager | null {
     return this.#subagents;
+  }
+
+  /** Background Bash jobs outlive their turn, so the adapter polls this for pending work. */
+  get hasRunningBackgroundJobs(): boolean {
+    return this.#backgroundJobs.hasRunningJobs();
+  }
+
+  async stopBackgroundJob(id: string): Promise<boolean> {
+    if (this.#backgroundJobs.get(id) === undefined) return false;
+    await this.#backgroundJobs.stop(id);
+    return true;
   }
 
   get todos(): TodoSnapshot {
@@ -965,6 +1005,11 @@ export class NativePiSessionRuntime {
         if (this.#active !== null) this.#active.manualCompactionRequested = reason ?? "manual";
       },
       isPlanMode: () => this.#policy.interactionMode === "plan",
+      backgroundJobs: this.#backgroundJobs,
+      onBackgroundJobStarted: (snapshot) => this.#emit({ type: "background_job", snapshot }),
+      scratch: this.#scratch,
+      resolveShell: () => this.#currentTurnShell(),
+      loginShellPath: () => this.#cachedLoginShellPath(),
       skills: () => this.#skills,
       ...(this.#options.threadId === undefined ? {} : { threadId: this.#options.threadId }),
       ...(this.#options.shell === undefined ? {} : { shell: this.#options.shell }),
@@ -975,11 +1020,67 @@ export class NativePiSessionRuntime {
     };
   }
 
+  #currentTurnShell(): TurnShell {
+    this.#turnShell ??= resolveTurnShell(
+      this.#options.environment === undefined ? {} : { environment: this.#options.environment },
+    );
+    return this.#turnShell;
+  }
+
+  #cachedLoginShellPath(): Promise<string | null> {
+    this.#loginShellPathPromise ??=
+      this.#options.loginShellPath !== undefined
+        ? this.#options.loginShellPath()
+        : probeLoginShellPath(
+            this.#options.environment === undefined
+              ? {}
+              : { environment: this.#options.environment },
+          );
+    return this.#loginShellPathPromise;
+  }
+
+  /** A notifying job leaves a status note for the next request. */
+  #handleBackgroundJobExit(snapshot: BackgroundJobSnapshot): void {
+    if (this.#disposed) return;
+    const seconds = Math.max(0, Math.round(snapshot.elapsedMs / 1_000));
+    const lines = [
+      `Background task ${snapshot.job.id} ${snapshot.state} after ${seconds}s with exit code ${snapshot.exitCode ?? "null"}.`,
+      "Read its output with TaskWait or TaskList if the result still matters.",
+    ];
+    if (snapshot.stdout.trim() !== "") {
+      lines.push(`stdout (tail):\n${snapshot.stdout.slice(-2_000)}`);
+    }
+    if (snapshot.stderr.trim() !== "") {
+      lines.push(`stderr (tail):\n${snapshot.stderr.slice(-2_000)}`);
+    }
+    this.#backgroundNotes.push(lines.join("\n"));
+    while (this.#backgroundNotes.length > 5) this.#backgroundNotes.shift();
+  }
+
   #buildToolList(): AgentTool<any>[] {
+    const subagentTools = (this.#subagents?.tools ?? []) as AgentTool<any>[];
+    const delegate = (name: string): AgentTool<any> | undefined =>
+      subagentTools.find((tool) => tool.name === name);
+    const wait = delegate("TaskWait");
+    const list = delegate("TaskList");
+    const stop = delegate("TaskStop");
+    const routing = createJobToolRouting({
+      backgroundJobs: this.#backgroundJobs,
+      delegates: {
+        ...(wait === undefined ? {} : { wait }),
+        ...(list === undefined ? {} : { list }),
+        ...(stop === undefined ? {} : { stop }),
+      },
+    });
+    this.#jobRouting = routing;
     return [
       ...createPiNativeTools(this.#toolDependencies()),
       ...(this.#mcpTools as AgentTool<any>[]),
-      ...(this.#subagents?.tools ?? []),
+      // Task stays with the subagent manager; the job tools route both owners.
+      ...subagentTools.filter(
+        (tool) => tool.name !== "TaskWait" && tool.name !== "TaskList" && tool.name !== "TaskStop",
+      ),
+      ...routing.tools,
     ];
   }
 
@@ -1100,12 +1201,13 @@ export class NativePiSessionRuntime {
       ...(this.#contextText === undefined || this.#contextText === ""
         ? {}
         : { context: this.#contextText }),
+      ...(this.#scratch.created ? { scratchDir: this.#scratch.path } : {}),
       ...(contextBudget === undefined ? {} : { contextBudget }),
       skillSections: piNativeSkillsPromptSections(this.#skills),
       ...(this.#customAppend === undefined ? {} : { customAppend: this.#customAppend }),
       ...(projectInstructions === undefined ? {} : { projectInstructions }),
       toolActivation: this.#options.settings.enableSubagents
-        ? "<tool_activation>Task, TaskWait, TaskList, and TaskStop delegate self-contained work to in-process subagents.</tool_activation>"
+        ? "<tool_activation>Task delegates self-contained work to in-process subagents. TaskWait, TaskList, and TaskStop cover both subagents and background Bash jobs.</tool_activation>"
         : "",
     });
     return {
@@ -1409,6 +1511,17 @@ export class NativePiSessionRuntime {
     );
     let messages = request.context.messages;
     if (delta !== null) messages = [...messages, delta];
+    if (this.#backgroundNotes.length > 0) {
+      const notes = this.#backgroundNotes.splice(0);
+      messages = [
+        ...messages,
+        {
+          role: "user",
+          content: `<background_tasks>\n${notes.join("\n\n")}\n</background_tasks>`,
+          timestamp: this.#now(),
+        } satisfies UserMessage,
+      ];
+    }
     if (reminder?.role === "user") {
       // Request-only: a synthetic user reminder protects the cached prefix on the
       // providers whose adapters cannot carry a mid-conversation system message.
@@ -1740,6 +1853,8 @@ export class NativePiSessionRuntime {
     };
     // Steering unblocks TaskWait without cancelling the running subagents.
     this.#subagents?.interruptWaits();
+    // A Bash wait is interrupted too; the process it waited on keeps running.
+    this.#jobRouting?.interruptWaits();
     if (this.#agent.state.isStreaming) {
       state.unreadSteers.set(input.messageId, message);
       this.#agent.steer(message);
@@ -1763,6 +1878,8 @@ export class NativePiSessionRuntime {
     readonly onLoopSettled?: () => void;
   }): Promise<NativeTurnOutcome> {
     if (this.#active !== null) throw new Error("A Pi Native turn is already running.");
+    // A shell change between turns takes effect at the start of the next one.
+    this.#turnShell = null;
     this.#ensureSubagents();
     await this.refreshSkills();
     const state = newTurnState();
@@ -1927,6 +2044,9 @@ export class NativePiSessionRuntime {
     this.#disposed = true;
     await this.abort();
     await this.#subagents?.stopAll("interrupted");
+    await this.#backgroundJobs.stopAll();
+    await this.#scratch.cleanup();
+    this.#backgroundNotes = [];
     this.#unsubscribe();
     this.#coalescer.dispose();
     this.#pool.close();

@@ -49,6 +49,20 @@ describe("WorkspaceSandbox", () => {
     });
   });
 
+  it("classifies the session scratch root as writable scratch", async () => {
+    await withDirectories(async (workspace, outside) => {
+      const sandbox = new WorkspaceSandbox({ cwd: workspace, scratchRoots: [outside] });
+      const resolution = await sandbox.resolvePath(NodePath.join(outside, "draft.ts"), "write");
+      expect(resolution.classification).toBe("scratch");
+      expect(resolution.denied).toBe(false);
+      expect(sandbox.scratchRoots).toContain(outside);
+      // A scratch write stays allowed even when the path is outside the workspace.
+      expect(await sandbox.resolvePath(NodePath.join(outside, "draft.ts"), "read")).toMatchObject({
+        classification: "scratch",
+      });
+    });
+  });
+
   it("grants extra roots as writable workspace", async () => {
     await withDirectories(async (workspace, outside) => {
       const sandbox = new WorkspaceSandbox({ cwd: workspace, extraRoots: [outside] });

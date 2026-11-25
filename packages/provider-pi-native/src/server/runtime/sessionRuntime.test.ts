@@ -8,6 +8,8 @@ import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
+import * as HostProcess from "@t3tools/shared/HostProcess";
+
 import { PiNativeSettings } from "../../settings.ts";
 import {
   createScriptedStreamFn,
@@ -69,6 +71,8 @@ const makeRuntime = async (
     readonly initialGoal?: OrchestrationV2ProviderGoal | null;
     readonly maxGoalChecks?: number;
     readonly streamFn?: StreamFn;
+    readonly threadId?: string;
+    readonly shell?: { readonly command: string; readonly args: ReadonlyArray<string> };
     readonly skills?: ReadonlyArray<PiNativeSkillDef>;
     readonly discoverSkills?: () => Promise<ReadonlyArray<PiNativeSkillDef>>;
     readonly piAgentDir?: string;
@@ -93,6 +97,8 @@ const makeRuntime = async (
     requestUserInput: async () => input.answers ?? { answer: "yes" },
     ...(input.initialGoal === undefined ? {} : { initialGoal: input.initialGoal }),
     ...(input.maxGoalChecks === undefined ? {} : { maxGoalChecks: input.maxGoalChecks }),
+    ...(input.threadId === undefined ? {} : { threadId: input.threadId }),
+    ...(input.shell === undefined ? {} : { shell: input.shell }),
     // A developer's own global AGENTS.md and SYSTEM.md must never reach a test.
     piAgentDir: input.piAgentDir ?? (await workspace()),
     now: () => 0,
@@ -664,6 +670,57 @@ describe("NativePiSessionRuntime", () => {
     assert.isNotNull(harness.runtime.subagents);
     await harness.runtime.dispose();
   });
+
+  it.skipIf(HostProcess.Platform.defaultValue() === "win32")(
+    "keeps a background Bash job alive past the turn and cleans up on dispose",
+    async () => {
+      const threadId = "pi-native-jobs-thread";
+      const scratchPath = NodePath.join(NodeOS.tmpdir(), "pi-native-scratch", threadId);
+      const harness = await makeRuntime({
+        threadId,
+        shell: { command: "/bin/sh", args: ["-c"] },
+        steps: [
+          scriptedToolCallResponse([
+            { name: "Bash", arguments: { command: "sleep 30", runInBackground: true } },
+          ]),
+          scriptedToolCallResponse([{ name: "TaskList", arguments: {} }]),
+          scriptedTextResponse("job is running"),
+        ],
+      });
+      const outcome = await harness.runtime.runTurn({ text: "start a job" });
+      assert.equal(outcome.status, "completed");
+      assert.isTrue(harness.runtime.hasRunningBackgroundJobs);
+      assert.isTrue((await NodeFSP.stat(scratchPath)).isDirectory());
+
+      // The job tools stay available with subagents disabled and list the Bash job.
+      const listEnd = harness.events.find(
+        (event) => event.type === "tool" && event.phase === "end" && event.toolName === "TaskList",
+      );
+      assert.isDefined(listEnd);
+      const listResult = listEnd as {
+        readonly isError?: boolean;
+        readonly result?: { readonly details?: unknown };
+      };
+      assert.notEqual(listResult.isError, true);
+      const details = listResult.result?.details as {
+        readonly backgroundJobs?: {
+          readonly tasks?: ReadonlyArray<{ readonly job: { readonly id: string } }>;
+        };
+      };
+      assert.equal(details.backgroundJobs?.tasks?.[0]?.job.id, "bash-1");
+
+      assert.isFalse(await harness.runtime.stopBackgroundJob("bash-404"));
+      await harness.runtime.dispose();
+      assert.isFalse(harness.runtime.hasRunningBackgroundJobs);
+      let removed = false;
+      try {
+        await NodeFSP.stat(scratchPath);
+      } catch {
+        removed = true;
+      }
+      assert.isTrue(removed, "dispose removes the session scratch directory");
+    },
+  );
 
   it("continues an active goal autonomously until UpdateGoalStatus completes it", async () => {
     const harness = await makeRuntime({

@@ -227,6 +227,8 @@ interface ActiveTurn {
   readonly subagents: Map<string, OrchestrationV2Subagent>;
   /** Subagents this turn started that have not settled; drives `background_work.updated`. */
   readonly runningSubagents: Set<string>;
+  /** Last published pending flag, so a job exit and a subagent settle do not double-emit. */
+  backgroundWorkPending: boolean;
   readonly streamedToolChars: Map<string, number>;
   nextItemOrdinal: number;
   interrupted: boolean;
@@ -869,6 +871,19 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
       );
     };
 
+    const updateBackgroundWork = (turn: ActiveTurn): void => {
+      const pending =
+        turn.runningSubagents.size > 0 || turn.state.runtime?.hasRunningBackgroundJobs === true;
+      if (pending === turn.backgroundWorkPending) return;
+      turn.backgroundWorkPending = pending;
+      emit({
+        type: "background_work.updated",
+        driver: DRIVER,
+        providerTurnId: turn.providerTurn.id,
+        pending,
+      });
+    };
+
     const handleSubagent = (
       turn: ActiveTurn,
       event: Extract<NativeSessionEvent, { type: "subagent" }>,
@@ -881,18 +896,9 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
       });
       const status = subagentStatus(record.status);
       const finished = isSettledSubagent(status);
-      const wasRunning = turn.runningSubagents.size > 0;
       if (finished) turn.runningSubagents.delete(record.id);
       else turn.runningSubagents.add(record.id);
-      const running = turn.runningSubagents.size > 0;
-      if (running !== wasRunning) {
-        emit({
-          type: "background_work.updated",
-          driver: DRIVER,
-          providerTurnId: turn.providerTurn.id,
-          pending: running,
-        });
-      }
+      updateBackgroundWork(turn);
       const subagent: OrchestrationV2Subagent = {
         id: subagentId,
         threadId: turn.input.threadId,
@@ -1056,6 +1062,10 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
           return;
         case "subagent":
           handleSubagent(turn, event);
+          return;
+        case "background_job":
+          // A detached Bash job changes the same pending flag the subagents use.
+          updateBackgroundWork(turn);
           return;
         case "retry":
           handleRetry(turn, event);
@@ -1870,6 +1880,7 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
         openMessages: new Map(),
         subagents: new Map(),
         runningSubagents: new Set(),
+        backgroundWorkPending: false,
         streamedToolChars: new Map(),
         // Item ordinals are unique per turn and never 0, which `failureItemOrdinal` requires.
         nextItemOrdinal: Math.max(1, turnInput.providerTurnOrdinal) * 100 + 1,
@@ -1906,6 +1917,9 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
         firstRunOrdinal: state.providerThread.firstRunOrdinal ?? Math.max(1, turnInput.runOrdinal),
         lastRunOrdinal: Math.max(1, turnInput.runOrdinal),
       });
+      if (state.runtime?.hasRunningBackgroundJobs === true) {
+        updateBackgroundWork(turn);
+      }
       updateSession("running", null);
       void run(turn);
     };
@@ -1993,7 +2007,9 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
         () =>
           activeTurn !== null ||
           [...threads.values()].some(
-            (state) => state.runtime?.subagents?.hasRunningSubagents() === true,
+            (state) =>
+              state.runtime?.subagents?.hasRunningSubagents() === true ||
+              state.runtime?.hasRunningBackgroundJobs === true,
           ),
       ),
       hasPendingBackgroundWorkForThread: (providerThread, opts) =>
@@ -2003,7 +2019,8 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
           return (
             state.activeTurn !== null ||
             (opts?.includeSubagents !== false &&
-              state.runtime?.subagents?.hasRunningSubagents() === true)
+              state.runtime?.subagents?.hasRunningSubagents() === true) ||
+            state.runtime?.hasRunningBackgroundJobs === true
           );
         }),
       getModelContextWindow: (selection) => {
@@ -2150,7 +2167,20 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
       stopSubagent: (args) =>
         Effect.promise(async () => {
           const state = findThread(args.providerThread);
-          const manager = state?.runtime?.subagents ?? null;
+          const runtime = state?.runtime ?? null;
+          if (runtime === null) return undefined;
+          if (args.nativeTaskId.startsWith("bash:")) {
+            const stopped = await runtime.stopBackgroundJob(
+              args.nativeTaskId.slice("bash:".length),
+            );
+            if (!stopped) return undefined;
+            return {
+              status: "cancelled" as const,
+              completedAt: at(),
+              result: null,
+            };
+          }
+          const manager = runtime.subagents;
           if (manager === null) return undefined;
           const taskId = args.nativeTaskId.replace(/^subagent:/u, "");
           const stopped = await manager.stopSubagents([taskId]);
