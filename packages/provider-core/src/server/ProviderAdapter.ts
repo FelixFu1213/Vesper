@@ -96,6 +96,19 @@ export const ProviderAdapterV2SessionStatus = Schema.Literals([
 ]);
 export type ProviderAdapterV2SessionStatus = typeof ProviderAdapterV2SessionStatus.Type;
 
+export const ProviderAdapterV2TurnPhase = Schema.Literals([
+  "starting",
+  "preparing",
+  "waiting-model",
+  "streaming",
+  "tool",
+  "compacting",
+  "recovering",
+  "waiting-subagents",
+  "stopping",
+]);
+export type ProviderAdapterV2TurnPhase = typeof ProviderAdapterV2TurnPhase.Type;
+
 export const ProviderAdapterV2Event = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("app_thread.created"),
@@ -180,6 +193,15 @@ export const ProviderAdapterV2Event = Schema.Union([
     threadId: ThreadId,
     runId: RunId,
     text: Schema.String,
+  }),
+  /** Ephemeral turn activity for status display; never persisted. */
+  Schema.Struct({
+    type: Schema.Literal("turn_phase.updated"),
+    driver: ProviderDriverKind,
+    threadId: ThreadId,
+    runId: RunId,
+    phase: ProviderAdapterV2TurnPhase,
+    detail: Schema.optional(Schema.String),
   }),
   Schema.Struct({
     type: Schema.Literal("runtime_request.updated"),
@@ -615,6 +637,8 @@ export interface ProviderAdapterV2InterruptInput {
   readonly providerThread: OrchestrationV2ProviderThread;
   readonly providerTurnId: ProviderTurnId;
   readonly requestRuntimeRestart?: boolean;
+  /** `graceful` ends after the current step; the default `hard` cancels immediately. */
+  readonly mode?: "hard" | "graceful";
 }
 
 export interface ProviderAdapterV2RuntimeRequestResponseInput {

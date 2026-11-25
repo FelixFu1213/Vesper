@@ -43,6 +43,8 @@ describe("SystemTranscriptManager", () => {
         context: "thread context",
         runtime: "runtime instructions",
         context_budget: "budget note",
+        project_instructions: "project rules",
+        custom_append: "append rules",
       },
       timestamp: TIMESTAMP,
     });
@@ -52,6 +54,8 @@ describe("SystemTranscriptManager", () => {
     assert.equal(initial?.content, "You are T3.");
     assert.deepEqual(Object.keys(initial?.sections ?? {}), [
       "runtime",
+      "custom_append",
+      "project_instructions",
       "context",
       "context_budget",
     ]);
@@ -99,6 +103,65 @@ describe("SystemTranscriptManager", () => {
     assert.deepEqual(delta?.sections, { skills: null });
     assert.deepEqual(manager.committedSections, { runtime: "runtime v1", skills: null });
   });
+
+  it("keeps each skill section right behind the catalog header, sorted by id", () => {
+    const manager = new SystemTranscriptManager({
+      basePrompt: "base",
+      sections: {
+        runtime: "runtime v1",
+        context: "context v1",
+        "skill:beta": "beta v1",
+        skills: "skills v1",
+        "skill:alpha": "alpha v1",
+        tool_activation: "activation v1",
+      },
+      timestamp: TIMESTAMP,
+    });
+
+    assert.deepEqual(Object.keys(manager.initialSystemMessage?.sections ?? {}), [
+      "runtime",
+      "skills",
+      "skill:alpha",
+      "skill:beta",
+      "tool_activation",
+      "context",
+    ]);
+  });
+
+  it("appends only the changed skill and revokes one that left the catalog", () => {
+    const manager = new SystemTranscriptManager({
+      basePrompt: "base",
+      sections: { runtime: "runtime v1", skills: "skills v1", "skill:alpha": "alpha v1" },
+      timestamp: TIMESTAMP,
+    });
+
+    const added = manager.diffSections(
+      {
+        runtime: "runtime v1",
+        skills: "skills v1",
+        "skill:alpha": "alpha v1",
+        "skill:beta": "beta v1",
+      },
+      TIMESTAMP + 1,
+    );
+    assert.deepEqual(added?.sections, { "skill:beta": "beta v1" });
+
+    const revoked = manager.diffSections(
+      { runtime: "runtime v1", skills: "skills v1" },
+      TIMESTAMP + 2,
+    );
+    assert.deepEqual(revoked?.sections, { "skill:alpha": null, "skill:beta": null });
+    assert.deepEqual(manager.committedSections, {
+      runtime: "runtime v1",
+      skills: "skills v1",
+      "skill:alpha": null,
+      "skill:beta": null,
+    });
+
+    assert.isNull(
+      manager.diffSections({ runtime: "runtime v1", skills: "skills v1" }, TIMESTAMP + 3),
+    );
+  });
 });
 
 describe("foldForCheckpoint", () => {
@@ -136,19 +199,26 @@ describe("buildT3SystemSections", () => {
       model: "gpt-5.4",
       hasT3Mcp: true,
       skillSummary: "skill: orca-cli",
+      customAppend: "append rules",
+      projectInstructions: "project rules",
       planMode: true,
     });
 
     assert.include(sections.runtime ?? "", "runtime_info");
     assert.include(sections.runtime ?? "", "T3 Code orchestration");
+    assert.equal(sections.custom_append, "append rules");
+    assert.equal(sections.project_instructions, "project rules");
     assert.equal(sections.skills, "skill: orca-cli");
     assert.include(sections.tool_activation ?? "", "plan_mode");
     assert.include(sections.tool_activation ?? "", "SubmitPlan");
     assert.isUndefined(sections.context);
-    assert.deepEqual(
-      Object.keys(sections),
-      CANONICAL_SYSTEM_SECTIONS.filter((name) => sections[name] !== undefined),
-    );
+    assert.deepEqual(Object.keys(sections), [
+      "runtime",
+      "custom_append",
+      "project_instructions",
+      "skills",
+      "tool_activation",
+    ]);
   });
 
   it("renders the goal mode section and the workflow directive into tool activation", () => {
@@ -184,18 +254,62 @@ describe("buildT3SystemSections", () => {
     assert.isUndefined(cleared.tool_activation);
   });
 
+  it("renders the on-demand tool catalog between skills and tool activation", () => {
+    const sections = buildT3SystemSections({
+      harness: "Pi Native",
+      skillSummary: "skill: orca-cli",
+      onDemandTools: "# On-demand tools\n- TodoWrite: Replace the visible todo list.",
+      planMode: true,
+    });
+
+    assert.deepEqual(
+      Object.keys(sections),
+      CANONICAL_SYSTEM_SECTIONS.filter((name) => sections[name] !== undefined),
+    );
+    assert.equal(
+      CANONICAL_SYSTEM_SECTIONS.indexOf("on_demand_tools"),
+      CANONICAL_SYSTEM_SECTIONS.indexOf("skills") + 1,
+    );
+    assert.include(sections.on_demand_tools ?? "", "- TodoWrite:");
+    assert.include(sections.tool_activation ?? "", "plan_mode");
+  });
+
+  it("merges per-skill sections into the catalog order", () => {
+    const sections = buildT3SystemSections({
+      harness: "Pi Native",
+      skillSections: {
+        skills: "# Skills",
+        "skill:review": "- `review` — Review",
+        "skill:notes": "- `notes` — Notes",
+      },
+    });
+
+    assert.equal(sections.skills, "# Skills");
+    assert.equal(sections["skill:review"], "- `review` — Review");
+    assert.equal(sections["skill:notes"], "- `notes` — Notes");
+    assert.isUndefined(sections.tool_activation);
+  });
+
   it("leaves optional sections out when they have no content", () => {
     const sections = buildT3SystemSections({
       harness: "Pi",
       hasT3Mcp: false,
       skillSummary: "",
+      customAppend: "",
+      projectInstructions: "",
       context: "",
       planMode: false,
     });
 
+    assert.isUndefined(sections.custom_append);
+    assert.isUndefined(sections.project_instructions);
     assert.isUndefined(sections.skills);
     assert.isUndefined(sections.tool_activation);
     assert.isUndefined(sections.context);
     assert.notInclude(sections.runtime ?? "", "T3 Code orchestration");
+    assert.deepEqual(
+      Object.keys(sections),
+      CANONICAL_SYSTEM_SECTIONS.filter((name) => sections[name] !== undefined),
+    );
   });
 });

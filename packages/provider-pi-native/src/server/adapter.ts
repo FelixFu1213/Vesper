@@ -55,7 +55,11 @@ import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
 
 import { PiNativeSettings } from "../settings.ts";
-import { parsePiNativeCompactCommand, parsePiNativeWorkflowCommand } from "./commands.ts";
+import {
+  parsePiNativeCompactCommand,
+  parsePiNativeSkillCommand,
+  parsePiNativeWorkflowCommand,
+} from "./commands.ts";
 import { PI_NATIVE_DRIVER_KIND } from "./status.ts";
 import {
   NativePiSessionRuntime,
@@ -226,6 +230,8 @@ interface ActiveTurn {
   readonly subagents: Map<string, OrchestrationV2Subagent>;
   /** Subagents this turn started that have not settled; drives `background_work.updated`. */
   readonly runningSubagents: Set<string>;
+  /** Last published pending flag, so a job exit and a subagent settle do not double-emit. */
+  backgroundWorkPending: boolean;
   readonly streamedToolChars: Map<string, number>;
   nextItemOrdinal: number;
   interrupted: boolean;
@@ -877,6 +883,19 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
       );
     };
 
+    const updateBackgroundWork = (turn: ActiveTurn): void => {
+      const pending =
+        turn.runningSubagents.size > 0 || turn.state.runtime?.hasRunningBackgroundJobs === true;
+      if (pending === turn.backgroundWorkPending) return;
+      turn.backgroundWorkPending = pending;
+      emit({
+        type: "background_work.updated",
+        driver: DRIVER,
+        providerTurnId: turn.providerTurn.id,
+        pending,
+      });
+    };
+
     const handleSubagent = (
       turn: ActiveTurn,
       event: Extract<NativeSessionEvent, { type: "subagent" }>,
@@ -889,18 +908,9 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
       });
       const status = subagentStatus(record.status);
       const finished = isSettledSubagent(status);
-      const wasRunning = turn.runningSubagents.size > 0;
       if (finished) turn.runningSubagents.delete(record.id);
       else turn.runningSubagents.add(record.id);
-      const running = turn.runningSubagents.size > 0;
-      if (running !== wasRunning) {
-        emit({
-          type: "background_work.updated",
-          driver: DRIVER,
-          providerTurnId: turn.providerTurn.id,
-          pending: running,
-        });
-      }
+      updateBackgroundWork(turn);
       const subagent: OrchestrationV2Subagent = {
         id: subagentId,
         threadId: turn.input.threadId,
@@ -1065,6 +1075,10 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
         case "subagent":
           handleSubagent(turn, event);
           return;
+        case "background_job":
+          // A detached Bash job changes the same pending flag the subagents use.
+          updateBackgroundWork(turn);
+          return;
         case "retry":
           handleRetry(turn, event);
           return;
@@ -1079,6 +1093,16 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
             runId: turn.input.runId,
             messageId: MessageId.make(event.messageId),
             status: event.status,
+          });
+          return;
+        case "phase":
+          emit({
+            type: "turn_phase.updated",
+            driver: DRIVER,
+            threadId: turn.input.threadId,
+            runId: turn.input.runId,
+            phase: event.phase,
+            ...(event.detail === undefined ? {} : { detail: event.detail }),
           });
           return;
       }
@@ -1730,9 +1754,41 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
         const workflowCommand = continuation
           ? null
           : parsePiNativeWorkflowCommand(turn.input.message.text);
+        // `/skill:<id>` loads that skill for the turn; a `$<id>` mention does the same in the runtime.
+        let resolvedSkillCommand = continuation
+          ? null
+          : parsePiNativeSkillCommand(turn.input.message.text);
+        if (resolvedSkillCommand !== null) {
+          await runtime.refreshSkills();
+          const enabled = runtime.skills.filter((skill) => skill.enabled);
+          const matched =
+            enabled.find((skill) => skill.id === resolvedSkillCommand?.skillId) ??
+            enabled.find(
+              (skill) => skill.id.toLowerCase() === resolvedSkillCommand?.skillId.toLowerCase(),
+            );
+          if (matched === undefined) {
+            const available = enabled
+              .map((skill) => skill.id)
+              .sort((left, right) => left.localeCompare(right));
+            emitDirectAssistantReply(
+              turn,
+              available.length === 0
+                ? `Unknown skill "${resolvedSkillCommand.skillId}". No skills are installed for this workspace.`
+                : `Unknown skill "${resolvedSkillCommand.skillId}". Available skills: ${available.join(", ")}.`,
+            );
+            await finishTurn(turn, { status: "completed", failure: null, outputTruncated: false });
+            return;
+          }
+          resolvedSkillCommand = { ...resolvedSkillCommand, skillId: matched.id };
+        }
         const text = await Effect.runPromiseWith(services)(
           providerMessageTextWithAttachmentPaths({
-            text: workflowCommand?.promptText ?? turn.input.message.text,
+            text:
+              resolvedSkillCommand === null
+                ? (workflowCommand?.promptText ?? turn.input.message.text)
+                : resolvedSkillCommand.args === ""
+                  ? `Use the ${resolvedSkillCommand.skillId} skill for this task.`
+                  : resolvedSkillCommand.args,
             attachments: turn.input.message.attachments,
             resolveAttachmentPath: hostService.resolveAttachmentPath,
             ...(hostService.resolveExtractedTextPath === undefined
@@ -1765,6 +1821,7 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
                 workflowDirective: workflowCommand.systemDirective,
                 boostThinking: workflowCommand.boostThinking,
               }),
+          ...(resolvedSkillCommand === null ? {} : { skillIds: [resolvedSkillCommand.skillId] }),
         });
         await finishTurn(turn, outcome);
       } catch (cause) {
@@ -1848,6 +1905,7 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
         openMessages: new Map(),
         subagents: new Map(),
         runningSubagents: new Set(),
+        backgroundWorkPending: false,
         streamedToolChars: new Map(),
         // Item ordinals are unique per turn and never 0, which `failureItemOrdinal` requires.
         nextItemOrdinal: Math.max(1, turnInput.providerTurnOrdinal) * 100 + 1,
@@ -1884,6 +1942,9 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
         firstRunOrdinal: state.providerThread.firstRunOrdinal ?? Math.max(1, turnInput.runOrdinal),
         lastRunOrdinal: Math.max(1, turnInput.runOrdinal),
       });
+      if (state.runtime?.hasRunningBackgroundJobs === true) {
+        updateBackgroundWork(turn);
+      }
       updateSession("running", null);
       void run(turn);
     };
@@ -1971,7 +2032,9 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
         () =>
           activeTurn !== null ||
           [...threads.values()].some(
-            (state) => state.runtime?.subagents?.hasRunningSubagents() === true,
+            (state) =>
+              state.runtime?.subagents?.hasRunningSubagents() === true ||
+              state.runtime?.hasRunningBackgroundJobs === true,
           ),
       ),
       hasPendingBackgroundWorkForThread: (providerThread, opts) =>
@@ -1981,7 +2044,8 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
           return (
             state.activeTurn !== null ||
             (opts?.includeSubagents !== false &&
-              state.runtime?.subagents?.hasRunningSubagents() === true)
+              state.runtime?.subagents?.hasRunningSubagents() === true) ||
+            state.runtime?.hasRunningBackgroundJobs === true
           );
         }),
       getModelContextWindow: (selection) => {
@@ -2095,10 +2159,31 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
             ? {}
             : { resolveExtractedTextPath: hostService.resolveExtractedTextPath }),
         });
+        // Steering keeps images for a vision binding, exactly as a turn's first message does.
+        const steerBinding = resolvePiNativeModelBinding(
+          options.settings,
+          args.modelSelection ?? state.modelSelection,
+        );
+        const images = steerBinding.supportsImages
+          ? yield* Effect.tryPromise({
+              try: () =>
+                readAttachmentImages(args.message.attachments, hostService.resolveAttachmentPath),
+              catch: (cause) =>
+                new ProviderAdapter.ProviderAdapterProtocolError({
+                  driver: DRIVER,
+                  detail: "Pi Native could not read the steering attachment images.",
+                  cause,
+                }),
+            })
+          : [];
         const accepted = yield* Effect.sync(() =>
           state.runtime === null
             ? ("declined" as const)
-            : state.runtime.steer({ messageId: args.message.messageId, text }),
+            : state.runtime.steer({
+                messageId: args.message.messageId,
+                text,
+                ...(images.length === 0 ? {} : { images }),
+              }),
         );
         if (accepted === "declined") {
           return yield* new ProviderAdapter.ProviderAdapterSteerDeclinedError({
@@ -2133,6 +2218,14 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
         Effect.promise(async () => {
           const turn = findThread(args.providerThread)?.activeTurn ?? null;
           if (turn === null || turn.providerTurn.id !== args.providerTurnId) return;
+          if (args.mode === "graceful") {
+            const result = turn.state.runtime?.requestGracefulStop();
+            if (result?.requested !== true) {
+              turn.interrupted = true;
+            }
+            await Promise.race([turn.done, stoppedDeadline(options.scheduleTimer)]);
+            return;
+          }
           turn.interrupted = true;
           await turn.state.runtime?.abort();
           // A provider that never settles must not block Stop; its terminal still follows.
@@ -2141,7 +2234,20 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
       stopSubagent: (args) =>
         Effect.promise(async () => {
           const state = findThread(args.providerThread);
-          const manager = state?.runtime?.subagents ?? null;
+          const runtime = state?.runtime ?? null;
+          if (runtime === null) return undefined;
+          if (args.nativeTaskId.startsWith("bash:")) {
+            const stopped = await runtime.stopBackgroundJob(
+              args.nativeTaskId.slice("bash:".length),
+            );
+            if (!stopped) return undefined;
+            return {
+              status: "cancelled" as const,
+              completedAt: at(),
+              result: null,
+            };
+          }
+          const manager = runtime.subagents;
           if (manager === null) return undefined;
           const taskId = args.nativeTaskId.replace(/^subagent:/u, "");
           const stopped = await manager.stopSubagents([taskId]);

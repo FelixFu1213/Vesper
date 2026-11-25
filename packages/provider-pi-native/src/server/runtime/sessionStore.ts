@@ -27,7 +27,7 @@ export interface PersistedCompactionCheckpoint {
   readonly providerThreadId: string;
   /** Last transcript row the checkpoint replaces, or null when it covers the whole thread. */
   readonly throughMessageId: string | null;
-  readonly mode: "active_turn" | "completed_turn";
+  readonly mode: "active_turn" | "completed_turn" | "fresh_window";
   readonly summary: string;
   readonly leadingSystemJson: string | null;
   readonly retainedMessagesJson: string;

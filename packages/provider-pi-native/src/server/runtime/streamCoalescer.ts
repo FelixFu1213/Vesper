@@ -3,7 +3,8 @@ const host = globalThis as unknown as {
   readonly clearTimeout: (handle: unknown) => void;
 };
 
-const DEFAULT_FLUSH_INTERVAL_MS = 40;
+/** One frame at 60fps: deltas batch per paint without visible lag. */
+const DEFAULT_FLUSH_INTERVAL_MS = 16;
 const DEFAULT_MAX_BUFFERED_CHARS = 4_096;
 
 export type ScheduleTimer = (ms: number, callback: () => void) => () => void;

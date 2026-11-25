@@ -78,7 +78,7 @@ const toCheckpoint = (
 ): PersistedCompactionCheckpoint => ({
   providerThreadId,
   throughMessageId: row.throughMessageId,
-  mode: row.mode === "active_turn" ? "active_turn" : "completed_turn",
+  mode: row.mode === "active_turn" || row.mode === "fresh_window" ? row.mode : "completed_turn",
   summary: row.summary,
   leadingSystemJson: row.leadingSystemJson,
   retainedMessagesJson: row.retainedMessagesJson,

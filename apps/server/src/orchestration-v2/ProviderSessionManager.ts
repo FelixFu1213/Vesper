@@ -2948,6 +2948,8 @@ export const layerWithOptions = (
                 return next;
               });
             }
+            // Status-only: no persistence, no subscriber work.
+            if (nativeEvent.type === "turn_phase.updated") return Effect.void;
             const tracked = retryStalls.track(nativeEvent);
             const event = tracked.event;
             const armRetryStall = retryStalls.update(tracked);

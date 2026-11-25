@@ -50,7 +50,7 @@ describe("StreamDeltaCoalescer", () => {
     assert.deepEqual(flushed, []);
     assert.deepEqual(coalescer.pendingKeys, ["text:a", "text:b"]);
     assert.equal(timers.scheduled.length, 1);
-    assert.equal(timers.scheduled[0]?.ms, 40);
+    assert.equal(timers.scheduled[0]?.ms, 16);
 
     timers.scheduled[0]?.fire();
 
