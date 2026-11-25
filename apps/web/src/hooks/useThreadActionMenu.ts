@@ -51,6 +51,8 @@ import { useCopyToClipboard } from "./useCopyToClipboard";
 import { useNewThreadHandler } from "./useHandleNewThread";
 import { useClientSettings } from "./useSettings";
 import { canTurnThreadIntoProject, useThreadActions } from "./useThreadActions";
+import { openTargetInSplit, serverThreadTarget } from "../splitThreadNavigation";
+import { resolveThreadRouteTarget } from "../threadRoutes";
 
 function failureToast(title: string, error: unknown) {
   toastManager.add(
@@ -141,6 +143,7 @@ export function useThreadActionMenu(input: {
       const items = buildThreadActionMenuItems({
         canOperate: readEnvironmentScope(threadRef.environmentId, AuthOrchestrationOperateScope),
         canFind: onFind !== undefined,
+        canOpenInSplit: true,
         branch: thread.branch ?? null,
         projectFilter: null,
         isPinned: thread.pinnedAt != null,
@@ -198,6 +201,11 @@ export function useThreadActionMenu(input: {
         case "find":
           onFind?.(threadRef);
           return;
+        case "open-in-split": {
+          const currentTarget = resolveThreadRouteTarget(router.state.matches.at(-1)?.params ?? {});
+          void openTargetInSplit(router, currentTarget, serverThreadTarget(threadRef));
+          return;
+        }
         case "project-settings": {
           const project = projects.find(
             (candidate) =>

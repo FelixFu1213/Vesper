@@ -5,10 +5,12 @@ import { visibilityParentKey } from "@t3tools/client-runtime/state/threads";
 import type { ScopedThreadRef } from "@t3tools/contracts";
 import * as Option from "effect/Option";
 import { Navigate, useNavigate } from "@tanstack/react-router";
-import { useEffect, useState } from "react";
+import { useEffect, useState, use } from "react";
 
 import ChatView from "./ChatView";
 import { BackgroundThreadContext, HiddenThreadContext } from "./chat/backgroundThread";
+import { SplitPaneContext } from "./chat/splitPaneContext";
+import { useSplitThreadStore } from "../splitThreadStore";
 import { SidebarInset } from "./ui/sidebar";
 import { useComposerDraftStore } from "../composerDraftStore";
 import { useSidebarPendingFileDropStore } from "../sidebarPendingFileDropStore";
@@ -58,6 +60,8 @@ export function ThreadRouteView({
   target: ThreadRouteTarget;
   background?: boolean;
 }) {
+  const splitPane = use(SplitPaneContext);
+  const isUnfocusedSplitPane = splitPane !== null && !splitPane.focused;
   const navigate = useNavigate();
   const draftId = target.kind === "draft" ? target.draftId : null;
   const draftSession = useComposerDraftStore((store) =>
@@ -148,11 +152,63 @@ export function ThreadRouteView({
     if (renderState === "missing") {
       const { clearPendingFileDropsForThread } = useSidebarPendingFileDropStore.getState();
       clearPendingFileDropsForThread(target.threadRef);
-      if (environmentHasAnyThreads && !background) {
+      if (isUnfocusedSplitPane && splitPane) {
+        useSplitThreadStore.getState().closePane(splitPane.side);
+      } else if (environmentHasAnyThreads && !background) {
         void navigate({ to: "/", replace: true });
       }
     }
-  }, [background, bootstrapComplete, environmentHasAnyThreads, navigate, renderState, target]);
+  }, [
+    background,
+    bootstrapComplete,
+    environmentHasAnyThreads,
+    isUnfocusedSplitPane,
+    navigate,
+    renderState,
+    splitPane,
+    target,
+  ]);
+
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- promotes or closes an unfocused split pane without stealing the router URL
+  useEffect(() => {
+    if (!isUnfocusedSplitPane || !splitPane) return;
+    if (target.kind === "draft") {
+      if (
+        draftSession &&
+        hiddenKeys.has(
+          threadKey({ environmentId: draftSession.environmentId, threadId: draftSession.threadId }),
+        )
+      ) {
+        useSplitThreadStore.getState().closePane(splitPane.side);
+      } else if (!draftSession && draftRedirect) {
+        if (hiddenKeys.has(threadKey(draftRedirect))) {
+          useSplitThreadStore.getState().closePane(splitPane.side);
+        } else {
+          useSplitThreadStore
+            .getState()
+            .setPaneTarget(splitPane.side, { kind: "server", threadRef: draftRedirect });
+        }
+      } else if (!draftSession) {
+        useSplitThreadStore.getState().closePane(splitPane.side);
+      }
+    } else if (
+      hiddenByTagFilter ||
+      (offShellBlocked && bootstrapComplete && unlistedThread !== null)
+    ) {
+      useSplitThreadStore.getState().closePane(splitPane.side);
+    }
+  }, [
+    bootstrapComplete,
+    draftRedirect,
+    draftSession,
+    hiddenByTagFilter,
+    hiddenKeys,
+    isUnfocusedSplitPane,
+    offShellBlocked,
+    splitPane,
+    target,
+    unlistedThread,
+  ]);
 
   let view: React.ReactNode = null;
   let redirect: React.ReactNode = null;
@@ -224,14 +280,27 @@ export function ThreadRouteView({
     );
   }
 
+  const wrappedView = (
+    <BackgroundThreadContext value={background || isUnfocusedSplitPane}>
+      <HiddenThreadContext value={background}>{view}</HiddenThreadContext>
+    </BackgroundThreadContext>
+  );
+
+  if (splitPane !== null) {
+    return (
+      <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+        {wrappedView}
+        {background || isUnfocusedSplitPane ? null : redirect}
+      </div>
+    );
+  }
+
   return (
     <SidebarInset
       className="h-svh min-h-0 overflow-hidden overscroll-y-none md:h-dvh"
       inert={background}
     >
-      <BackgroundThreadContext value={background}>
-        <HiddenThreadContext value={background}>{view}</HiddenThreadContext>
-      </BackgroundThreadContext>
+      {wrappedView}
       {background ? null : redirect}
     </SidebarInset>
   );

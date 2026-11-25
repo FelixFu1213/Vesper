@@ -170,6 +170,11 @@ import {
   resolveActiveThreadRouteRef,
   resolveThreadRouteTarget,
 } from "../threadRoutes";
+import {
+  openTargetInFocusedPane,
+  openTargetInSplit,
+  serverThreadTarget,
+} from "../splitThreadNavigation";
 import type { SidebarThreadSummary } from "../types";
 import { isScratchProject } from "@t3tools/client-runtime/state/projects";
 import { cn } from "~/lib/utils";
@@ -1483,10 +1488,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
     if (isMobile) {
       setOpenMobile(false);
     }
-    return router.navigate({
-      to: "/$environmentId/$threadId",
-      params: buildThreadRouteParams(threadRef),
-    });
+    return openTargetInFocusedPane(router, serverThreadTarget(threadRef));
   };
 
   const handleThreadFileDrop = async (threadRef: ScopedThreadRef, files: File[]) => {
@@ -1516,7 +1518,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
     if (isMobile) {
       setOpenMobile(false);
     }
-    void router.navigate({ to: "/draft/$draftId", params: { draftId } });
+    void openTargetInFocusedPane(router, { kind: "draft", draftId });
   };
 
   const clearThreadSearch = () => {
@@ -1610,6 +1612,11 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
     if (event.shiftKey) {
       event.preventDefault();
       rangeSelectTo(threadKey, orderedThreadKeysRef.current);
+      return;
+    }
+    if (event.altKey && !isMobile) {
+      event.preventDefault();
+      void openTargetInSplit(router, routeTarget, serverThreadTarget(threadRef));
       return;
     }
     if (isTrailingDoubleClick(event.detail)) {
@@ -2716,6 +2723,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
               ),
               canTurnIntoProject: canTurnThreadIntoProject(threadRef),
               canRename: !fromSearch,
+              canOpenInSplit: !isMobile,
               supports: {
                 settlement: configLoaded,
                 autoSettleOptOut: supportsAutoSettleOptOut,
@@ -2745,6 +2753,9 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
           return;
         }
         switch (clicked.value) {
+          case "open-in-split":
+            void openTargetInSplit(router, routeTarget, serverThreadTarget(threadRef));
+            return;
           case "filter-by-project":
             if (threadProjectGroup) {
               setProjectScopeKeys(
