@@ -2,9 +2,8 @@
 // @effect-diagnostics globalTimers:off -- Bash enforces its timeout with a Node timer; tests inject the sleep seam instead.
 import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
-import { arr, bool, int, lit, obj, oneOf, opt, str, union } from "@earendil-works/pi-schema";
+import { arr, bool, int, lit, num, obj, oneOf, opt, str, union } from "@earendil-works/pi-schema";
 import type { OrchestrationV2UserInputQuestion } from "@t3tools/contracts";
-import * as HostProcess from "@t3tools/shared/HostProcess";
 import {
   withAgentDeviceEnvironment,
   type McpProviderSessionConfig,
@@ -22,9 +21,17 @@ import {
   splitFileLines,
   type HashlineEdit,
 } from "./hashline.ts";
+import {
+  createHeadTailCapture,
+  normalizeBashTimeout,
+  type BackgroundJobManager,
+  type BackgroundJobSnapshot,
+  type JobReference,
+} from "./backgroundJobs.ts";
 import { detectShellFilePatch, MutationRecoveryTracker } from "./mutationRecovery.ts";
 import { PathMutex } from "./pathLock.ts";
 import type { WorkspaceSandbox } from "./sandbox.ts";
+import { resolveTurnShell, type SessionScratchDir, type TurnShell } from "./shellCatalog.ts";
 import { SeenLinesTracker } from "./hashline.ts";
 
 const T3CODE_THREAD_ID_ENV = "T3CODE_THREAD_ID";
@@ -34,8 +41,6 @@ const DEFAULT_MAX_OUTPUT_BYTES = 64 * 1024;
 const DEFAULT_MAX_GLOB_RESULTS = 500;
 const DEFAULT_MAX_GREP_MATCHES = 200;
 const DEFAULT_MAX_GREP_FILE_BYTES = 1024 * 1024;
-const DEFAULT_BASH_TIMEOUT_MS = 120_000;
-const DEFAULT_MAX_BASH_TIMEOUT_MS = 600_000;
 const MAX_PREVIEW_CHARS = 240;
 const SKIP_DIRECTORIES: ReadonlySet<string> = new Set([".git", "node_modules"]);
 
@@ -106,6 +111,14 @@ export interface PiNativeToolDeps {
   readonly threadId?: string;
   readonly environment?: NodeJS.ProcessEnv;
   readonly shell?: ShellSpec;
+  /** The shell this turn pinned; `shell` is a test override that wins over it. */
+  readonly resolveShell?: (() => TurnShell) | undefined;
+  readonly loginShellPath?: (() => Promise<string | null>) | undefined;
+  readonly backgroundJobs?: BackgroundJobManager | undefined;
+  /** Lets the runtime report a detached job to the client as soon as it starts. */
+  readonly onBackgroundJobStarted?: ((snapshot: BackgroundJobSnapshot) => void) | undefined;
+  readonly scratch?: SessionScratchDir | undefined;
+  readonly platform?: NodeJS.Platform | undefined;
   readonly sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   readonly maxImageBytes?: number;
   readonly maxOutputBytes?: number;
@@ -148,11 +161,18 @@ export interface GrepDetails {
 export interface BashDetails {
   readonly command: string;
   readonly exitCode: number | null;
+  /** stdout and stderr joined, kept for callers that render one block. */
   readonly output: string;
+  readonly stdout?: string | undefined;
+  readonly stderr?: string | undefined;
   readonly truncated: boolean;
   readonly timedOut: boolean;
   readonly aborted: boolean;
   readonly shellPatchWarning?: string;
+  readonly backgroundTaskId?: string;
+  readonly job?: JobReference;
+  readonly errorCode?: string;
+  readonly root?: "workspace" | "scratch";
 }
 
 export interface AskToolDetails {
@@ -424,7 +444,24 @@ const GREP_PARAMS = obj({
 
 const BASH_PARAMS = obj({
   command: str({ description: "Shell command to run in the workspace folder." }),
-  timeoutMs: opt(int({ minimum: 1, description: "Timeout in milliseconds." })),
+  timeoutSeconds: opt(
+    num({
+      description:
+        "Give up after this many seconds (default 60). A value above 21600 is read as milliseconds; the result is clamped to 1-21600.",
+    }),
+  ),
+  timeoutMs: opt(
+    int({ minimum: 1, description: "Timeout in milliseconds; prefer timeoutSeconds." }),
+  ),
+  runInBackground: opt(
+    bool({
+      description:
+        "Detach the command from this turn and return its job id. It survives turn abort and no timeout applies.",
+    }),
+  ),
+  notifyOnExit: opt(
+    bool({ description: "With runInBackground, ask for a continuation when the job ends." }),
+  ),
 });
 
 const ASK_QUESTION_SCHEMA = obj({
@@ -579,19 +616,11 @@ const isFull = (count: number, limit: number): boolean => count >= limit;
 
 const isAborted = (signal: AbortSignal | undefined): boolean => signal?.aborted === true;
 
-const defaultShell = (): ShellSpec =>
-  HostProcess.Platform.defaultValue() === "win32"
-    ? { command: process.env.ComSpec ?? "cmd.exe", args: ["/c"] }
-    : { command: "/bin/sh", args: ["-c"] };
-
 export const createPiNativeTools = (deps: PiNativeToolDeps): ReadonlyArray<AgentTool<any>> => {
   const maxImageBytes = deps.maxImageBytes ?? DEFAULT_MAX_IMAGE_BYTES;
   const maxOutputBytes = deps.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
   const maxGlobResults = deps.maxGlobResults ?? DEFAULT_MAX_GLOB_RESULTS;
   const maxGrepMatches = deps.maxGrepMatches ?? DEFAULT_MAX_GREP_MATCHES;
-  const defaultBashTimeoutMs = deps.defaultBashTimeoutMs ?? DEFAULT_BASH_TIMEOUT_MS;
-  const maxBashTimeoutMs = deps.maxBashTimeoutMs ?? DEFAULT_MAX_BASH_TIMEOUT_MS;
-  const shell = deps.shell ?? defaultShell();
 
   const writeGuard = (target: string): string | undefined => {
     const state = deps.recovery.peek(target);
@@ -732,6 +761,7 @@ export const createPiNativeTools = (deps: PiNativeToolDeps): ReadonlyArray<Agent
       parameters: WRITE_PARAMS,
       execute: async (_toolCallId, params) => {
         try {
+          await deps.scratch?.ensureCreated();
           const resolution = await deps.sandbox.resolvePath(params.path, "write");
           if (resolution.denied) {
             return fail(
@@ -769,6 +799,7 @@ export const createPiNativeTools = (deps: PiNativeToolDeps): ReadonlyArray<Agent
     execute: async (_toolCallId, params) => {
       let target = params.path;
       try {
+        await deps.scratch?.ensureCreated();
         const resolution = await deps.sandbox.resolvePath(params.path, "write");
         if (resolution.denied) {
           return fail(resolution.writeDeniedReason ?? `${resolution.resolvedPath} is read-only.`, {
@@ -985,102 +1016,162 @@ export const createPiNativeTools = (deps: PiNativeToolDeps): ReadonlyArray<Agent
     execute: async (_toolCallId, params, signal, onUpdate) => {
       const command = params.command;
       const patch = detectShellFilePatch(command);
-      const timeoutMs = Math.min(
-        Math.max(params.timeoutMs ?? defaultBashTimeoutMs, 1),
-        maxBashTimeoutMs,
-      );
-      const cwd = deps.sandbox.cwd ?? process.cwd();
-      const environment = withAgentDeviceEnvironment(
-        deps.environment ?? process.env,
-        deps.mcpSession,
-      );
-      const env: NodeJS.ProcessEnv = {
-        ...environment,
-        ...(deps.threadId === undefined ? {} : { [T3CODE_THREAD_ID_ENV]: deps.threadId }),
-      };
       const shellPatchWarning = patch.isPatch
         ? `${patch.reason ?? "shell writes files"}; prefer Edit or Write so the change shows as a diff.`
         : undefined;
+      const cwd = deps.sandbox.cwd ?? process.cwd();
+      const root: "workspace" | "scratch" =
+        deps.sandbox.classify(cwd) === "scratch" ? "scratch" : "workspace";
+      const details = (patchDetails: Partial<BashDetails> = {}): BashDetails => ({
+        command,
+        exitCode: null,
+        output: "",
+        stdout: "",
+        stderr: "",
+        truncated: false,
+        timedOut: false,
+        aborted: false,
+        root,
+        ...(shellPatchWarning === undefined ? {} : { shellPatchWarning }),
+        ...patchDetails,
+      });
+
+      // One shell per turn keeps the dialect (and therefore the syntax) stable.
+      let turnShell: TurnShell;
+      try {
+        turnShell =
+          deps.resolveShell !== undefined
+            ? deps.resolveShell()
+            : deps.shell !== undefined
+              ? {
+                  id: "bash",
+                  dialect: "posix",
+                  executable: deps.shell.command,
+                  args: deps.shell.args,
+                }
+              : resolveTurnShell({
+                  ...(deps.environment === undefined ? {} : { environment: deps.environment }),
+                  ...(deps.platform === undefined ? {} : { platform: deps.platform }),
+                });
+      } catch (error) {
+        return fail(
+          `Could not start the command: ${describe(error)}`,
+          details({ errorCode: errorCode(error) ?? "TOOL_FAILED" }),
+        );
+      }
 
       if (isAborted(signal)) {
-        const aborted: BashDetails = {
-          command,
-          exitCode: null,
-          output: "",
-          truncated: false,
-          timedOut: false,
-          aborted: true,
-          ...(shellPatchWarning === undefined ? {} : { shellPatchWarning }),
-        };
-        return fail("The command was cancelled before it started.", aborted);
+        return fail("The command was cancelled before it started.", details({ aborted: true }));
       }
+
+      const env: NodeJS.ProcessEnv = {
+        ...withAgentDeviceEnvironment(deps.environment ?? process.env, deps.mcpSession),
+        ...(deps.threadId === undefined ? {} : { [T3CODE_THREAD_ID_ENV]: deps.threadId }),
+      };
+      if (deps.loginShellPath !== undefined) {
+        const loginPath = await deps.loginShellPath();
+        if (loginPath !== null) env.PATH = loginPath;
+      }
+      if (deps.scratch !== undefined) {
+        await deps.scratch.ensureCreated();
+        env.PI_SCRATCH_DIR = deps.scratch.formatForShell(turnShell.dialect);
+      }
+
+      // A background command is owned by the session, not by this turn's signal or timeout.
+      if (params.runInBackground === true) {
+        const jobs = deps.backgroundJobs;
+        if (jobs === undefined) {
+          return fail(
+            "Background Bash jobs are unavailable in this session. Run the command in the foreground.",
+            details({ errorCode: "TOOL_FAILED" }),
+          );
+        }
+        try {
+          const started = jobs.start({
+            command,
+            executable: turnShell.executable,
+            args: turnShell.args,
+            cwd,
+            env,
+            ...(params.notifyOnExit === true ? { notifyOnExit: true } : {}),
+          });
+          deps.onBackgroundJobStarted?.(started);
+          return ok(
+            `Started background task ${started.job.id}. Wait for it with TaskWait (job {"kind":"bash","id":"${started.job.id}"}) or stop it with TaskStop.`,
+            details({
+              backgroundTaskId: started.job.id,
+              job: started.job,
+              stdout: started.stdout,
+              stderr: started.stderr,
+              output: [started.stdout, started.stderr].filter((part) => part !== "").join("\n"),
+              truncated: started.truncated,
+            }),
+          );
+        } catch (error) {
+          return fail(
+            `Could not start the command: ${describe(error)}`,
+            details({ errorCode: errorCode(error) ?? "TOOL_FAILED" }),
+          );
+        }
+      }
+
+      const timeoutMs = normalizeBashTimeout({
+        ...(params.timeoutSeconds === undefined ? {} : { timeoutSeconds: params.timeoutSeconds }),
+        ...(params.timeoutMs === undefined ? {} : { timeoutMs: params.timeoutMs }),
+        ...(deps.defaultBashTimeoutMs === undefined
+          ? {}
+          : { defaultTimeoutMs: deps.defaultBashTimeoutMs }),
+        ...(deps.maxBashTimeoutMs === undefined ? {} : { maxTimeoutMs: deps.maxBashTimeoutMs }),
+      });
 
       let child: NodeChildProcess.ChildProcess;
       try {
-        child = NodeChildProcess.spawn(shell.command, [...shell.args, command], {
+        child = NodeChildProcess.spawn(turnShell.executable, [...turnShell.args, command], {
           cwd,
           env,
           detached: true,
           stdio: ["ignore", "pipe", "pipe"],
         });
       } catch (error) {
-        return fail(`Could not start the command: ${describe(error)}`, {
-          command,
-          exitCode: null,
-          output: "",
-          truncated: false,
-          timedOut: false,
-          aborted: false,
-          ...(shellPatchWarning === undefined ? {} : { shellPatchWarning }),
-        });
+        return fail(
+          `Could not start the command: ${describe(error)}`,
+          details({ errorCode: errorCode(error) ?? "TOOL_FAILED" }),
+        );
       }
 
-      let outputHead = "";
-      let outputTail = "";
-      let truncated = false;
-      let killed = false;
+      const stdout = createHeadTailCapture(maxOutputBytes);
+      const stderr = createHeadTailCapture(maxOutputBytes);
 
-      const capture = (chunk: string): void => {
-        if (outputHead.length < maxOutputBytes) {
-          outputHead += chunk;
-          if (outputHead.length > maxOutputBytes) {
-            truncated = true;
-            const half = Math.floor(maxOutputBytes / 2);
-            outputTail = outputHead.slice(-half);
-            outputHead = outputHead.slice(0, half);
-          }
-          return;
-        }
-        truncated = true;
-        outputTail = (outputTail + chunk).slice(-Math.floor(maxOutputBytes / 2));
+      const combined = (): string => {
+        const out = stdout.text();
+        const err = stderr.text();
+        if (out === "") return err;
+        if (err === "") return out;
+        return `${out}\n\n${err}`;
       };
-
-      const currentOutput = (): string =>
-        truncated ? `${outputHead}\n\n[output truncated]\n\n${outputTail}` : outputHead;
 
       const emitUpdate = (): void => {
         onUpdate?.({
-          content: [text(currentOutput())],
-          details: {
-            command,
-            exitCode: null,
-            output: currentOutput(),
-            truncated,
-            timedOut: false,
-            aborted: false,
-            ...(shellPatchWarning === undefined ? {} : { shellPatchWarning }),
-          },
+          content: [text(combined())],
+          details: details({
+            output: combined(),
+            stdout: stdout.text(),
+            stderr: stderr.text(),
+            truncated: stdout.truncated() || stderr.truncated(),
+          }),
         });
       };
 
       child.stdout?.on("data", (chunk: Buffer) => {
-        capture(chunk.toString("utf8"));
+        stdout.push(chunk);
         emitUpdate();
       });
       child.stderr?.on("data", (chunk: Buffer) => {
-        capture(chunk.toString("utf8"));
+        stderr.push(chunk);
         emitUpdate();
       });
+
+      let killed = false;
 
       const terminate = (): void => {
         if (killed) return;
@@ -1125,27 +1216,33 @@ export const createPiNativeTools = (deps: PiNativeToolDeps): ReadonlyArray<Agent
         const timedOut = !exited;
         if (timedOut) terminate();
         const exitCode = await exitPromise;
-        const aborted = isAborted(signal);
-        const details: BashDetails = {
-          command,
+        stdout.end();
+        stderr.end();
+        const finished = details({
           exitCode,
-          output: currentOutput(),
-          truncated,
+          output: combined(),
+          stdout: stdout.text(),
+          stderr: stderr.text(),
+          truncated: stdout.truncated() || stderr.truncated(),
           timedOut,
-          aborted,
-          ...(shellPatchWarning === undefined ? {} : { shellPatchWarning }),
-        };
-        if (aborted) {
-          return fail("The command was cancelled.", details);
+          aborted: isAborted(signal),
+        });
+        if (finished.aborted) {
+          return fail("The command was cancelled.", { ...finished, errorCode: "TOOL_ABORTED" });
         }
         const status = timedOut
-          ? `Command timed out after ${timeoutMs}ms.`
+          ? `Command timed out after ${timeoutMs}ms, the effective timeout budget. Raise timeoutSeconds, or split the command into smaller steps.`
           : `Command exited with code ${exitCode ?? "null"}.`;
-        const body = details.output === "" ? status : `${details.output}\n\n${status}`;
+        const body = finished.output === "" ? status : `${finished.output}\n\n${status}`;
         const withWarning =
           shellPatchWarning === undefined ? body : `${body}\n\n[warning] ${shellPatchWarning}`;
-        const result = ok(withWarning, details);
-        return timedOut ? { ...result, isError: true } : result;
+        if (timedOut) {
+          return { ...ok(withWarning, { ...finished, errorCode: "TOOL_TIMEOUT" }), isError: true };
+        }
+        if (exitCode !== 0) {
+          return { ...ok(withWarning, { ...finished, errorCode: "TOOL_FAILED" }), isError: true };
+        }
+        return ok(withWarning, finished);
       } finally {
         if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
         signal?.removeEventListener("abort", onAbort);

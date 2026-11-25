@@ -347,6 +347,11 @@ export class PermissionEngine {
       }
     }
 
+    // Scratch writes cannot touch the project; the resolver still runs above.
+    if ((toolName === "Write" || toolName === "Edit") && resolution?.classification === "scratch") {
+      return allow("file_edit", "Session scratch files are outside the project.");
+    }
+
     const readOnly = READ_ONLY_TOOL_NAMES.has(toolName) || mcpReadOnly;
     if (readOnly && resolution?.classification !== "external") {
       return allow("read", `${toolName} only reads within the workspace.`);

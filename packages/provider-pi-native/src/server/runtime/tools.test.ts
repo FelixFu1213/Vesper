@@ -8,8 +8,10 @@ import { describe, expect, it } from "vite-plus/test";
 
 import { computeLineTag, SeenLinesTracker } from "./hashline.ts";
 import { MutationRecoveryTracker } from "./mutationRecovery.ts";
+import { BackgroundJobManager } from "./backgroundJobs.ts";
 import { PathMutex } from "./pathLock.ts";
 import { WorkspaceSandbox } from "./sandbox.ts";
+import { SessionScratchDir } from "./shellCatalog.ts";
 import {
   createPiNativeTools,
   type GoalStatusUpdate,
@@ -35,6 +37,9 @@ interface Harness {
 interface HarnessOptions {
   readonly planMode?: boolean;
   readonly readOnlyRoots?: ReadonlyArray<string>;
+  readonly scratchRoots?: ReadonlyArray<string>;
+  readonly scratch?: SessionScratchDir;
+  readonly backgroundJobs?: BackgroundJobManager;
   readonly threadId?: string;
   readonly sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   readonly shell?: PiNativeToolDeps["shell"];
@@ -60,6 +65,7 @@ const withDirectory = async (body: (make: HarnessFactory) => Promise<void>): Pro
       sandbox: new WorkspaceSandbox({
         cwd: directory,
         ...(options.readOnlyRoots === undefined ? {} : { readOnlyRoots: options.readOnlyRoots }),
+        ...(options.scratchRoots === undefined ? {} : { scratchRoots: options.scratchRoots }),
       }),
       seen,
       recovery,
@@ -81,6 +87,8 @@ const withDirectory = async (body: (make: HarnessFactory) => Promise<void>): Pro
       ...(options.threadId === undefined ? {} : { threadId: options.threadId }),
       ...(options.sleep === undefined ? {} : { sleep: options.sleep }),
       ...(options.shell === undefined ? {} : { shell: options.shell }),
+      ...(options.scratch === undefined ? {} : { scratch: options.scratch }),
+      ...(options.backgroundJobs === undefined ? {} : { backgroundJobs: options.backgroundJobs }),
       ...(options.maxOutputBytes === undefined ? {} : { maxOutputBytes: options.maxOutputBytes }),
       ...(options.maxGlobResults === undefined ? {} : { maxGlobResults: options.maxGlobResults }),
     };
@@ -551,7 +559,95 @@ describe("Bash", () => {
       const result = await harness.tool("Bash").execute("call-1", { command: "ignored" });
       expect(result.isError).toBe(true);
       expect(result.details.timedOut).toBe(true);
+      expect(result.details.errorCode).toBe("TOOL_TIMEOUT");
       expect(textOf(result)).toContain("timed out");
+      expect(textOf(result)).toContain("timeoutSeconds");
+    });
+  });
+
+  it.skipIf(windows)("applies a timeoutSeconds budget", async () => {
+    await withDirectory(async (make) => {
+      const harness = make({
+        sleep: () => Promise.resolve(),
+        shell: { command: "/bin/sh", args: ["-c", "sleep 30; true"] },
+      });
+      const result = await harness
+        .tool("Bash")
+        .execute("call-1", { command: "ignored", timeoutSeconds: 2 });
+      expect(result.details.errorCode).toBe("TOOL_TIMEOUT");
+      expect(textOf(result)).toContain("2000ms");
+    });
+  });
+
+  it.skipIf(windows)("separates stdout and stderr and flags a non-zero exit", async () => {
+    await withDirectory(async (make) => {
+      const harness = make();
+      const result = await harness
+        .tool("Bash")
+        .execute("call-1", { command: "printf out; printf err >&2; exit 3" });
+      expect(result.isError).toBe(true);
+      expect(result.details).toMatchObject({
+        exitCode: 3,
+        stdout: "out",
+        stderr: "err",
+        output: "out\n\nerr",
+        errorCode: "TOOL_FAILED",
+        root: "workspace",
+      });
+      expect(textOf(result)).toContain("exited with code 3");
+    });
+  });
+
+  it("detaches a background command and reports its job", async () => {
+    await withDirectory(async (make) => {
+      const jobs = new BackgroundJobManager();
+      const harness = make({ backgroundJobs: jobs });
+      const result = await harness
+        .tool("Bash")
+        .execute("call-1", { command: "printf hi", runInBackground: true });
+      expect(result.isError).toBeUndefined();
+      expect(result.details.backgroundTaskId).toBe("bash-1");
+      expect(result.details.job).toEqual({ kind: "bash", id: "bash-1" });
+      expect(textOf(result)).toContain("TaskWait");
+      const snapshot = await jobs.wait("bash-1", 10_000);
+      expect(snapshot.state).toBe("exited");
+      expect(snapshot.stdout).toBe("hi");
+    });
+  });
+
+  it("refuses a background command without a job manager", async () => {
+    await withDirectory(async (make) => {
+      const harness = make();
+      const result = await harness
+        .tool("Bash")
+        .execute("call-1", { command: "printf hi", runInBackground: true });
+      expect(result.isError).toBe(true);
+      expect(textOf(result)).toContain("Background Bash jobs are unavailable");
+    });
+  });
+
+  it("creates the session scratch directory and exports PI_SCRATCH_DIR", async () => {
+    await withDirectory(async (make) => {
+      const base = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "pi-native-scratch-tool-"));
+      try {
+        const scratch = new SessionScratchDir({ sessionId: "thread-1", baseRoot: base });
+        const harness = make({ scratch, scratchRoots: [scratch.path] });
+
+        const write = await harness.tool("Write").execute("call-1", {
+          path: NodePath.join(scratch.path, "draft.txt"),
+          content: "draft",
+        });
+        expect(write.isError).toBeUndefined();
+        expect(scratch.created).toBe(true);
+        expect(await readFile(NodePath.join(scratch.path, "draft.txt"))).toBe("draft");
+
+        const bash = await harness
+          .tool("Bash")
+          .execute("call-2", { command: 'printf "%s" "$PI_SCRATCH_DIR"' });
+        expect(bash.details.output).toBe(scratch.path);
+      } finally {
+        await NodeFSP.rm(base, { recursive: true, force: true });
+      }
     });
   });
 });

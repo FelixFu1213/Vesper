@@ -176,6 +176,8 @@ export interface BuildT3SystemSectionsInput {
   /** Skill names and descriptions available to this thread. */
   readonly skillSummary?: string | undefined;
   readonly toolActivation?: string | undefined;
+  /** Advertised once the session's scratch directory exists. */
+  readonly scratchDir?: string | undefined;
   readonly context?: string | undefined;
   readonly contextBudget?: string | undefined;
   readonly planMode?: boolean | undefined;
@@ -197,6 +199,12 @@ export function buildT3SystemSections(input: BuildT3SystemSectionsInput): System
       ...(input.runtimePolicy === undefined ? {} : { runtimePolicy: input.runtimePolicy }),
     }),
     t3OrchestrationSystemPrompt(input.hasT3Mcp === true, input.hasDeviceTools === true),
+    input.scratchDir === undefined || input.scratchDir === ""
+      ? undefined
+      : [
+          `<scratch_directory>${input.scratchDir}</scratch_directory>`,
+          "Write one-off scripts and intermediate files here instead of the project. Bash exports this directory as PI_SCRATCH_DIR, and Write/Edit create files there without an approval prompt.",
+        ].join("\n"),
   ]
     .filter((part): part is string => part !== undefined && part !== "")
     .join("\n\n");
