@@ -20,6 +20,7 @@ import {
 } from "../../testing.ts";
 import {
   NativePiSessionRuntime,
+  isProgressOnlyAssistantTurn,
   parseCompactionSummary,
   type NativeSessionEvent,
 } from "./sessionRuntime.ts";
@@ -426,6 +427,146 @@ describe("NativePiSessionRuntime", () => {
   it("declines a steer when no turn is running", async () => {
     const harness = await makeRuntime();
     assert.equal(harness.runtime.steer({ messageId: "idle", text: "hi" }), "declined");
+    await harness.runtime.dispose();
+  });
+
+  it("starts the reply after a consumed steer in its own assistant item", async () => {
+    const harness = await makeRuntime({
+      steps: [
+        () => {
+          harness.runtime.steer({ messageId: "steer-split", text: "and this" });
+          return scriptedTextResponse("before steer");
+        },
+        scriptedTextResponse("after steer"),
+      ],
+    });
+    const outcome = await harness.runtime.runTurn({ text: "start" });
+    assert.equal(outcome.status, "completed");
+    const completed = harness.events.flatMap((event) =>
+      event.type === "stream" && event.kind === "assistant" && event.done
+        ? [{ itemId: event.itemId, text: event.text }]
+        : [],
+    );
+    assert.deepStrictEqual(
+      completed.map((entry) => entry.text),
+      ["before steer", "after steer"],
+    );
+    assert.notEqual(completed[0]?.itemId, completed[1]?.itemId);
+    await harness.runtime.dispose();
+  });
+
+  it("keeps steering images in the next model request", async () => {
+    const harness = await makeRuntime({
+      steps: [
+        () => {
+          harness.runtime.steer({
+            messageId: "steer-image",
+            text: "look at this",
+            images: [{ type: "image", data: "aGVsbG8=", mimeType: "image/png" }],
+          });
+          return scriptedTextResponse("before");
+        },
+        scriptedTextResponse("after"),
+      ],
+    });
+    await harness.runtime.runTurn({ text: "start" });
+    const steered = harness.streamFn.calls
+      .at(-1)
+      ?.context.messages.find(
+        (message) =>
+          Array.isArray(message.content) &&
+          message.content.some((block) => (block as { readonly type?: unknown }).type === "image"),
+      );
+    assert.isDefined(steered);
+    await harness.runtime.dispose();
+  });
+
+  it("ends the turn after a graceful stop instead of starting another step", async () => {
+    const harness = await makeRuntime({
+      steps: [
+        () => {
+          assert.deepStrictEqual(harness.runtime.requestGracefulStop(), { requested: true });
+          assert.equal(
+            harness.runtime.steer({ messageId: "after-stop", text: "more" }),
+            "declined",
+          );
+          return scriptedTextResponse("stopping after this");
+        },
+        scriptedTextResponse("must not run"),
+      ],
+    });
+    const outcome = await harness.runtime.runTurn({ text: "start" });
+    assert.equal(outcome.status, "interrupted");
+    assert.isNull(outcome.failure);
+    assert.deepStrictEqual(streamTexts(harness.events), ["stopping after this"]);
+    assert.equal(harness.streamFn.calls.length, 1);
+    assert.deepStrictEqual(harness.runtime.requestGracefulStop(), { requested: false });
+    await harness.runtime.dispose();
+  });
+
+  it("nudges an autonomous goal once when a turn only announces the next step", async () => {
+    const harness = await makeRuntime({
+      initialGoal: { objective: "Ship it", status: "active", checks: 0 },
+      steps: [
+        scriptedTextResponse("Next, I'll update the docs."),
+        scriptedToolCallResponse([
+          { name: "UpdateGoalStatus", arguments: { status: "complete", summary: "done" } },
+        ]),
+        scriptedTextResponse("verified complete"),
+      ],
+    });
+    const outcome = await harness.runtime.runTurn({ text: "start" });
+    assert.equal(outcome.status, "completed", JSON.stringify(outcome.failure));
+    assert.deepStrictEqual(streamTexts(harness.events), [
+      "Next, I'll update the docs.",
+      "verified complete",
+    ]);
+    assert.equal(harness.runtime.goal?.status, "complete");
+    const prompts = harness.runtime
+      .getSnapshot()
+      .messages.filter(
+        (message) =>
+          message.role === "user" && message.text.includes("only announced the next step"),
+      );
+    assert.lengthOf(prompts, 1);
+    await harness.runtime.dispose();
+  });
+
+  it("nudges plan mode once when a turn only announces the plan work", async () => {
+    const harness = await makeRuntime({
+      interactionMode: "plan",
+      steps: [
+        scriptedTextResponse("Let me inspect the adapter first."),
+        scriptedToolCallResponse([{ name: "SubmitPlan", arguments: { markdown: "# Plan" } }]),
+      ],
+    });
+    const outcome = await harness.runtime.runTurn({ text: "plan it" });
+    assert.equal(outcome.status, "completed");
+    assert.isDefined(harness.events.find((event) => event.type === "plan_submitted"));
+    // SubmitPlan ends its turn, so the nudge plus the submission are the whole run.
+    assert.equal(harness.streamFn.calls.length, 2);
+    const prompts = harness.runtime
+      .getSnapshot()
+      .messages.filter(
+        (message) =>
+          message.role === "user" && message.text.includes("only announced the next step"),
+      );
+    assert.lengthOf(prompts, 1);
+    await harness.runtime.dispose();
+  });
+
+  it("does not nudge a substantive plan reply", async () => {
+    const harness = await makeRuntime({
+      interactionMode: "plan",
+      steps: [scriptedTextResponse("Implemented the approved plan and the tests pass.")],
+    });
+    await harness.runtime.runTurn({ text: "plan it" });
+    assert.equal(harness.streamFn.calls.length, 1);
+    assert.isFalse(
+      harness.runtime
+        .getSnapshot()
+        .messages.some((message) => message.text.includes("only announced the next step")),
+    );
     await harness.runtime.dispose();
   });
 
@@ -900,6 +1041,48 @@ describe("parseCompactionSummary", () => {
 
   it("rejects text without a summary", () => {
     assert.throws(() => parseCompactionSummary("no summary here"));
+  });
+});
+
+describe("isProgressOnlyAssistantTurn", () => {
+  it("detects an announcement without a tool call", () => {
+    for (const text of [
+      "Let me inspect the runtime now.",
+      "I'll now wire the adapter.",
+      "I will next update the tests.",
+      "Next, I'll run the checks.",
+      "Going to inspect the failing test.",
+      "Reading the remaining files:",
+      "Staged YAML complete. Writing Owner Note now.",
+    ]) {
+      assert.isTrue(isProgressOnlyAssistantTurn(text), text);
+    }
+  });
+
+  it("treats a terminal opening followed by an announcement as progress", () => {
+    assert.isTrue(isProgressOnlyAssistantTurn("Done. Next, I'll add the tests."));
+  });
+
+  it("leaves substantive answers alone", () => {
+    for (const text of [
+      "Implemented the approved plan.",
+      "All acceptance criteria are met; tests passed.",
+      "The plan is complete.",
+      "Fixed the bug in streamCoalescer.ts and added a test.",
+    ]) {
+      assert.isFalse(isProgressOnlyAssistantTurn(text), text);
+    }
+  });
+
+  it("leaves empty, structured and long reports alone", () => {
+    assert.isFalse(isProgressOnlyAssistantTurn(""));
+    assert.isFalse(isProgressOnlyAssistantTurn("   "));
+    assert.isFalse(isProgressOnlyAssistantTurn(`# Summary\n\n${"x".repeat(10)}`));
+    assert.isFalse(
+      isProgressOnlyAssistantTurn(
+        `I'll wrap up. ${"The tests cover the adapter path. ".repeat(20)}`,
+      ),
+    );
   });
 });
 

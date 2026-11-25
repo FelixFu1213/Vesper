@@ -35,7 +35,10 @@ import type {
   OrchestrationV2UserInputQuestion,
 } from "@t3tools/contracts";
 import { settingsSecretLiteral } from "@t3tools/contracts";
-import type { ProviderAdapterV2RuntimePolicy } from "@t3tools/provider-core/server/ProviderAdapter";
+import type {
+  ProviderAdapterV2RuntimePolicy,
+  ProviderAdapterV2TurnPhase,
+} from "@t3tools/provider-core/server/ProviderAdapter";
 import type { McpProviderSessionConfig } from "@t3tools/provider-core/server/mcpSession";
 import * as DateTime from "effect/DateTime";
 
@@ -96,6 +99,38 @@ const host = globalThis as unknown as {
 
 const SILENT_TURN_NUDGE =
   "Your previous reply was empty. Continue the task and answer the user, or say plainly that you have nothing to add.";
+
+const PROGRESS_ONLY_PLAN_NUDGE =
+  "Your previous reply only announced the next step and stopped. Carry it out now, then submit the plan with SubmitPlan when it is ready.";
+
+const PROGRESS_ONLY_GOAL_NUDGE =
+  "Your previous reply only announced the next step and stopped. Carry it out now, or call UpdateGoalStatus once the work is verified done.";
+
+/** A progress update is short; a long report is a final answer even if it mentions next steps. */
+const PROGRESS_ONLY_MAX_CHARS = 400;
+
+const PROGRESS_FORWARD_INTENT =
+  /\b(?:let me|let's|i'?ll|i will|i'?m going to|going to|about to|next(?:,| up| i'?ll)|still (?:need|have) to|remaining|left to|working on|writing|reading|updating|implementing|checking|running|creating|fixing|reviewing|proceeding|continuing|starting)\b/iu;
+
+/** A reply that opens by claiming the work is done; only a later forward clause makes it progress. */
+const PROGRESS_TERMINAL_LEAD =
+  /^(?:done|all done|complete(?:d)?|finished|implemented|resolved|verified|successful(?:ly)?|the (?:approved )?(?:plan|goal) is (?:complete|done))\b/iu;
+
+/**
+ * Visible text that only announces work it has not done yet: plan and goal continuation use it to
+ * ask once more instead of ending a turn on a promise. A final answer, a tool call, or a
+ * structured report never qualifies.
+ */
+export function isProgressOnlyAssistantTurn(text: string): boolean {
+  const trimmed = text.trim();
+  if (trimmed === "" || trimmed.length > PROGRESS_ONLY_MAX_CHARS) return false;
+  if (/^#{1,6}\s/mu.test(trimmed)) return false;
+  if (trimmed.endsWith(":")) return true;
+  if (!PROGRESS_FORWARD_INTENT.test(trimmed)) return false;
+  if (!PROGRESS_TERMINAL_LEAD.test(trimmed)) return true;
+  // A report can name a finished step and still announce the next one.
+  return PROGRESS_FORWARD_INTENT.test(trimmed.replace(PROGRESS_TERMINAL_LEAD, ""));
+}
 
 const SUMMARY_SYSTEM_PROMPT =
   "You compress a coding conversation for another agent that must continue the work. Reply with exactly one <compaction_summary> block and nothing else.";
@@ -187,6 +222,12 @@ export interface NativeSessionGoalUpdated {
   readonly goal: OrchestrationV2ProviderGoal | null;
 }
 
+export interface NativeSessionPhaseUpdate {
+  readonly type: "phase";
+  readonly phase: ProviderAdapterV2TurnPhase;
+  readonly detail?: string | undefined;
+}
+
 export type NativeSessionEvent =
   | NativeSessionStreamUpdate
   | NativeSessionToolUpdate
@@ -197,7 +238,8 @@ export type NativeSessionEvent =
   | NativeSessionSteerUpdate
   | NativeSessionRetryUpdate
   | NativeSessionUsageUpdate
-  | NativeSessionGoalUpdated;
+  | NativeSessionGoalUpdated
+  | NativeSessionPhaseUpdate;
 
 /** T3 reports the goal banner from these, so the loop stops itself after this many checks. */
 const DEFAULT_MAX_GOAL_CHECKS = 8;
@@ -292,10 +334,15 @@ interface ActiveTurnState {
   readonly toolNames: Map<string, string>;
   readonly toolOutput: Map<string, string>;
   messageIndex: number;
+  /** Bumped when a consumed steer must start a fresh assistant bubble. */
+  streamEpoch: number;
+  steeringSplitPending: boolean;
   itemSequence: number;
   preRequestRawEstimate: number | null;
   overflowRecoveryTried: boolean;
   silentTurnTried: boolean;
+  progressOnlyTried: boolean;
+  gracefulStopRequested: boolean;
   manualCompactionRequested: string | null;
   pendingInstall: AgentMessage[] | null;
   pendingAppend: AgentMessage[];
@@ -541,10 +588,14 @@ const newTurnState = (): ActiveTurnState => ({
   toolNames: new Map(),
   toolOutput: new Map(),
   messageIndex: 0,
+  streamEpoch: 0,
+  steeringSplitPending: false,
   itemSequence: 0,
   preRequestRawEstimate: null,
   overflowRecoveryTried: false,
   silentTurnTried: false,
+  progressOnlyTried: false,
+  gracefulStopRequested: false,
   manualCompactionRequested: null,
   pendingInstall: null,
   pendingAppend: [],
@@ -591,6 +642,10 @@ export class NativePiSessionRuntime {
   #mcpAvailable = false;
   #subagents: SubagentManager | null = null;
   #active: ActiveTurnState | null = null;
+  #phase: {
+    readonly phase: ProviderAdapterV2TurnPhase;
+    readonly detail?: string | undefined;
+  } | null = null;
   #tailRace: Array<{ readonly messageId: string; readonly message: UserMessage }> = [];
   #abortPromise: Promise<void> | null = null;
   #disposed = false;
@@ -1000,6 +1055,14 @@ export class NativePiSessionRuntime {
     this.#options.onEvent(event);
   }
 
+  /** Status only, so a repeated phase is not resent; the adapter forwards each one as ephemeral. */
+  #emitPhase(phase: ProviderAdapterV2TurnPhase, detail?: string): void {
+    const current = this.#phase;
+    if (current !== null && current.phase === phase && current.detail === detail) return;
+    this.#phase = detail === undefined ? { phase } : { phase, detail };
+    this.#emit({ type: "phase", phase, ...(detail === undefined ? {} : { detail }) });
+  }
+
   #flushKey(key: string): void {
     if (key.startsWith("tool:")) {
       const state = this.#active;
@@ -1029,10 +1092,14 @@ export class NativePiSessionRuntime {
   }
 
   #handleRetry(event: ProviderRetryLifecycleEvent): void {
+    this.#coalescer.flushAll();
     const state = this.#active;
     if (state !== null) {
       state.retry = event;
-      if (event.status === "running") state.retryStartedAtMs = this.#now();
+      if (event.status === "running") {
+        state.retryStartedAtMs = this.#now();
+        this.#emitPhase("recovering");
+      }
     }
     this.#emit({ type: "retry", event });
   }
@@ -1042,7 +1109,13 @@ export class NativePiSessionRuntime {
     if (state === null) return;
     switch (event.type) {
       case "message_start":
-        if (event.message.role === "assistant") state.messageIndex += 1;
+        if (event.message.role === "assistant") {
+          state.messageIndex += 1;
+          if (state.steeringSplitPending) {
+            state.steeringSplitPending = false;
+            state.streamEpoch += 1;
+          }
+        }
         return;
       case "message_update":
         if (event.message.role !== "assistant") return;
@@ -1070,7 +1143,7 @@ export class NativePiSessionRuntime {
   }
 
   #streamKey(state: ActiveTurnState, kind: NativeSessionStreamKind, contentIndex: number): string {
-    return `${kind}:${state.messageIndex}:${contentIndex}`;
+    return `${kind}:${state.streamEpoch}:${state.messageIndex}:${contentIndex}`;
   }
 
   #streamItem(
@@ -1095,12 +1168,14 @@ export class NativePiSessionRuntime {
   #handleAssistantEvent(state: ActiveTurnState, event: AssistantMessageEvent): void {
     switch (event.type) {
       case "text_delta": {
+        this.#emitPhase("streaming");
         const key = this.#streamKey(state, "assistant", event.contentIndex);
         this.#streamItem(state, key, "assistant", event.contentIndex).text += event.delta;
         this.#coalescer.push(key, event.delta);
         return;
       }
       case "thinking_delta": {
+        this.#emitPhase("streaming");
         const key = this.#streamKey(state, "reasoning", event.contentIndex);
         this.#streamItem(state, key, "reasoning", event.contentIndex).text += event.delta;
         this.#coalescer.push(key, event.delta);
@@ -1182,6 +1257,7 @@ export class NativePiSessionRuntime {
 
   #startTool(state: ActiveTurnState, toolCallId: string, toolName: string, args: unknown): void {
     this.#coalescer.flushAll();
+    this.#emitPhase(toolName === "TaskWait" ? "waiting-subagents" : "tool", toolName);
     const itemId = `tool:${toolCallId}`;
     state.toolArgs.set(itemId, args);
     state.toolNames.set(itemId, toolName);
@@ -1241,6 +1317,7 @@ export class NativePiSessionRuntime {
   #prepareRequest: PrepareRequest = async (request) => {
     const state = this.#active;
     if (state === null) return undefined;
+    this.#emitPhase("preparing");
     const pressure = evaluateContextPressure(
       request.context.messages,
       request.model,
@@ -1264,7 +1341,10 @@ export class NativePiSessionRuntime {
         this.#agent.state.messages = compacted.messages;
         messages = compacted.messages;
       }
+      this.#emitPhase("preparing");
     }
+    // The request is about to be issued; the first token ends this phase.
+    this.#emitPhase("waiting-model");
     if (messages === request.context.messages) return undefined;
     return {
       context: {
@@ -1284,6 +1364,14 @@ export class NativePiSessionRuntime {
     }
     if (turn.message.stopReason === "length") state.outputTruncated = true;
 
+    // A graceful stop ends the loop here, leaving in-flight work to finish on its own.
+    if (state.gracefulStopRequested) {
+      state.gracefulStopRequested = false;
+      state.interrupted = true;
+      this.#emitPhase("stopping");
+      return { action: "end" };
+    }
+
     if (state.manualCompactionRequested !== null) {
       state.manualCompactionRequested = null;
       const compacted = await this.#compactWith("completed_turn", 1);
@@ -1295,9 +1383,11 @@ export class NativePiSessionRuntime {
 
     if (this.#shouldRecoverOverflow(turn.message, state)) {
       state.overflowRecoveryTried = true;
+      this.#emitPhase("recovering");
       // An overflowed request cannot be retried, so the whole turn folds into a summary.
       const compacted = await this.#compactWith("completed_turn", 0);
       if (compacted !== null) {
+        this.#emitPhase("recovering");
         state.pendingInstall = compacted.messages;
         state.pendingAppend = [
           {
@@ -1320,6 +1410,31 @@ export class NativePiSessionRuntime {
       state.silentTurnTried = true;
       state.pendingAppend = [
         { role: "user", content: SILENT_TURN_NUDGE, timestamp: this.#now() } satisfies UserMessage,
+      ];
+      return { action: "continue" };
+    }
+
+    // Autonomous plan/goal: announcing a step and stopping is progress, not an answer.
+    const text = textOf(turn.message.content).trim();
+    const planMode = this.#policy.interactionMode === "plan" && !state.planSubmittedThisTurn;
+    const goalActive = this.#goal?.status === "active";
+    if (
+      (planMode || goalActive) &&
+      turn.message.stopReason === "stop" &&
+      text !== "" &&
+      !turn.message.content.some(isToolCall) &&
+      !state.silentTurnTried &&
+      !state.progressOnlyTried &&
+      !state.gracefulStopRequested &&
+      isProgressOnlyAssistantTurn(text)
+    ) {
+      state.progressOnlyTried = true;
+      state.pendingAppend = [
+        {
+          role: "user",
+          content: planMode ? PROGRESS_ONLY_PLAN_NUDGE : PROGRESS_ONLY_GOAL_NUDGE,
+          timestamp: this.#now(),
+        } satisfies UserMessage,
       ];
       return { action: "continue" };
     }
@@ -1436,6 +1551,7 @@ export class NativePiSessionRuntime {
     const source = sourceMessages ?? this.#agent.state.messages;
     const itemId = `compaction:${++this.#sequence}`;
     const before = estimateAgentMessagesTokens(source);
+    this.#emitPhase("compacting");
     this.#emit({ type: "compaction", itemId, status: "running", beforeTokenCount: before });
     try {
       const checkpoint = await buildCompactionCheckpoint({
@@ -1507,11 +1623,18 @@ export class NativePiSessionRuntime {
     const state = this.#active;
     if (state === null || state.unreadSteers.size === 0) return;
     const present = new Set<AgentMessage>(messages);
+    let consumed = false;
     for (const [messageId, message] of state.unreadSteers) {
       if (!present.has(message)) continue;
       state.unreadSteers.delete(messageId);
+      consumed = true;
       this.#emit({ type: "steer", messageId, status: "completed" });
     }
+    if (!consumed) return;
+    // Steering closes the pre-steering bubble: flush what it streamed and start the next reply
+    // in a new item, so the two replies never merge.
+    this.#coalescer.flushAll();
+    state.steeringSplitPending = true;
   }
 
   #cancelUnreadSteers(state: ActiveTurnState): void {
@@ -1528,7 +1651,7 @@ export class NativePiSessionRuntime {
     readonly images?: ReadonlyArray<ImageContent> | undefined;
   }): "accepted" | "declined" {
     const state = this.#active;
-    if (state === null) return "declined";
+    if (state === null || state.gracefulStopRequested) return "declined";
     const message: UserMessage = {
       role: "user",
       content: buildUserContent(input.text, input.images ?? []),
@@ -1560,6 +1683,8 @@ export class NativePiSessionRuntime {
     this.#ensureSubagents();
     const state = newTurnState();
     this.#active = state;
+    this.#phase = null;
+    this.#emitPhase("starting");
     this.#tailRace = [];
     this.#agent.clearAllQueues();
     // The goal clock measures active execution, not time spent idle between turns.
@@ -1623,6 +1748,7 @@ export class NativePiSessionRuntime {
     if (state.interrupted || failed?.stopReason !== "error") return;
     if (!this.#shouldRecoverOverflow(failed, state)) return;
     state.overflowRecoveryTried = true;
+    this.#emitPhase("recovering");
     const messages = this.#agent.state.messages;
     const source = messages.filter(
       (message, index) =>
@@ -1693,6 +1819,15 @@ export class NativePiSessionRuntime {
     };
   }
 
+  /** Ask the loop to stop after the current assistant/tool step instead of aborting it. */
+  requestGracefulStop(): { readonly requested: boolean } {
+    const state = this.#active;
+    if (this.#disposed || state === null) return { requested: false };
+    state.gracefulStopRequested = true;
+    this.#emitPhase("stopping");
+    return { requested: true };
+  }
+
   abort(): Promise<void> {
     this.#abortPromise ??= this.#abort().finally(() => {
       this.#abortPromise = null;
@@ -1702,18 +1837,21 @@ export class NativePiSessionRuntime {
 
   async #abort(): Promise<void> {
     const state = this.#active;
-    if (state === null) return;
-    state.interrupted = true;
-    this.#agent.abort();
-    this.#coalescer.flushAll();
-    this.#cancelUnreadSteers(state);
+    if (state !== null) {
+      state.interrupted = true;
+      this.#emitPhase("stopping");
+      this.#agent.abort();
+      this.#coalescer.flushAll();
+      this.#cancelUnreadSteers(state);
+    }
+    // Subagents outlive their parent's step, so an interrupt has to settle them too.
+    await this.#subagents?.stopAll("interrupted");
   }
 
   async dispose(): Promise<void> {
     if (this.#disposed) return;
     this.#disposed = true;
     await this.abort();
-    await this.#subagents?.stopAll("interrupted");
     this.#unsubscribe();
     this.#coalescer.dispose();
     this.#pool.close();
