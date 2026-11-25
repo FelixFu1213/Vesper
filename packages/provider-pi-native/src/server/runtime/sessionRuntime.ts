@@ -54,7 +54,8 @@ import {
   evaluateContextPressure,
 } from "./contextBudget.ts";
 import { loadCustomSystemPrompt, type CustomSystemPrompt } from "./customSystemPrompt.ts";
-import { SeenLinesTracker } from "./hashline.ts";
+import { NamedRegisters } from "./editEngine.ts";
+import { FileSnapshotStore } from "./fileSnapshotStore.ts";
 import { connectMcpSession, mcpReadOnlyPredicate, type McpAgentTool } from "./mcpBridge.ts";
 import { MutationRecoveryTracker } from "./mutationRecovery.ts";
 import { PathMutex } from "./pathLock.ts";
@@ -593,7 +594,8 @@ export class NativePiSessionRuntime {
   readonly #now: () => number;
   readonly #sessionId: string;
   readonly #unsubscribe: () => void;
-  #seen = new SeenLinesTracker();
+  #anchors = new FileSnapshotStore();
+  #registers = new NamedRegisters();
   #recovery = new MutationRecoveryTracker();
   #todos: TodoSnapshot = EMPTY_TODO_SNAPSHOT;
   #goal: OrchestrationV2ProviderGoal | null = null;
@@ -822,7 +824,8 @@ export class NativePiSessionRuntime {
   #toolDependencies(): Parameters<typeof createPiNativeTools>[0] {
     return {
       sandbox: this.#sandbox,
-      seen: this.#seen,
+      anchors: this.#anchors,
+      registers: this.#registers,
       recovery: this.#recovery,
       locks: this.#locks,
       requestUserInput: (questions, signal) =>
@@ -1799,7 +1802,8 @@ export class NativePiSessionRuntime {
   }
 
   #clearTrackers(): void {
-    this.#seen = new SeenLinesTracker();
+    this.#anchors = new FileSnapshotStore();
+    this.#registers = new NamedRegisters();
     this.#recovery = new MutationRecoveryTracker();
   }
 

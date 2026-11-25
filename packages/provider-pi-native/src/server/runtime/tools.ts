@@ -15,13 +15,29 @@ import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
 
 import {
-  applyHashlineEdits,
-  buildSimpleDiff,
-  computeFileHash,
-  computeLineTag,
+  applyEdit,
+  applyLegacyTextEdit,
+  findRecoveredPath,
+  legacyHashlineEditsToOps,
+  NamedRegisters,
+  type EditResult,
+  type EditSessionState,
+  type LegacyHashlineEdit,
+} from "./editEngine.ts";
+import {
+  computeFileTag,
+  decodeNormalizedFile,
+  detectLineEnding,
+  encodeNormalizedFile,
+  FILE_TAG_PATTERN,
+  formatSectionHeader,
+  normalizeLineEndings,
   splitFileLines,
-  type HashlineEdit,
-} from "./hashline.ts";
+  stripWriteMarkup,
+  type FileAnchorStore,
+  type NormalizedFile,
+} from "./fileAnchorTypes.ts";
+import { buildSimpleDiff } from "./hashline.ts";
 import { detectShellFilePatch, MutationRecoveryTracker } from "./mutationRecovery.ts";
 import {
   isSensitivePath,
@@ -30,7 +46,6 @@ import {
 } from "./ignoreRules.ts";
 import { PathMutex } from "./pathLock.ts";
 import type { WorkspaceSandbox } from "./sandbox.ts";
-import { SeenLinesTracker } from "./hashline.ts";
 import {
   canonicalizeToolParams,
   describeDirectoryReadHint,
@@ -52,6 +67,7 @@ const DEFAULT_MAX_GLOB_RESULTS = 500;
 const DEFAULT_MAX_GREP_MATCHES = 200;
 const DEFAULT_BASH_TIMEOUT_MS = 120_000;
 const DEFAULT_MAX_BASH_TIMEOUT_MS = 600_000;
+const MAX_LINE_CHARS = 16_384;
 
 const IMAGE_MIME_TYPES: Readonly<Record<string, string>> = {
   ".png": "image/png",
@@ -114,7 +130,8 @@ export interface ShellSpec {
 
 export interface PiNativeToolDeps {
   readonly sandbox: WorkspaceSandbox;
-  readonly seen: SeenLinesTracker;
+  readonly anchors: FileAnchorStore;
+  readonly registers: NamedRegisters;
   readonly recovery: MutationRecoveryTracker;
   readonly locks: PathMutex;
   readonly requestUserInput: (
@@ -151,6 +168,7 @@ export interface ReadDetails {
   readonly totalLines: number;
   readonly truncated: boolean;
   readonly image: boolean;
+  readonly tag?: string;
 }
 
 export interface FileChangeDetails {
@@ -160,6 +178,9 @@ export interface FileChangeDetails {
   readonly diffStr: string;
   readonly oldStr: string;
   readonly newStr: string;
+  readonly tag?: string;
+  readonly warnings?: ReadonlyArray<string>;
+  readonly ops?: ReadonlyArray<string>;
 }
 
 export interface GlobDetails {
@@ -244,6 +265,8 @@ const ok = <T>(message: string, details: T): AgentToolResult<T> => ({
   details,
 });
 
+const toPosix = (value: string): string => value.split(NodePath.sep).join("/");
+
 const formatGrepBody = (result: GrepSearchResult, pattern: string, root: string): string => {
   if (result.files.length === 0) return `No matches for ${pattern} under ${root}.`;
   const lines: Array<string> = [];
@@ -267,16 +290,6 @@ const formatGrepBody = (result: GrepSearchResult, pattern: string, root: string)
       : `[${result.totalMatches} ${noun} in ${result.files.length} files${result.truncated ? ", truncated" : ""}]`;
   return `${lines.join("\n")}\n\n${summary}`;
 };
-
-const readIfExists = async (target: string): Promise<string | undefined> => {
-  try {
-    return await NodeFSP.readFile(target, "utf8");
-  } catch (error) {
-    if (errorCode(error) === "ENOENT") return undefined;
-    throw error;
-  }
-};
-
 const imageMimeType = (target: string): string | undefined =>
   IMAGE_MIME_TYPES[NodePath.extname(target).toLowerCase()];
 
@@ -312,7 +325,7 @@ const toUserInputQuestion = (question: {
   ...(question.required === undefined ? {} : { required: question.required }),
 });
 
-const asHashlineEdit = (value: unknown): HashlineEdit | undefined => {
+const asLegacyHashlineEdit = (value: unknown): LegacyHashlineEdit | undefined => {
   const record = asRecord(value);
   if (record === undefined) return undefined;
   if (
@@ -377,11 +390,29 @@ const HASHLINE_EDIT_SCHEMA = union([
 ]);
 
 const EDIT_PARAMS = obj({
-  path: opt(str({ description: "File path to edit." })),
+  path: opt(str({ description: "File path to edit. Edit never creates files; use Write." })),
   file_path: opt(str({ description: "Alias for path." })),
-  edits: opt(arr(HASHLINE_EDIT_SCHEMA, { description: "Hashline edits using tags from Read." })),
-  oldText: opt(str({ description: "Exact text to replace when edits is omitted." })),
-  newText: opt(str({ description: "Replacement text for oldText." })),
+  tag: opt(
+    str({
+      description:
+        "4 uppercase hex from the latest Read, Grep, Write, or Edit result for this path.",
+    }),
+  ),
+  ops: opt(
+    str({
+      description:
+        'Operation headers and + body rows, newline separated: "PUT 12.=14:", "PUT <3:", "PUT >$", "CUT 7.=9", "PUT 12*", "MV dest.ts", "REM".',
+    }),
+  ),
+  edits: opt(
+    arr(HASHLINE_EDIT_SCHEMA, {
+      description: "Legacy hashline edits; ops is preferred.",
+    }),
+  ),
+  oldText: opt(str({ description: "Legacy compatibility: exact text to replace." })),
+  newText: opt(str({ description: "Legacy compatibility: replacement text for oldText." })),
+  old_string: opt(str({ description: "Legacy compatibility alias for oldText." })),
+  new_string: opt(str({ description: "Legacy compatibility alias for newText." })),
 });
 
 const GLOB_PARAMS = obj({
@@ -580,6 +611,27 @@ export const createPiNativeTools = (deps: PiNativeToolDeps): ReadonlyArray<Agent
     return `Stop mutating ${target}: ${state.strikes} edits failed in a row. Re-read the file and ask the user how to proceed.`;
   };
 
+  const displayPath = (target: string): string => {
+    const cwd = deps.sandbox.cwd;
+    if (cwd === null) return target;
+    const relative = NodePath.relative(cwd, target);
+    return relative === "" || relative.startsWith("..") || NodePath.isAbsolute(relative)
+      ? target
+      : toPosix(relative);
+  };
+
+  const allLines = (text: string): ReadonlySet<number> =>
+    new Set(splitFileLines(text).map((_line, index) => index + 1));
+
+  const readNormalized = async (target: string): Promise<NormalizedFile | undefined> => {
+    try {
+      return decodeNormalizedFile(await NodeFSP.readFile(target));
+    } catch (error) {
+      if (errorCode(error) === "ENOENT") return undefined;
+      throw error;
+    }
+  };
+
   const emptyReadDetails = (target: string): ReadDetails => ({
     path: target,
     startLine: 0,
@@ -589,24 +641,56 @@ export const createPiNativeTools = (deps: PiNativeToolDeps): ReadonlyArray<Agent
     image: false,
   });
 
-  const commit = async (
+  const commitContent = async (
     target: string,
-    before: string,
-    after: string,
+    beforeText: string,
+    after: NormalizedFile,
   ): Promise<FileChangeDetails> => {
     await NodeFSP.mkdir(NodePath.dirname(target), { recursive: true });
-    await NodeFSP.writeFile(target, after, "utf8");
-    const diff = buildSimpleDiff(target, before, after);
-    deps.seen.recordWrite(target, after);
+    await NodeFSP.writeFile(target, encodeNormalizedFile(after));
+    const diff = buildSimpleDiff(target, beforeText, after.text);
+    const tag = deps.anchors.record(target, after.text, allLines(after.text));
     deps.recovery.recordSuccess(target);
     return {
       fileName: NodePath.basename(target),
       additions: diff.additions,
       deletions: diff.deletions,
       diffStr: diff.diffStr,
-      oldStr: before,
-      newStr: after,
+      oldStr: beforeText,
+      newStr: after.text,
+      tag,
     };
+  };
+
+  const editSession = (): EditSessionState => ({
+    store: deps.anchors,
+    registers: deps.registers,
+  });
+
+  const describeEditFailure = (
+    failure: {
+      readonly code: string;
+      readonly message: string;
+      readonly extras?: {
+        readonly unseenLines?: ReadonlyArray<{
+          readonly line: number;
+          readonly text: string;
+          readonly clipped: boolean;
+        }>;
+      };
+    },
+    target: string,
+  ): string => {
+    const state = deps.recovery.recordFailure(target, failure.code);
+    const reveal = (failure.extras?.unseenLines ?? []).map(
+      (row) => `${row.line}: ${row.text}${row.clipped ? " ..." : ""}`,
+    );
+    return [
+      `${failure.code}: ${failure.message}`,
+      ...(reveal.length === 0 ? [] : ["", ...reveal]),
+      "",
+      state.message,
+    ].join("\n");
   };
 
   const readTool: AgentTool<typeof READ_PARAMS, ReadDetails> = {
@@ -669,33 +753,50 @@ export const createPiNativeTools = (deps: PiNativeToolDeps): ReadonlyArray<Agent
             };
           }
 
-          const content = await NodeFSP.readFile(target, "utf8");
+          const file = decodeNormalizedFile(await NodeFSP.readFile(target));
           deps.recovery.recordSuccess(target);
 
-          const lines = splitFileLines(content).lines;
+          const lines = splitFileLines(file.text);
           const totalLines = lines.length;
+          const tag = computeFileTag(file.text);
+          const header = formatSectionHeader(displayPath(target), tag);
           if (totalLines === 0) {
-            return ok("The file is empty.", {
+            deps.anchors.record(target, file.text, new Set());
+            return ok(`${header}\n[file is empty]`, {
               path: target,
               startLine: 0,
               endLine: 0,
               totalLines: 0,
               truncated: false,
               image: false,
+              tag,
             });
           }
           const startLine = Math.min(Math.max(params.offset ?? 1, 1), totalLines);
           const limit = params.limit ?? totalLines - startLine + 1;
           const endLine = Math.min(startLine + Math.max(limit, 1) - 1, totalLines);
-          const slice = lines.slice(startLine - 1, endLine);
-          const formatted = slice
-            .map((line, index) => `${startLine + index}:${computeLineTag(line)}|${line}`)
+          const seen = new Set<number>();
+          const formatted = lines
+            .slice(startLine - 1, endLine)
+            .map((line, index) => {
+              const lineNumber = startLine + index;
+              const chars = [...line];
+              if (chars.length <= MAX_LINE_CHARS) seen.add(lineNumber);
+              return `${lineNumber}:${chars.slice(0, MAX_LINE_CHARS).join("")}`;
+            })
             .join("\n");
-          deps.seen.recordRead(target, startLine, endLine, computeFileHash(content));
+          deps.anchors.record(target, file.text, seen);
+          const clipped = endLine - startLine + 1 - seen.size;
           const truncated = endLine < totalLines || startLine > 1;
-          const body = truncated
-            ? `${formatted}\n\n[lines ${startLine}-${endLine} of ${totalLines}]`
-            : formatted;
+          const footer = [
+            ...(truncated ? [`[lines ${startLine}-${endLine} of ${totalLines}]`] : []),
+            ...(clipped === 0
+              ? []
+              : [`[${clipped} line(s) clipped at ${MAX_LINE_CHARS} characters]`]),
+          ];
+          const body = [header, formatted, ...(footer.length === 0 ? [] : ["", ...footer])].join(
+            "\n",
+          );
           return ok(body, {
             path: target,
             startLine,
@@ -703,6 +804,7 @@ export const createPiNativeTools = (deps: PiNativeToolDeps): ReadonlyArray<Agent
             totalLines,
             truncated,
             image: false,
+            tag,
           });
         });
       } catch (error) {
@@ -739,10 +841,16 @@ export const createPiNativeTools = (deps: PiNativeToolDeps): ReadonlyArray<Agent
           return await deps.locks.withWriteLock(target, async () => {
             const guard = writeGuard(target);
             if (guard !== undefined) return fail(guard, { error: guard });
-            const before = (await readIfExists(target)) ?? "";
-            const details = await commit(target, before, params.content);
+            const existing = await readNormalized(target);
+            const after: NormalizedFile = {
+              text: normalizeLineEndings(stripWriteMarkup(params.content)),
+              ending: existing?.ending ?? detectLineEnding(params.content),
+              bom: existing?.bom ?? false,
+              utf16: existing?.utf16,
+            };
+            const details = await commitContent(target, existing?.text ?? "", after);
             return ok(
-              `Wrote ${target} (${details.additions} additions, ${details.deletions} deletions).`,
+              `Wrote ${formatSectionHeader(displayPath(target), details.tag ?? "")} (${details.additions} additions, ${details.deletions} deletions).`,
               details,
             );
           });
@@ -758,7 +866,7 @@ export const createPiNativeTools = (deps: PiNativeToolDeps): ReadonlyArray<Agent
     name: "Edit",
     label: "Edit",
     description:
-      "Change a file with hashline edits that cite the tags from Read, or with one exact oldText replacement.",
+      "Edit one existing file by position. Send the tag from Read, Grep, Write, or your last Edit, plus ops such as `PUT 12.=14:` with `+TEXT` rows, `PUT <3:`, `PUT >$:`, `CUT 7.=9`, `PUT 12*`, `MV dest.ts`, or `REM`. Body rows are the final content only.",
     parameters: EDIT_PARAMS,
     execute: async (_toolCallId, rawParams) => {
       const params = canonicalizeToolParams(rawParams, PATH_PARAM_ALIASES);
@@ -766,9 +874,8 @@ export const createPiNativeTools = (deps: PiNativeToolDeps): ReadonlyArray<Agent
       if (path === undefined) {
         return fail("A path is required.", { error: "A path is required." });
       }
-      let target = path;
       try {
-        const resolution = await deps.sandbox.resolvePath(path, "write");
+        let resolution = await deps.sandbox.resolvePath(path, "write");
         if (isSensitivePath(resolution.resolvedPath)) {
           return fail(sensitivePathDeniedMessage(resolution.resolvedPath), {
             error: WORKSPACE_PATH_DENIED,
@@ -779,82 +886,190 @@ export const createPiNativeTools = (deps: PiNativeToolDeps): ReadonlyArray<Agent
             error: resolution.writeDeniedReason ?? "read-only path",
           });
         }
-        target = resolution.resolvedPath;
+        let target = resolution.resolvedPath;
+        const rawTag = params.tag?.trim().toUpperCase() ?? "";
+        let file = await readNormalized(target);
+        if (file === undefined && FILE_TAG_PATTERN.test(rawTag)) {
+          const recovered = findRecoveredPath(deps.anchors, path, target, rawTag);
+          if (recovered !== undefined) {
+            resolution = await deps.sandbox.resolvePath(recovered, "write");
+            if (isSensitivePath(resolution.resolvedPath)) {
+              return fail(sensitivePathDeniedMessage(resolution.resolvedPath), {
+                error: WORKSPACE_PATH_DENIED,
+              });
+            }
+            if (resolution.denied) {
+              return fail(
+                resolution.writeDeniedReason ?? `${resolution.resolvedPath} is read-only.`,
+                { error: resolution.writeDeniedReason ?? "read-only path" },
+              );
+            }
+            target = resolution.resolvedPath;
+            file = await readNormalized(target);
+          }
+        }
+        if (file === undefined) {
+          return fail(`Cannot edit ${target}: the file does not exist. Use Write first.`, {
+            error: "missing file",
+          });
+        }
+        const live = file;
         return await deps.locks.withWriteLock(
           target,
           async (): Promise<AgentToolResult<FileChangeDetails | { readonly error: string }>> => {
             const guard = writeGuard(target);
             if (guard !== undefined) return fail(guard, { error: guard });
-            const before = await readIfExists(target);
-            if (before === undefined) {
-              return fail(`Cannot edit ${target}: the file does not exist. Use Write first.`, {
-                error: "missing file",
+            const session = editSession();
+            const oldText = params.oldText ?? params.old_string;
+            const newText = params.newText ?? params.new_string;
+            const extraWarnings: Array<string> = [];
+            let result: EditResult;
+            if (params.ops !== undefined) {
+              result = applyEdit({
+                path,
+                canonicalPath: target,
+                tag: rawTag,
+                ops: params.ops,
+                text: live.text,
+                session,
               });
-            }
-
-            const rawEdits: unknown = params.edits;
-            if (params.edits !== undefined) {
-              if (!Array.isArray(rawEdits)) {
-                return fail("edits must be an array of hashline edits.", {
+            } else if (oldText !== undefined) {
+              if (newText === undefined) {
+                return fail("oldText needs newText; send ops with the file tag instead.", {
+                  error: "missing newText",
+                });
+              }
+              result = applyLegacyTextEdit({
+                path,
+                canonicalPath: target,
+                text: live.text,
+                oldText,
+                newText,
+                session,
+              });
+            } else if (params.edits !== undefined) {
+              if (!Array.isArray(params.edits)) {
+                return fail("edits must be an array of PUT, CUT, or INS objects.", {
                   error: "invalid edits",
                 });
               }
-              const edits: Array<HashlineEdit> = [];
-              for (const value of rawEdits) {
-                const edit = asHashlineEdit(value);
+              const legacy: Array<LegacyHashlineEdit> = [];
+              for (const value of params.edits) {
+                const edit = asLegacyHashlineEdit(value);
                 if (edit === undefined) {
                   return fail("An edit is not a valid PUT, CUT, or INS object.", {
                     error: "invalid edit",
                   });
                 }
-                edits.push(edit);
+                legacy.push(edit);
               }
-              const applied = applyHashlineEdits(before, edits, {
-                isSeen: (line) => deps.seen.hasSeenRange(target, line, line),
+              const lowered = legacyHashlineEditsToOps(legacy);
+              if ("ok" in lowered) {
+                return fail(`${lowered.code}: ${lowered.message}`, { error: lowered.code });
+              }
+              if (!FILE_TAG_PATTERN.test(rawTag)) {
+                extraWarnings.push(
+                  "edits[] carried no tag; applied to the live file with the provenance gate",
+                );
+              }
+              result = applyEdit({
+                path,
+                canonicalPath: target,
+                tag: FILE_TAG_PATTERN.test(rawTag) ? rawTag : computeFileTag(live.text),
+                ops: lowered.ops,
+                text: live.text,
+                session,
               });
-              if (!applied.ok) {
-                const state = deps.recovery.recordFailure(target, applied.error.code);
-                return fail(`${applied.error.code}: ${applied.error.message}\n\n${state.message}`, {
-                  error: applied.error.code,
-                });
-              }
-              const details = await commit(target, before, applied.content);
-              return ok(
-                `Edited ${target} (${details.additions} additions, ${details.deletions} deletions).`,
-                details,
-              );
-            }
-
-            const { oldText, newText } = params;
-            if (oldText === undefined || newText === undefined) {
-              return fail("Provide edits, or both oldText and newText.", {
+            } else {
+              return fail("Provide ops with tag, edits, or oldText/newText.", {
                 error: "no edit given",
               });
             }
-            if (oldText === "") {
-              return fail("oldText must not be empty; use Write to create a file.", {
-                error: "empty oldText",
+            if (!result.ok) {
+              return fail(describeEditFailure(result, target), { error: result.code });
+            }
+
+            let movedTo: string | undefined;
+            if (result.movedTo !== undefined) {
+              const dest = await deps.sandbox.resolvePath(result.movedTo, "write");
+              if (isSensitivePath(dest.resolvedPath)) {
+                return fail(sensitivePathDeniedMessage(dest.resolvedPath), {
+                  error: WORKSPACE_PATH_DENIED,
+                });
+              }
+              if (dest.denied) {
+                return fail(dest.writeDeniedReason ?? `${dest.resolvedPath} is read-only.`, {
+                  error: dest.writeDeniedReason ?? "read-only path",
+                });
+              }
+              if (dest.resolvedPath === target) {
+                deps.recovery.recordFailure(target, "EDIT_NO_CHANGE");
+                return fail(
+                  `EDIT_NO_CHANGE: MV ${result.movedTo} resolves to ${target}; the source is untouched. Use a distinct destination.`,
+                  { error: "EDIT_NO_CHANGE" },
+                );
+              }
+              movedTo = dest.resolvedPath;
+            }
+
+            if (result.deleteFile) {
+              await NodeFSP.rm(target, { force: true });
+              deps.anchors.invalidatePath(target);
+              deps.recovery.recordSuccess(target);
+              const diff = buildSimpleDiff(target, live.text, "");
+              return ok(`Removed ${formatSectionHeader(displayPath(target), result.tag)}.`, {
+                fileName: NodePath.basename(target),
+                additions: diff.additions,
+                deletions: diff.deletions,
+                diffStr: diff.diffStr,
+                oldStr: live.text,
+                newStr: "",
+                tag: result.tag,
+                warnings: [...extraWarnings, ...result.warnings],
+                ops: result.ops,
               });
             }
-            const occurrences = before.split(oldText).length - 1;
-            if (occurrences === 0) {
-              return fail(
-                `oldText does not appear in ${target}. Re-read the file and copy the text exactly.`,
-                { error: "oldText not found" },
-              );
-            }
-            if (occurrences > 1) {
-              return fail(
-                `oldText appears ${occurrences} times in ${target}. Include more surrounding text so it is unique.`,
-                { error: "oldText is ambiguous" },
-              );
-            }
-            const after = before.replace(oldText, newText);
-            const details = await commit(target, before, after);
-            return ok(
-              `Edited ${target} (${details.additions} additions, ${details.deletions} deletions).`,
-              details,
+
+            await NodeFSP.mkdir(NodePath.dirname(target), { recursive: true });
+            await NodeFSP.writeFile(
+              target,
+              encodeNormalizedFile({
+                text: result.text,
+                ending: live.ending,
+                bom: live.bom,
+                utf16: live.utf16,
+              }),
             );
+            if (movedTo === undefined) {
+              deps.anchors.record(target, result.text, allLines(result.text));
+            } else {
+              await NodeFSP.mkdir(NodePath.dirname(movedTo), { recursive: true });
+              await NodeFSP.rename(target, movedTo);
+              deps.anchors.invalidatePath(target);
+              deps.anchors.record(movedTo, result.text, allLines(result.text));
+              deps.recovery.recordSuccess(movedTo);
+            }
+            deps.recovery.recordSuccess(target);
+
+            const finalPath = movedTo ?? target;
+            const diff = buildSimpleDiff(target, live.text, result.text);
+            const warnings = [...extraWarnings, ...result.warnings];
+            const summary = `Edited ${formatSectionHeader(displayPath(finalPath), result.tag)} (${diff.additions} additions, ${diff.deletions} deletions).`;
+            const blockLines = result.blocks.map(
+              (block) => `[block] ${block.op} -> lines ${block.start}-${block.end}`,
+            );
+            const warningLines = warnings.map((warning) => `[warning] ${warning}`);
+            return ok([summary, ...blockLines, ...warningLines].join("\n"), {
+              fileName: NodePath.basename(finalPath),
+              additions: diff.additions,
+              deletions: diff.deletions,
+              diffStr: diff.diffStr,
+              oldStr: live.text,
+              newStr: result.text,
+              tag: result.tag,
+              warnings,
+              ops: result.ops,
+            });
           },
         );
       } catch (error) {
@@ -952,8 +1167,7 @@ export const createPiNativeTools = (deps: PiNativeToolDeps): ReadonlyArray<Agent
         const root = resolution.resolvedPath;
         const anchorSink: SearchFileAnchorSink = {
           recordContentHits: ({ path, content, lines }) => {
-            const hash = computeFileHash(content);
-            for (const line of lines) deps.seen.recordRead(path, line, line, hash);
+            deps.anchors.record(path, normalizeLineEndings(content), new Set(lines));
           },
         };
         const result = await searchFiles({

@@ -6,7 +6,9 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import { describe, expect, it } from "vite-plus/test";
 
-import { computeLineTag, SeenLinesTracker } from "./hashline.ts";
+import { NamedRegisters } from "./editEngine.ts";
+import { computeFileTag, splitFileLines } from "./fileAnchorTypes.ts";
+import { FileSnapshotStore } from "./fileSnapshotStore.ts";
 import { MutationRecoveryTracker } from "./mutationRecovery.ts";
 import { PathMutex } from "./pathLock.ts";
 import { WorkspaceSandbox } from "./sandbox.ts";
@@ -23,7 +25,8 @@ const windows = HostProcess.Platform.defaultValue() === "win32";
 
 interface Harness {
   readonly directory: string;
-  readonly seen: SeenLinesTracker;
+  readonly anchors: FileSnapshotStore;
+  readonly registers: NamedRegisters;
   readonly recovery: MutationRecoveryTracker;
   readonly plans: Array<PlanSubmission>;
   readonly todos: Array<TodoUpdate>;
@@ -51,7 +54,8 @@ const withDirectory = async (body: (make: HarnessFactory) => Promise<void>): Pro
   const directory = await NodeFSP.realpath(
     await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "pi-native-tools-")),
   );
-  const seen = new SeenLinesTracker();
+  const anchors = new FileSnapshotStore();
+  const registers = new NamedRegisters();
   const recovery = new MutationRecoveryTracker();
   const plans: Array<PlanSubmission> = [];
   const todos: Array<TodoUpdate> = [];
@@ -63,7 +67,8 @@ const withDirectory = async (body: (make: HarnessFactory) => Promise<void>): Pro
         cwd: directory,
         ...(options.readOnlyRoots === undefined ? {} : { readOnlyRoots: options.readOnlyRoots }),
       }),
-      seen,
+      anchors,
+      registers,
       recovery,
       locks: new PathMutex(),
       requestUserInput: async () => ({ q1: "A" }),
@@ -92,7 +97,8 @@ const withDirectory = async (body: (make: HarnessFactory) => Promise<void>): Pro
     const byName = new Map(tools.map((tool) => [String(tool.name), tool]));
     return {
       directory,
-      seen,
+      anchors,
+      registers,
       recovery,
       plans,
       todos,
@@ -129,32 +135,40 @@ const writeFile = async (directory: string, name: string, content: string): Prom
 
 const readFile = async (target: string): Promise<string> => NodeFSP.readFile(target, "utf8");
 
+const headerOf = (path: string, content: string): string => `[${path}#${computeFileTag(content)}]`;
+
+const staleTag = (content: string): string =>
+  computeFileTag(content) === "0000" ? "0001" : "0000";
+
+const seenOf = (harness: Harness, name: string, content: string): ReadonlyArray<number> => [
+  ...(harness.anchors.latestMatchingText(harness.dir(name), content)?.seenLines ?? []),
+];
+
 const setModified = async (target: string, seconds: number): Promise<void> => {
   await NodeFSP.utimes(target, seconds, seconds);
 };
 
 describe("Read", () => {
-  it("formats tagged lines and records the range as seen", async () => {
+  it("emits the whole-file tag header and records displayed lines as seen", async () => {
     await withDirectory(async (make) => {
       const harness = make();
       await writeFile(harness.directory, "file.ts", "alpha\nbeta\n");
       const result = await harness.tool("Read").execute("call-1", { file_path: "file.ts" });
-      const expected = `1:${computeLineTag("alpha")}|alpha\n2:${computeLineTag("beta")}|beta`;
-      expect(textOf(result)).toBe(expected);
+      expect(textOf(result)).toBe(`${headerOf("file.ts", "alpha\nbeta\n")}\n1:alpha\n2:beta`);
       expect(result.details).toMatchObject({
         startLine: 1,
         endLine: 2,
         totalLines: 2,
         truncated: false,
         image: false,
+        tag: computeFileTag("alpha\nbeta\n"),
       });
       expect(result.isError).toBeUndefined();
-      expect(harness.seen.hasSeenRange(harness.dir("file.ts"), 1, 2)).toBe(true);
-      expect(harness.seen.hasSeenRange(harness.dir("file.ts"), 1, 3)).toBe(false);
+      expect(seenOf(harness, "file.ts", "alpha\nbeta\n")).toEqual([1, 2]);
     });
   });
 
-  it("honors offset and limit and reports the slice", async () => {
+  it("honors offset and limit and reports only the window as seen", async () => {
     await withDirectory(async (make) => {
       const harness = make();
       await writeFile(harness.directory, "file.txt", "one\ntwo\nthree\nfour\n");
@@ -164,14 +178,35 @@ describe("Read", () => {
         limit: 2,
       });
       expect(textOf(result).split("\n")).toEqual([
-        `2:${computeLineTag("two")}|two`,
-        `3:${computeLineTag("three")}|three`,
+        headerOf("file.txt", "one\ntwo\nthree\nfour\n"),
+        "2:two",
+        "3:three",
         "",
         "[lines 2-3 of 4]",
       ]);
       expect(result.details).toMatchObject({ startLine: 2, endLine: 3, truncated: true });
-      expect(harness.seen.hasSeenRange(harness.dir("file.txt"), 2, 3)).toBe(true);
-      expect(harness.seen.hasSeenRange(harness.dir("file.txt"), 1, 2)).toBe(false);
+      expect(seenOf(harness, "file.txt", "one\ntwo\nthree\nfour\n")).toEqual([2, 3]);
+    });
+  });
+
+  it("fuses paginated reads into one tag whose seen lines cover both windows", async () => {
+    await withDirectory(async (make) => {
+      const harness = make();
+      const lines = Array.from({ length: 6 }, (_, index) => `line-${index + 1}`);
+      const content = `${lines.join("\n")}\n`;
+      await writeFile(harness.directory, "file.txt", content);
+      const first = await harness.tool("Read").execute("call-1", {
+        path: "file.txt",
+        offset: 1,
+        limit: 3,
+      });
+      const second = await harness.tool("Read").execute("call-2", {
+        path: "file.txt",
+        offset: 2,
+        limit: 3,
+      });
+      expect(first.details.tag).toBe(second.details.tag);
+      expect(seenOf(harness, "file.txt", content)).toEqual([1, 2, 3, 4]);
     });
   });
 
@@ -193,12 +228,26 @@ describe("Read", () => {
       const harness = make();
       await writeFile(harness.directory, "empty.txt", "");
       const empty = await harness.tool("Read").execute("call-1", { path: "empty.txt" });
-      expect(textOf(empty)).toBe("The file is empty.");
-      expect(empty.details).toMatchObject({ totalLines: 0 });
+      expect(textOf(empty)).toBe(`${headerOf("empty.txt", "")}\n[file is empty]`);
+      expect(empty.details).toMatchObject({ totalLines: 0, tag: computeFileTag("") });
 
       const missing = await harness.tool("Read").execute("call-1", { path: "missing.txt" });
       expect(missing.isError).toBe(true);
       expect(textOf(missing)).toContain("Could not read");
+    });
+  });
+
+  it("clips an oversized line and excludes it from seen lines", async () => {
+    await withDirectory(async (make) => {
+      const harness = make();
+      const long = "x".repeat(20_000);
+      const content = `short\n${long}\n`;
+      await writeFile(harness.directory, "wide.txt", content);
+      const result = await harness.tool("Read").execute("call-1", { path: "wide.txt" });
+      expect(textOf(result)).toContain("[1 line(s) clipped at 16384 characters]");
+      expect(textOf(result)).toContain(`2:${"x".repeat(16_384)}`);
+      expect(textOf(result)).not.toContain("x".repeat(16_385));
+      expect(seenOf(harness, "wide.txt", content)).toEqual([1]);
     });
   });
 
@@ -246,13 +295,14 @@ describe("Read", () => {
 });
 
 describe("Write", () => {
-  it("creates a file and returns the diff and content", async () => {
+  it("creates a file, returns the diff, and mints the tag of what landed", async () => {
     await withDirectory(async (make) => {
       const harness = make();
       const result = await harness.tool("Write").execute("call-1", {
         path: "src/new.ts",
         content: "alpha\nbeta\n",
       });
+      const tag = computeFileTag("alpha\nbeta\n");
       expect(result.isError).toBeUndefined();
       expect(result.details).toMatchObject({
         fileName: "new.ts",
@@ -260,10 +310,40 @@ describe("Write", () => {
         deletions: 0,
         oldStr: "",
         newStr: "alpha\nbeta\n",
+        tag,
       });
       expect(result.details.diffStr).toContain("+alpha");
+      expect(textOf(result)).toContain(`[src/new.ts#${tag}]`);
       expect(await readFile(harness.dir("src/new.ts"))).toBe("alpha\nbeta\n");
-      expect(harness.seen.hasSeenRange(harness.dir("src/new.ts"), 1, 2)).toBe(true);
+      expect(seenOf(harness, "src/new.ts", "alpha\nbeta\n")).toEqual([1, 2]);
+    });
+  });
+
+  it("strips a pasted Read window from incoming content", async () => {
+    await withDirectory(async (make) => {
+      const harness = make();
+      await harness.tool("Write").execute("call-1", {
+        path: "pasted.ts",
+        content: "[src/main.ts#A1B2]\n1:alpha\n2:beta\n",
+      });
+      expect(await readFile(harness.dir("pasted.ts"))).toBe("alpha\nbeta\n");
+    });
+  });
+
+  it("preserves an existing BOM and CRLF endings", async () => {
+    await withDirectory(async (make) => {
+      const harness = make();
+      const bom = Buffer.from([0xef, 0xbb, 0xbf]);
+      const original = Buffer.concat([bom, Buffer.from("one\r\ntwo\r\n")]);
+      await NodeFSP.writeFile(NodePath.join(harness.directory, "win.txt"), original);
+      const result = await harness.tool("Write").execute("call-1", {
+        path: "win.txt",
+        content: "one\nthree\n",
+      });
+      expect(result.details).toMatchObject({ additions: 1, deletions: 1 });
+      expect(await NodeFSP.readFile(harness.dir("win.txt"))).toEqual(
+        Buffer.concat([bom, Buffer.from("one\r\nthree\r\n")]),
+      );
     });
   });
 
@@ -310,57 +390,297 @@ describe("Write", () => {
 });
 
 describe("Edit", () => {
-  it("applies hashline edits built from the tags Read returned", async () => {
+  it("applies ops anchored on the tag Read returned", async () => {
     await withDirectory(async (make) => {
       const harness = make();
       await writeFile(harness.directory, "file.ts", "alpha\nbeta\ngamma\n");
-      await harness.tool("Read").execute("call-1", { path: "file.ts" });
+      const read = await harness.tool("Read").execute("call-1", { path: "file.ts" });
 
       const result = await harness.tool("Edit").execute("call-2", {
         path: "file.ts",
-        edits: [{ op: "PUT", start: `2:${computeLineTag("beta")}`, content: "BETA\nBETA-2" }],
+        tag: read.details.tag,
+        ops: "PUT 2.=2:\n+BETA\n+BETA-2",
       });
       expect(result.isError).toBeUndefined();
       expect(await readFile(harness.dir("file.ts"))).toBe("alpha\nBETA\nBETA-2\ngamma\n");
-      expect(result.details).toMatchObject({ additions: 2, deletions: 1 });
+      expect(result.details).toMatchObject({
+        additions: 2,
+        deletions: 1,
+        tag: computeFileTag("alpha\nBETA\nBETA-2\ngamma\n"),
+      });
+      expect(textOf(result)).toContain(headerOf("file.ts", "alpha\nBETA\nBETA-2\ngamma\n"));
     });
   });
 
-  it("rejects unseen lines with a free retry", async () => {
+  it("covers ranges, gaps, append, and block locators", async () => {
     await withDirectory(async (make) => {
       const harness = make();
-      await writeFile(harness.directory, "file.ts", "alpha\nbeta\n");
-      const result = await harness.tool("Edit").execute("call-1", {
+      await writeFile(
+        harness.directory,
+        "file.ts",
+        "const a = 1;\nfunction f() {\n  return 2;\n}\n",
+      );
+      const read = await harness.tool("Read").execute("call-1", { path: "file.ts" });
+      const tag = read.details.tag;
+
+      const replaced = await harness.tool("Edit").execute("call-2", {
         path: "file.ts",
-        edits: [{ op: "CUT", start: `1:${computeLineTag("alpha")}` }],
+        tag,
+        ops: "PUT 1.=1:\n+const a = 2;\nPUT >$:\n+const tail = 3;",
       });
-      expect(result.isError).toBe(true);
-      expect(textOf(result)).toContain("EDIT_LINES_UNSEEN");
+      expect(replaced.isError).toBeUndefined();
+      expect(await readFile(harness.dir("file.ts"))).toBe(
+        "const a = 2;\nfunction f() {\n  return 2;\n}\nconst tail = 3;\n",
+      );
+
+      const block = await harness.tool("Edit").execute("call-3", {
+        path: "file.ts",
+        tag: replaced.details.tag,
+        ops: "PUT 2*:\n+function f() {\n+  return 3;\n+}",
+      });
+      expect(block.isError).toBeUndefined();
+      expect(await readFile(harness.dir("file.ts"))).toBe(
+        "const a = 2;\nfunction f() {\n  return 3;\n}\nconst tail = 3;\n",
+      );
+      expect(block.details.ops).toEqual(["PUT 2*:"]);
+
+      const insertBefore = await harness.tool("Edit").execute("call-4", {
+        path: "file.ts",
+        tag: block.details.tag,
+        ops: "PUT <1:\n+// header",
+      });
+      expect(insertBefore.isError).toBeUndefined();
+      expect((await readFile(harness.dir("file.ts"))).startsWith("// header\n")).toBe(true);
+    });
+  });
+
+  it("reports resolved block spans for a direct apply", async () => {
+    await withDirectory(async (make) => {
+      const harness = make();
+      await writeFile(harness.directory, "file.ts", "function f() {\n  return 1;\n}\n");
+      const read = await harness.tool("Read").execute("call-1", { path: "file.ts" });
+      const result = await harness.tool("Edit").execute("call-2", {
+        path: "file.ts",
+        tag: read.details.tag,
+        ops: "PUT 1*:\n+function f() {\n+  return 2;\n+}",
+      });
+      expect(textOf(result)).toContain("[block] PUT 1*: -> lines 1-3");
+    });
+  });
+
+  it("declines a block locator on an unsupported language", async () => {
+    await withDirectory(async (make) => {
+      const harness = make();
+      await writeFile(harness.directory, "notes.txt", "a\nb\nc\n");
+      const read = await harness.tool("Read").execute("call-1", { path: "notes.txt" });
+      const result = await harness.tool("Edit").execute("call-2", {
+        path: "notes.txt",
+        tag: read.details.tag,
+        ops: "PUT 1*:\n+x",
+      });
+      expect(textOf(result)).toContain("EDIT_BLOCK_UNRESOLVED");
+      expect(textOf(result)).toContain("use PUT 1.=1:");
+    });
+  });
+
+  it("records session registers across calls and moves files", async () => {
+    await withDirectory(async (make) => {
+      const harness = make();
+      await writeFile(harness.directory, "source.ts", "alpha\nbeta\n");
+      await writeFile(harness.directory, "target.ts", "one\ntwo\n");
+      const source = await harness.tool("Read").execute("call-1", { path: "source.ts" });
+      const cut = await harness.tool("Edit").execute("call-2", {
+        path: "source.ts",
+        tag: source.details.tag,
+        ops: "CUT 1.=1 @line",
+      });
+      expect(cut.isError).toBeUndefined();
+      expect(await readFile(harness.dir("source.ts"))).toBe("beta\n");
+
+      const target = await harness.tool("Read").execute("call-3", { path: "target.ts" });
+      const paste = await harness.tool("Edit").execute("call-4", {
+        path: "target.ts",
+        tag: target.details.tag,
+        ops: "PUT <1 @line",
+      });
+      expect(paste.isError).toBeUndefined();
+      expect(await readFile(harness.dir("target.ts"))).toBe("alpha\none\ntwo\n");
+
+      const moved = await harness.tool("Edit").execute("call-5", {
+        path: "target.ts",
+        tag: paste.details.tag,
+        ops: "MV renamed.ts",
+      });
+      expect(moved.isError).toBeUndefined();
+      expect(moved.details.fileName).toBe("renamed.ts");
+      expect(await readFile(harness.dir("renamed.ts"))).toBe("alpha\none\ntwo\n");
+      await expect(NodeFSP.readFile(harness.dir("target.ts"))).rejects.toThrow();
+    });
+  });
+
+  it("removes a file with REM", async () => {
+    await withDirectory(async (make) => {
+      const harness = make();
+      await writeFile(harness.directory, "gone.txt", "alpha\n");
+      const read = await harness.tool("Read").execute("call-1", { path: "gone.txt" });
+      const result = await harness.tool("Edit").execute("call-2", {
+        path: "gone.txt",
+        tag: read.details.tag,
+        ops: "REM",
+      });
+      expect(result.isError).toBeUndefined();
+      expect(result.details.newStr).toBe("");
+      await expect(NodeFSP.readFile(harness.dir("gone.txt"))).rejects.toThrow();
+    });
+  });
+
+  it("reveals unseen anchors once so an honest retry applies", async () => {
+    await withDirectory(async (make) => {
+      const harness = make();
+      await writeFile(harness.directory, "file.ts", "one\ntwo\nthree\nfour\n");
+      const read = await harness.tool("Read").execute("call-1", {
+        path: "file.ts",
+        offset: 1,
+        limit: 2,
+      });
+      const ops = "PUT 4.=4:\n+FOUR";
+      const rejected = await harness.tool("Edit").execute("call-2", {
+        path: "file.ts",
+        tag: read.details.tag,
+        ops,
+      });
+      expect(textOf(rejected)).toContain("EDIT_LINES_UNSEEN");
+      expect(textOf(rejected)).toContain("4: four");
+      expect(textOf(rejected)).toContain("retry the same tag unchanged");
       expect(harness.recovery.peek(harness.dir("file.ts"))).toMatchObject({
         strikes: 0,
         freeRetryUsed: true,
       });
+
+      const retried = await harness.tool("Edit").execute("call-3", {
+        path: "file.ts",
+        tag: read.details.tag,
+        ops,
+      });
+      expect(retried.isError).toBeUndefined();
+      expect(await readFile(harness.dir("file.ts"))).toBe("one\ntwo\nthree\nFOUR\n");
     });
   });
 
-  it("hard-stops after three failed mutations and blocks Write", async () => {
+  it("does not merge a clipped unseen-line reveal", async () => {
+    await withDirectory(async (make) => {
+      const harness = make();
+      const long = "y".repeat(600);
+      await writeFile(harness.directory, "file.ts", `${long}\nshort\n`);
+      await harness.tool("Read").execute("call-1", { path: "file.ts", offset: 2, limit: 1 });
+      const result = await harness.tool("Edit").execute("call-2", {
+        path: "file.ts",
+        tag: computeFileTag(`${long}\nshort\n`),
+        ops: "PUT 1.=1:\n+LONG",
+      });
+      expect(textOf(result)).toContain("EDIT_LINES_UNSEEN");
+      expect(textOf(result)).toContain("reveal is truncated");
+      expect(await readFile(harness.dir("file.ts"))).toBe(`${long}\nshort\n`);
+    });
+  });
+
+  it("recovers a stale tag when every anchor moved by one consistent offset", async () => {
+    await withDirectory(async (make) => {
+      const harness = make();
+      await writeFile(harness.directory, "file.ts", "a\nb\nc\n");
+      const read = await harness.tool("Read").execute("call-1", { path: "file.ts" });
+      await writeFile(harness.directory, "file.ts", "zero\na\nb\nc\n");
+      const result = await harness.tool("Edit").execute("call-2", {
+        path: "file.ts",
+        tag: read.details.tag,
+        ops: "PUT 2.=2:\n+B",
+      });
+      expect(result.isError).toBeUndefined();
+      expect(await readFile(harness.dir("file.ts"))).toBe("zero\na\nB\nc\n");
+      expect(textOf(result)).toContain("[warning]");
+      expect(textOf(result)).toContain("anchors moved by +1 line(s)");
+    });
+  });
+
+  it("rejects a stale tag when the anchored line itself changed", async () => {
+    await withDirectory(async (make) => {
+      const harness = make();
+      await writeFile(harness.directory, "file.ts", "a\nb\nc\n");
+      const read = await harness.tool("Read").execute("call-1", { path: "file.ts" });
+      await writeFile(harness.directory, "file.ts", "a\nB2\nc\n");
+      const result = await harness.tool("Edit").execute("call-2", {
+        path: "file.ts",
+        tag: read.details.tag,
+        ops: "PUT 2.=2:\n+B",
+      });
+      expect(textOf(result)).toContain("EDIT_TAG_MISMATCH");
+      expect(textOf(result)).toContain("Current content at the anchors");
+      expect(await readFile(harness.dir("file.ts"))).toBe("a\nB2\nc\n");
+    });
+  });
+
+  it("rebinds a mistyped path by basename and tag", async () => {
+    await withDirectory(async (make) => {
+      const harness = make();
+      await writeFile(harness.directory, "src/main.ts", "a\nb\n");
+      const read = await harness.tool("Read").execute("call-1", { path: "src/main.ts" });
+      const result = await harness.tool("Edit").execute("call-2", {
+        path: "main.ts",
+        tag: read.details.tag,
+        ops: "PUT 2.=2:\n+B",
+      });
+      expect(result.isError).toBeUndefined();
+      expect(await readFile(harness.dir("src/main.ts"))).toBe("a\nB\n");
+    });
+  });
+
+  it("applies a stale tag at the file tail as position-stable", async () => {
+    await withDirectory(async (make) => {
+      const harness = make();
+      await writeFile(harness.directory, "file.ts", "a\nb\n");
+      const read = await harness.tool("Read").execute("call-1", { path: "file.ts" });
+      await writeFile(harness.directory, "file.ts", "a\nb\nc\n");
+      const result = await harness.tool("Edit").execute("call-2", {
+        path: "file.ts",
+        tag: read.details.tag,
+        ops: "PUT >$:\n+d",
+      });
+      expect(result.isError).toBeUndefined();
+      expect(await readFile(harness.dir("file.ts"))).toBe("a\nb\nc\nd\n");
+      expect(textOf(result)).toContain("applied at the file head/tail");
+    });
+  });
+
+  it("requires a well-formed tag for ops", async () => {
+    await withDirectory(async (make) => {
+      const harness = make();
+      await writeFile(harness.directory, "file.ts", "a\n");
+      const result = await harness.tool("Edit").execute("call-1", {
+        path: "file.ts",
+        ops: "CUT 1.=1",
+      });
+      expect(textOf(result)).toContain("EDIT_TAG_REQUIRED");
+      expect(await readFile(harness.dir("file.ts"))).toBe("a\n");
+    });
+  });
+
+  it("hard-stops after three counted failures and blocks Write", async () => {
     await withDirectory(async (make) => {
       const harness = make();
       await writeFile(harness.directory, "file.ts", "alpha\nbeta\n");
-      const cut = { op: "CUT", start: `1:${computeLineTag("alpha")}` };
+      const tag = staleTag("alpha\nbeta\n");
+      const ops = "CUT 1.=1";
 
-      const free = await harness.tool("Edit").execute("call-1", { path: "file.ts", edits: [cut] });
-      expect(textOf(free)).toContain("EDIT_LINES_UNSEEN");
+      const free = await harness.tool("Edit").execute("call-1", {
+        path: "file.ts",
+        tag,
+        ops,
+      });
       expect(textOf(free)).toContain("One free retry");
 
-      const first = await harness.tool("Edit").execute("call-2", { path: "file.ts", edits: [cut] });
-      expect(textOf(first)).toContain("failed mutation 1 of 3");
-      const second = await harness
-        .tool("Edit")
-        .execute("call-3", { path: "file.ts", edits: [cut] });
-      expect(textOf(second)).toContain("failed mutation 2 of 3");
-      const third = await harness.tool("Edit").execute("call-4", { path: "file.ts", edits: [cut] });
-      expect(textOf(third)).toContain("Stop mutating");
+      for (const call of ["call-2", "call-3", "call-4"]) {
+        await harness.tool("Edit").execute(call, { path: "file.ts", tag, ops });
+      }
       expect(harness.recovery.peek(harness.dir("file.ts"))?.hardStop).toBe(true);
 
       const blocked = await harness.tool("Write").execute("call-5", {
@@ -370,19 +690,6 @@ describe("Edit", () => {
       expect(blocked.isError).toBe(true);
       expect(textOf(blocked)).toContain("Stop mutating");
       expect(await readFile(harness.dir("file.ts"))).toBe("alpha\nbeta\n");
-    });
-  });
-
-  it("reports a tag mismatch after a read", async () => {
-    await withDirectory(async (make) => {
-      const harness = make();
-      await writeFile(harness.directory, "file.ts", "alpha\n");
-      await harness.tool("Read").execute("call-1", { path: "file.ts" });
-      const result = await harness.tool("Edit").execute("call-2", {
-        path: "file.ts",
-        edits: [{ op: "CUT", start: "1:zz" }],
-      });
-      expect(textOf(result)).toContain("EDIT_TAG_MISMATCH");
     });
   });
 
@@ -401,7 +708,35 @@ describe("Edit", () => {
     });
   });
 
-  it("rejects missing, ambiguous, and unchanged edits", async () => {
+  it("accepts old_string aliases and multi-line legacy replacements", async () => {
+    await withDirectory(async (make) => {
+      const harness = make();
+      await writeFile(harness.directory, "file.txt", "one\ntwo\nthree\nfour\n");
+      const result = await harness.tool("Edit").execute("call-1", {
+        path: "file.txt",
+        old_string: "two\nthree",
+        new_string: "TWO\nTHREE",
+      });
+      expect(result.isError).toBeUndefined();
+      expect(await readFile(harness.dir("file.txt"))).toBe("one\nTWO\nTHREE\nfour\n");
+    });
+  });
+
+  it("lowers legacy edits[] through the same engine", async () => {
+    await withDirectory(async (make) => {
+      const harness = make();
+      await writeFile(harness.directory, "file.ts", "alpha\nbeta\ngamma\n");
+      const result = await harness.tool("Edit").execute("call-1", {
+        path: "file.ts",
+        edits: [{ op: "PUT", start: "2:zz", content: "BETA" }],
+      });
+      expect(result.isError).toBeUndefined();
+      expect(await readFile(harness.dir("file.ts"))).toBe("alpha\nBETA\ngamma\n");
+      expect(result.details.warnings?.[0]).toContain("carried no tag");
+    });
+  });
+
+  it("rejects missing, ambiguous, unchanged, and self-move edits", async () => {
     await withDirectory(async (make) => {
       const harness = make();
       await writeFile(harness.directory, "file.txt", "same\nsame\n");
@@ -420,7 +755,7 @@ describe("Edit", () => {
       expect(textOf(ambiguous)).toContain("appears 2 times");
 
       const noEdits = await harness.tool("Edit").execute("call-3", { path: "file.txt" });
-      expect(textOf(noEdits)).toContain("both oldText and newText");
+      expect(textOf(noEdits)).toContain("Provide ops with tag, edits, or oldText/newText");
 
       const missing = await harness.tool("Edit").execute("call-4", {
         path: "missing.txt",
@@ -429,12 +764,73 @@ describe("Edit", () => {
       });
       expect(textOf(missing)).toContain("does not exist");
 
-      await harness.tool("Read").execute("call-5", { path: "file.txt" });
+      const read = await harness.tool("Read").execute("call-5", { path: "file.txt" });
       const noChange = await harness.tool("Edit").execute("call-6", {
         path: "file.txt",
-        edits: [{ op: "PUT", start: `1:${computeLineTag("same")}`, content: "same" }],
+        tag: read.details.tag,
+        ops: "PUT 1.=1:\n+same",
       });
       expect(textOf(noChange)).toContain("EDIT_NO_CHANGE");
+
+      const selfMove = await harness.tool("Edit").execute("call-7", {
+        path: "file.txt",
+        tag: read.details.tag,
+        ops: "MV ./file.txt",
+      });
+      expect(textOf(selfMove)).toContain("EDIT_NO_CHANGE");
+      expect(await readFile(harness.dir("file.txt"))).toBe("same\nsame\n");
+    });
+  });
+
+  it("rejects malformed ops with a concrete replacement form", async () => {
+    await withDirectory(async (make) => {
+      const harness = make();
+      await writeFile(harness.directory, "file.ts", "a\nb\n");
+      const read = await harness.tool("Read").execute("call-1", { path: "file.ts" });
+      const result = await harness.tool("Edit").execute("call-2", {
+        path: "file.ts",
+        tag: read.details.tag,
+        ops: "PUT 1.=1\n+x",
+      });
+      expect(textOf(result)).toContain("EDIT_PARSE_FAILED");
+      expect(textOf(result)).toContain("PUT 1.=1:");
+      expect(await readFile(harness.dir("file.ts"))).toBe("a\nb\n");
+    });
+  });
+
+  it("preserves UTF-16 and CRLF when editing", async () => {
+    await withDirectory(async (make) => {
+      const harness = make();
+      const original = Buffer.concat([
+        Buffer.from([0xff, 0xfe]),
+        Buffer.from("one\r\ntwo\r\n", "utf16le"),
+      ]);
+      await NodeFSP.writeFile(NodePath.join(harness.directory, "wide.txt"), original);
+      const read = await harness.tool("Read").execute("call-1", { path: "wide.txt" });
+      const result = await harness.tool("Edit").execute("call-2", {
+        path: "wide.txt",
+        tag: read.details.tag,
+        ops: "PUT 2.=2:\n+TWO",
+      });
+      expect(result.isError).toBeUndefined();
+      expect(await NodeFSP.readFile(harness.dir("wide.txt"))).toEqual(
+        Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from("one\r\nTWO\r\n", "utf16le")]),
+      );
+    });
+  });
+
+  it("keeps a missing trailing newline", async () => {
+    await withDirectory(async (make) => {
+      const harness = make();
+      await writeFile(harness.directory, "file.txt", "alpha\nbeta");
+      const read = await harness.tool("Read").execute("call-1", { path: "file.txt" });
+      await harness.tool("Edit").execute("call-2", {
+        path: "file.txt",
+        tag: read.details.tag,
+        ops: "PUT 2.=2:\n+BETA",
+      });
+      expect(await readFile(harness.dir("file.txt"))).toBe("alpha\nBETA");
+      expect(splitFileLines("alpha\nBETA")).toEqual(["alpha", "BETA"]);
     });
   });
 });
@@ -614,8 +1010,8 @@ describe("Glob and Grep", () => {
       expect(matches.find((match) => match.fileName === harness.dir("src/long.ts"))?.clipped).toBe(
         true,
       );
-      expect(harness.seen.hasSeenRange(harness.dir("src/a.ts"), 2, 2)).toBe(true);
-      expect(harness.seen.hasSeenRange(harness.dir("src/long.ts"), 1, 1)).toBe(false);
+      expect(seenOf(harness, "src/a.ts", "alpha\nconst needle = 1;\n")).toEqual([2]);
+      expect(seenOf(harness, "src/long.ts", `${longLine}\n`)).toEqual([]);
     });
   });
 

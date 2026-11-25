@@ -1,4 +1,4 @@
-import { isRecoverableHashlineErrorCode } from "./hashline.ts";
+import { isRecoverableEditErrorCode } from "./editEngine.ts";
 
 export const MAX_STRIKES = 3;
 
@@ -11,7 +11,7 @@ export interface MutationFailureState {
 
 interface RecoveryEntry {
   strikes: number;
-  freeRetryUsed: boolean;
+  readonly graced: Set<string>;
 }
 
 export class MutationRecoveryTracker {
@@ -20,7 +20,7 @@ export class MutationRecoveryTracker {
   #entry(realPath: string): RecoveryEntry {
     const existing = this.#entries.get(realPath);
     if (existing !== undefined) return existing;
-    const created: RecoveryEntry = { strikes: 0, freeRetryUsed: false };
+    const created: RecoveryEntry = { strikes: 0, graced: new Set() };
     this.#entries.set(realPath, created);
     return created;
   }
@@ -29,8 +29,8 @@ export class MutationRecoveryTracker {
     const entry = this.#entry(realPath);
     const detail = errorCode === undefined ? "" : ` (${errorCode})`;
 
-    if (isRecoverableHashlineErrorCode(errorCode) && !entry.freeRetryUsed) {
-      entry.freeRetryUsed = true;
+    if (isRecoverableEditErrorCode(errorCode) && !entry.graced.has(errorCode ?? "")) {
+      entry.graced.add(errorCode ?? "");
       return {
         strikes: entry.strikes,
         freeRetryUsed: true,
@@ -43,7 +43,7 @@ export class MutationRecoveryTracker {
     const hardStop = entry.strikes >= MAX_STRIKES;
     return {
       strikes: entry.strikes,
-      freeRetryUsed: entry.freeRetryUsed,
+      freeRetryUsed: entry.graced.size > 0,
       hardStop,
       message: hardStop
         ? `Stop mutating ${realPath}${detail}. ${MAX_STRIKES} failed mutations in a row: re-read the file, then ask the user how to proceed instead of retrying the same edit.`
@@ -60,7 +60,7 @@ export class MutationRecoveryTracker {
     if (entry === undefined) return undefined;
     return {
       strikes: entry.strikes,
-      freeRetryUsed: entry.freeRetryUsed,
+      freeRetryUsed: entry.graced.size > 0,
       hardStop: entry.strikes >= MAX_STRIKES,
       message: "",
     };
