@@ -99,6 +99,65 @@ describe("SystemTranscriptManager", () => {
     assert.deepEqual(delta?.sections, { skills: null });
     assert.deepEqual(manager.committedSections, { runtime: "runtime v1", skills: null });
   });
+
+  it("keeps each skill section right behind the catalog header, sorted by id", () => {
+    const manager = new SystemTranscriptManager({
+      basePrompt: "base",
+      sections: {
+        runtime: "runtime v1",
+        context: "context v1",
+        "skill:beta": "beta v1",
+        skills: "skills v1",
+        "skill:alpha": "alpha v1",
+        tool_activation: "activation v1",
+      },
+      timestamp: TIMESTAMP,
+    });
+
+    assert.deepEqual(Object.keys(manager.initialSystemMessage?.sections ?? {}), [
+      "runtime",
+      "skills",
+      "skill:alpha",
+      "skill:beta",
+      "tool_activation",
+      "context",
+    ]);
+  });
+
+  it("appends only the changed skill and revokes one that left the catalog", () => {
+    const manager = new SystemTranscriptManager({
+      basePrompt: "base",
+      sections: { runtime: "runtime v1", skills: "skills v1", "skill:alpha": "alpha v1" },
+      timestamp: TIMESTAMP,
+    });
+
+    const added = manager.diffSections(
+      {
+        runtime: "runtime v1",
+        skills: "skills v1",
+        "skill:alpha": "alpha v1",
+        "skill:beta": "beta v1",
+      },
+      TIMESTAMP + 1,
+    );
+    assert.deepEqual(added?.sections, { "skill:beta": "beta v1" });
+
+    const revoked = manager.diffSections(
+      { runtime: "runtime v1", skills: "skills v1" },
+      TIMESTAMP + 2,
+    );
+    assert.deepEqual(revoked?.sections, { "skill:alpha": null, "skill:beta": null });
+    assert.deepEqual(manager.committedSections, {
+      runtime: "runtime v1",
+      skills: "skills v1",
+      "skill:alpha": null,
+      "skill:beta": null,
+    });
+
+    assert.isNull(
+      manager.diffSections({ runtime: "runtime v1", skills: "skills v1" }, TIMESTAMP + 3),
+    );
+  });
 });
 
 describe("foldForCheckpoint", () => {
@@ -182,6 +241,22 @@ describe("buildT3SystemSections", () => {
       workflowDirective: "   ",
     });
     assert.isUndefined(cleared.tool_activation);
+  });
+
+  it("merges per-skill sections into the catalog order", () => {
+    const sections = buildT3SystemSections({
+      harness: "Pi Native",
+      skillSections: {
+        skills: "# Skills",
+        "skill:review": "- `review` — Review",
+        "skill:notes": "- `notes` — Notes",
+      },
+    });
+
+    assert.equal(sections.skills, "# Skills");
+    assert.equal(sections["skill:review"], "- `review` — Review");
+    assert.equal(sections["skill:notes"], "- `notes` — Notes");
+    assert.isUndefined(sections.tool_activation);
   });
 
   it("leaves optional sections out when they have no content", () => {
