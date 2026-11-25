@@ -43,6 +43,8 @@ describe("SystemTranscriptManager", () => {
         context: "thread context",
         runtime: "runtime instructions",
         context_budget: "budget note",
+        project_instructions: "project rules",
+        custom_append: "append rules",
       },
       timestamp: TIMESTAMP,
     });
@@ -52,6 +54,8 @@ describe("SystemTranscriptManager", () => {
     assert.equal(initial?.content, "You are T3.");
     assert.deepEqual(Object.keys(initial?.sections ?? {}), [
       "runtime",
+      "custom_append",
+      "project_instructions",
       "context",
       "context_budget",
     ]);
@@ -136,19 +140,26 @@ describe("buildT3SystemSections", () => {
       model: "gpt-5.4",
       hasT3Mcp: true,
       skillSummary: "skill: orca-cli",
+      customAppend: "append rules",
+      projectInstructions: "project rules",
       planMode: true,
     });
 
     assert.include(sections.runtime ?? "", "runtime_info");
     assert.include(sections.runtime ?? "", "T3 Code orchestration");
+    assert.equal(sections.custom_append, "append rules");
+    assert.equal(sections.project_instructions, "project rules");
     assert.equal(sections.skills, "skill: orca-cli");
     assert.include(sections.tool_activation ?? "", "plan_mode");
     assert.include(sections.tool_activation ?? "", "SubmitPlan");
     assert.isUndefined(sections.context);
-    assert.deepEqual(
-      Object.keys(sections),
-      CANONICAL_SYSTEM_SECTIONS.filter((name) => sections[name] !== undefined),
-    );
+    assert.deepEqual(Object.keys(sections), [
+      "runtime",
+      "custom_append",
+      "project_instructions",
+      "skills",
+      "tool_activation",
+    ]);
   });
 
   it("renders the goal mode section and the workflow directive into tool activation", () => {
@@ -189,13 +200,21 @@ describe("buildT3SystemSections", () => {
       harness: "Pi",
       hasT3Mcp: false,
       skillSummary: "",
+      customAppend: "",
+      projectInstructions: "",
       context: "",
       planMode: false,
     });
 
+    assert.isUndefined(sections.custom_append);
+    assert.isUndefined(sections.project_instructions);
     assert.isUndefined(sections.skills);
     assert.isUndefined(sections.tool_activation);
     assert.isUndefined(sections.context);
     assert.notInclude(sections.runtime ?? "", "T3 Code orchestration");
+    assert.deepEqual(
+      Object.keys(sections),
+      CANONICAL_SYSTEM_SECTIONS.filter((name) => sections[name] !== undefined),
+    );
   });
 });
