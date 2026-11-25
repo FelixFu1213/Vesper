@@ -115,6 +115,7 @@ interface McpTransport {
   readonly notify: (method: string, params?: unknown) => Promise<void>;
   readonly sessionId: () => string | undefined;
   readonly listChanged: () => boolean;
+  readonly clearListChanged: () => void;
 }
 
 const createTransport = (
@@ -185,6 +186,9 @@ const createTransport = (
     notify,
     sessionId: () => sessionId,
     listChanged: () => listChanged,
+    clearListChanged: () => {
+      listChanged = false;
+    },
   };
 };
 
@@ -331,16 +335,23 @@ export const connectMcpSession = async (
     });
     await session.notify("notifications/initialized");
 
+    let hasRemoteToolSearch = false;
+
     const loadTools = async (): Promise<ReadonlyArray<McpAgentTool>> => {
       const listed = asRecord(await session.request("tools/list"));
+      session.clearListChanged();
       const remoteTools = Array.isArray(listed?.tools) ? listed.tools : [];
       const loaded: McpAgentTool[] = [];
       const loadedMetadata = new Map<string, McpBridgeMetadata>();
+      hasRemoteToolSearch = false;
       for (const entry of remoteTools) {
         const record = asRecord(entry);
         if (record === undefined) continue;
         // Deferred sessions expose one search entrypoint: this bridge's own ToolSearch.
-        if (exposure === "deferred" && record.name === MCP_TOOL_SEARCH) continue;
+        if (exposure === "deferred" && record.name === MCP_TOOL_SEARCH) {
+          hasRemoteToolSearch = true;
+          continue;
+        }
         const tool = createTool(server, record, session);
         if (tool === undefined) continue;
         if (loadedMetadata.has(tool.name)) continue;
@@ -362,17 +373,25 @@ export const connectMcpSession = async (
       session.listChanged() ? loadTools() : tools;
 
     const searchTools = async (query: string): Promise<ReadonlyArray<string>> => {
-      if (exposure !== "deferred") return [];
-      const result = asRecord(
-        await session.request("tools/call", {
-          name: MCP_TOOL_SEARCH,
-          arguments: { query },
-        }),
-      );
+      if (exposure !== "deferred" || !hasRemoteToolSearch) return [];
+      let result: Record<string, unknown> | undefined;
+      try {
+        result = asRecord(
+          await session.request("tools/call", {
+            name: MCP_TOOL_SEARCH,
+            arguments: { query },
+          }),
+        );
+      } catch {
+        return [];
+      }
       const names = toolSearchNames(result);
       if (names.length === 0) return [];
-      await refreshTools();
-      return names.map((name) => `mcp__${server}__${name}`);
+      const prefixed = names.map((name) => `mcp__${server}__${name}`);
+      if (session.listChanged() || prefixed.some((name) => !metadata.has(name))) {
+        await loadTools();
+      }
+      return prefixed;
     };
 
     await loadTools();

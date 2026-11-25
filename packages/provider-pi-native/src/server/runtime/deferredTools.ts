@@ -157,6 +157,13 @@ export class DeferredToolRegistry {
     return activated;
   }
 
+  /** Clears activated deferred tools (used on rollback or transcript replacement). */
+  resetActivation(): void {
+    if (this.#active.size === 0) return;
+    this.#active.clear();
+    this.#rebuildActiveList();
+  }
+
   /** Every registered tool plus `ToolSearch`, for routes that declare the catalog up front. */
   allDeclarations(): AgentTool<any>[] {
     return [...this.#tools, this.#searchTool];
@@ -196,15 +203,19 @@ export class DeferredToolRegistry {
       const restored = restoredToolActivation(messages, fixedDeclarationKey);
       if (restored === undefined) return;
       this.activate(restored.active);
+      this.#replaySearchResults(messages.slice(restored.replayFrom));
       return;
     }
     const lastSystem = messages.map((message) => message.role).lastIndexOf("system");
-    for (const message of messages.slice(lastSystem + 1)) {
+    this.#replaySearchResults(messages.slice(lastSystem + 1));
+  }
+
+  #replaySearchResults(messages: ReadonlyArray<AgentMessage>): void {
+    for (const message of messages) {
       if (message.role !== "toolResult") continue;
       if (message.toolName !== TOOL_SEARCH_NAME || message.isError === true) continue;
       const details = asRecord(message.details);
-      const names = activationNames(details ?? message);
-      this.activate(names);
+      this.activate(activationNames(details ?? message));
     }
   }
 

@@ -642,6 +642,7 @@ describe("NativePiSessionRuntime", () => {
         };
         return json({
           tools: [
+            { name: "tool_search", description: "Search tools", inputSchema: {} },
             { name: "orchestrator_capabilities", description: "Capabilities", inputSchema: {} },
             ...(listed === 1 ? [] : [threads]),
           ],
@@ -1000,6 +1001,35 @@ describe("NativePiSessionRuntime", () => {
     assert.isTrue(requests[1]?.hasToolActivationKey);
     assert.isNull(requests[1]?.toolActivation);
     assert.match(requests[2]?.toolActivation ?? "", /workflow_command name="review"/u);
+    await harness.runtime.dispose();
+  });
+
+  it("clears activated deferred tools across truncateToTurn rollback", async () => {
+    const harness = await makeRuntime({
+      steps: [
+        scriptedToolCallResponse([{ name: "ToolSearch", arguments: { query: "TodoWrite" } }]),
+        scriptedTextResponse("activated"),
+        scriptedToolCallResponse([{ name: "TodoRead", arguments: {} }]),
+        scriptedTextResponse("after rollback"),
+      ],
+    });
+    await harness.runtime.runTurn({ text: "turn one" });
+    harness.runtime.activateTools(["TodoRead"]);
+    harness.runtime.truncateToTurn(0);
+    await harness.runtime.runTurn({ text: "turn after rollback" });
+    const declaredAfterRollback = (harness.streamFn.calls[2]?.context.messages ?? []).flatMap(
+      (message) =>
+        (
+          (message as { readonly toolsAdded?: ReadonlyArray<{ readonly name: string }> })
+            .toolsAdded ?? []
+        ).map((tool) => tool.name),
+    );
+    assert.notInclude(declaredAfterRollback, "TodoWrite");
+    assert.notInclude(declaredAfterRollback, "TodoRead");
+    const blockedEnd = harness.events.findLast(
+      (event) => event.type === "tool" && event.phase === "end",
+    );
+    assert.equal(blockedEnd?.type === "tool" ? blockedEnd.isError === true : false, true);
     await harness.runtime.dispose();
   });
 });

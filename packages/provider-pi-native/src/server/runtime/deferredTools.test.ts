@@ -177,7 +177,7 @@ describe("DeferredToolRegistry", () => {
     expect(registry.activeNames).toEqual(["TodoRead"]);
   });
 
-  it("restores from the fixed-declaration activation record when one is current", () => {
+  it("restores from the fixed-declaration activation record and replays subsequent search results", () => {
     const registry = registryWith(BUILTINS);
     registry.restore(
       [
@@ -193,10 +193,14 @@ describe("DeferredToolRegistry", () => {
           },
           timestamp: 1,
         },
+        toolResult(TOOL_SEARCH_NAME, { addedToolNames: ["TodoRead"] }),
       ],
       "a".repeat(64),
     );
-    expect(registry.activeNames).toEqual(["TodoWrite"]);
+    expect(registry.activeNames).toEqual(["TodoRead", "TodoWrite"]);
+
+    registry.resetActivation();
+    expect(registry.activeNames).toEqual([]);
   });
 
   it("fails closed when the fixed-declaration snapshot does not match", () => {

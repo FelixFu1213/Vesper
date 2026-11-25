@@ -167,10 +167,12 @@ describe("connectMcpSession", () => {
       if (body.method === "initialize") return jsonResponse(body.id, {});
       if (body.method === "notifications/initialized") return new Response(null, { status: 202 });
       if (body.method === "tools/list") {
+        const searchTool = { name: "tool_search", description: "Search tools", inputSchema: {} };
         const tools =
           listed === 1
-            ? [TOOLS[0]]
+            ? [searchTool, TOOLS[0]]
             : [
+                searchTool,
                 TOOLS[0],
                 {
                   name: "t3_thread_list",
@@ -213,9 +215,50 @@ describe("connectMcpSession", () => {
 
     const refreshed = await result.refreshTools();
     expect(refreshed.map((tool) => tool.name)).toContain("mcp__t3-code__t3_thread_list");
+    // Loading clears the notification flag so repeated refreshes reuse the cache.
+    await result.refreshTools();
+    expect(calls.filter((call) => call.body.method === "tools/list")).toHaveLength(2);
     expect(result.metadata.get("mcp__t3-code__t3_thread_list")?.readOnlyHint).toBe(true);
     const isReadOnly = mcpReadOnlyPredicate(result.metadata);
     expect(isReadOnly("mcp__t3-code__t3_thread_list")).toBe(true);
+  });
+
+  it("skips or catches remote search errors and reloads missing tools without notifications", async () => {
+    const plain = createFetch(sessionHandler());
+    const plainResult = await connectMcpSession(config, {
+      fetch: plain.fetchImpl,
+      toolExposure: "deferred",
+    });
+    await expect(plainResult.searchTools("threads")).resolves.toEqual([]);
+    expect(plain.calls.some((call) => call.body.method === "tools/call")).toBe(false);
+
+    let listCount = 0;
+    const remote = createFetch((body) => {
+      if (body.method === "initialize") return jsonResponse(body.id, {});
+      if (body.method === "notifications/initialized") return new Response(null, { status: 202 });
+      if (body.method === "tools/list") {
+        listCount += 1;
+        const tools =
+          listCount === 1
+            ? [{ name: "tool_search", description: "Search tools", inputSchema: {} }, TOOLS[0]]
+            : [TOOLS[0], TOOLS[1]];
+        return jsonResponse(body.id, { tools });
+      }
+      if (
+        (body.params as { readonly arguments?: { readonly query?: string } })?.arguments?.query ===
+        "boom"
+      ) {
+        return new Response("down", { status: 503 });
+      }
+      return jsonResponse(body.id, { structuredContent: { tools: [{ name: "send_message" }] } });
+    });
+    const remoteResult = await connectMcpSession(config, {
+      fetch: remote.fetchImpl,
+      toolExposure: "deferred",
+    });
+    await expect(remoteResult.searchTools("boom")).resolves.toEqual([]);
+    await expect(remoteResult.searchTools("send")).resolves.toEqual(["mcp__t3-code__send_message"]);
+    expect(remoteResult.tools.map((tool) => tool.name)).toContain("mcp__t3-code__send_message");
   });
 
   it("does not search when the session is eager", async () => {

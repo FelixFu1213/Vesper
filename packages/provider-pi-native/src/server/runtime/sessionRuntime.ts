@@ -1463,11 +1463,13 @@ export class NativePiSessionRuntime {
     const append = state.pendingAppend;
     state.pendingAppend = [];
     if (install !== null) this.#agent.state.messages = install;
+    const tools = this.#declaredTools();
+    this.#agent.state.tools = tools;
     // The declared tools ride on the context, so a ToolSearch activation is callable next step.
     return {
       context: {
         messages: install ?? context.context.messages,
-        tools: this.#declaredTools(),
+        tools,
       },
       ...(append.length === 0 ? {} : { messages: append }),
     };
@@ -1866,6 +1868,7 @@ export class NativePiSessionRuntime {
     this.#agent.state.messages = leading === undefined ? converted : [leading, ...converted];
     this.#todos = EMPTY_TODO_SNAPSHOT;
     this.#clearTrackers();
+    this.#registry.resetActivation();
     this.#rebuildTools();
   }
 
@@ -1878,6 +1881,7 @@ export class NativePiSessionRuntime {
     this.#agent.state.messages = leading === undefined ? kept : [leading, ...kept];
     this.#todos = restoreTodosFromMessages(kept);
     this.#clearTrackers();
+    this.#registry.resetActivation();
     this.#rebuildTools();
   }
 
@@ -1910,6 +1914,7 @@ export class NativePiSessionRuntime {
     if (contextText !== undefined && contextText.trim() !== "") {
       this.#contextText = contextText;
     }
+    this.#registry.resetActivation();
     this.#rebuildTools();
   }
 
