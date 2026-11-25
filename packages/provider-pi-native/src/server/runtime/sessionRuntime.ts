@@ -41,6 +41,7 @@ import type {
 } from "@t3tools/provider-core/server/ProviderAdapter";
 import type { McpProviderSessionConfig } from "@t3tools/provider-core/server/mcpSession";
 import * as DateTime from "effect/DateTime";
+import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
 import type { PiNativeSettings } from "../../settings.ts";
@@ -102,6 +103,11 @@ import {
   type ProviderRetrySleep,
 } from "./providerRetry.ts";
 import { WorkspaceSandbox } from "./sandbox.ts";
+import type {
+  PersistedCompactionCheckpoint,
+  PersistedTranscriptRecord,
+  PiNativeSessionStoreService,
+} from "./sessionStore.ts";
 import {
   probeLoginShellPath,
   resolveTurnShell,
@@ -124,6 +130,7 @@ import {
   SystemTranscriptManager,
   type SystemSectionMap,
 } from "./systemTranscript.ts";
+import { serializeSystemMessage, SystemTranscriptJournal } from "./systemTranscriptJournal.ts";
 import {
   createPiNativeTools,
   EMPTY_TODO_SNAPSHOT,
@@ -131,6 +138,7 @@ import {
   type TodoSnapshot,
 } from "./tools.ts";
 import { resolveBatchExecutionMode } from "./toolExecutionPolicy.ts";
+import { restoreTodosFromMessages, restoreTranscript } from "./transcriptRecovery.ts";
 
 const host = globalThis as unknown as {
   readonly Date: { now: () => number };
@@ -362,6 +370,9 @@ export interface NativePiSessionRuntimeOptions {
   /** Test seam for the Unix login-shell PATH probe; defaults to the real, cached probe. */
   readonly loginShellPath?: (() => Promise<string | null>) | undefined;
   readonly calibration?: ContextEstimateCalibration | undefined;
+  /** Durable transcript owner; optional so adapter tests run without a database. */
+  readonly sessionStore?: PiNativeSessionStoreService | undefined;
+  readonly providerThreadId?: string | undefined;
   /** Discovery seam: tests inject a fixed catalog instead of walking the real filesystem. */
   readonly discoverSkills?:
     | ((input: DiscoverPiNativeSkillsInput) => Promise<PiNativeSkillDiscovery>)
@@ -560,53 +571,11 @@ const splitUserTurns = (messages: readonly AgentMessage[]): AgentMessage[][] => 
   return turns;
 };
 
-const isTodoStep = (value: unknown): value is TodoSnapshot["steps"][number] => {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
-  const record = value as Record<string, unknown>;
-  return (
-    typeof record.id === "string" &&
-    record.id.trim() !== "" &&
-    typeof record.text === "string" &&
-    record.text.trim() !== "" &&
-    (record.status === "pending" || record.status === "running" || record.status === "completed")
-  );
-};
-
-const isTodoSnapshot = (value: unknown): value is TodoSnapshot => {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
-  const record = value as Record<string, unknown>;
-  if (
-    typeof record.revision !== "number" ||
-    !Number.isFinite(record.revision) ||
-    record.revision < 0
-  )
-    return false;
-  if (!Array.isArray(record.steps) || !record.steps.every(isTodoStep)) return false;
-  return record.explanation === undefined || typeof record.explanation === "string";
-};
-
 const cloneTodoSnapshot = (snapshot: TodoSnapshot): TodoSnapshot => ({
   revision: snapshot.revision,
   steps: snapshot.steps.map((step) => ({ ...step })),
   ...(snapshot.explanation === undefined ? {} : { explanation: snapshot.explanation }),
 });
-
-const restoreTodosFromMessages = (messages: ReadonlyArray<AgentMessage>): TodoSnapshot => {
-  let latest: TodoSnapshot = EMPTY_TODO_SNAPSHOT;
-  for (const message of messages) {
-    if (
-      message.role !== "toolResult" ||
-      message.toolName !== "TodoWrite" ||
-      message.isError === true
-    )
-      continue;
-    const details = (message as { readonly details?: unknown }).details;
-    if (isTodoSnapshot(details)) {
-      latest = cloneTodoSnapshot(details);
-    }
-  }
-  return latest;
-};
 
 const formatGoalForSummary = (goal: OrchestrationV2ProviderGoal | null): string | undefined => {
   if (goal === null || (goal.status !== "active" && goal.status !== "paused")) return undefined;
@@ -769,6 +738,17 @@ export class NativePiSessionRuntime {
   readonly #instructions: ProjectInstructionTracker;
   readonly #customAppend: string | undefined;
   #sequence = 0;
+  readonly #store: PiNativeSessionStoreService | null;
+  readonly #persistenceKey: string;
+  readonly #journal = new SystemTranscriptJournal();
+  readonly #recordIds = new WeakMap<AgentMessage, string>();
+  #restoredMessages = new WeakSet<AgentMessage>();
+  #recordSequence = 0;
+  #turnCursor = 0;
+  #lastRecordId: string | null = null;
+  #writeTail: Promise<void> = Promise.resolve();
+  #restoredTranscript = false;
+  #hydrating: Promise<boolean> | null = null;
 
   private constructor(
     options: NativePiSessionRuntimeOptions,
@@ -779,6 +759,8 @@ export class NativePiSessionRuntime {
     this.#options = options;
     this.#skills = skills;
     this.#now = options.now ?? (() => host.Date.now());
+    this.#store = options.sessionStore ?? null;
+    this.#persistenceKey = options.providerThreadId?.trim() || "";
     this.#sessionId =
       options.threadId !== undefined && options.threadId.trim() !== ""
         ? options.threadId.trim()
@@ -1068,6 +1050,7 @@ export class NativePiSessionRuntime {
           ...(update.explanation === undefined ? {} : { explanation: update.explanation }),
         };
         this.#todos = snapshot;
+        this.#persistAsync();
         this.#emit({
           type: "todo_updated",
           itemId: `todo:${++this.#sequence}`,
@@ -1456,6 +1439,7 @@ export class NativePiSessionRuntime {
         this.#handleAssistantEvent(state, event.assistantMessageEvent);
         return;
       case "message_end":
+        this.#persistAsync([event.message]);
         if (event.message.role === "assistant") this.#finishAssistantMessage(state, event.message);
         return;
       case "tool_execution_start":
@@ -1468,6 +1452,9 @@ export class NativePiSessionRuntime {
         this.#endTool(state, event.toolCallId, event.toolName, event.result, event.isError);
         return;
       case "turn_end":
+        this.#persistAsync(event.toolResults);
+        this.#coalescer.flushAll();
+        return;
       case "agent_end":
         this.#coalescer.flushAll();
         return;
@@ -1686,6 +1673,8 @@ export class NativePiSessionRuntime {
     let messages = request.context.messages;
     if (delta !== null) messages = syncToolActivation(messages, delta);
     const tools = this.#declaredTools();
+    await this.#appendNewRecords(this.#agent.state.messages);
+    await this.#appendSystemDeclarations(messages);
     if (this.#backgroundNotes.length > 0) {
       const notes = this.#backgroundNotes.splice(0);
       messages = [
@@ -1984,28 +1973,30 @@ export class NativePiSessionRuntime {
       summary: checkpoint.summary,
       ...(checkpoint.failureReason === null ? {} : { failureReason: checkpoint.failureReason }),
     });
+    await this.#persistCheckpoint(checkpoint, source, installed);
     return { messages: installed, summarizedMessageCount: checkpoint.summarizedMessageCount };
   }
 
   async compactManually(instructions?: string): Promise<NativeManualCompactionResult> {
+    const source = this.#agent.state.messages;
     const checkpoint: CompactionCheckpoint = await buildCompactionCheckpoint({
-      messages: this.#agent.state.messages,
+      messages: source,
       mode: "completed_turn",
       model: this.#binding.model,
       timestamp: this.#now(),
       summarizeFn: this.#makeSummarizeFn(),
       pinnedRecentTurns: 1,
     });
-    let installed = installCompactionCheckpoint(this.#agent.state.messages, checkpoint);
+    const installedBase = installCompactionCheckpoint(source, checkpoint);
+    let instructionMessage: UserMessage | undefined;
+    let installed: AgentMessage[] = installedBase;
     if (instructions !== undefined && instructions.trim() !== "") {
-      installed = [
-        ...installed,
-        {
-          role: "user",
-          content: `<compaction_instructions>${instructions.trim()}</compaction_instructions>`,
-          timestamp: this.#now(),
-        } satisfies UserMessage,
-      ];
+      instructionMessage = {
+        role: "user",
+        content: `<compaction_instructions>${instructions.trim()}</compaction_instructions>`,
+        timestamp: this.#now(),
+      };
+      installed = [...installedBase, instructionMessage];
     }
     this.#agent.state.messages = installed;
     this.#reminders.reset();
@@ -2020,6 +2011,11 @@ export class NativePiSessionRuntime {
       summary: checkpoint.summary,
       ...(checkpoint.failureReason === null ? {} : { failureReason: checkpoint.failureReason }),
     });
+    await this.#persistCheckpoint(checkpoint, source, installedBase);
+    if (instructionMessage !== undefined) {
+      await this.#appendNewRecords([instructionMessage]);
+    }
+    await this.#persistMeta();
     return {
       beforeTokenCount: checkpoint.beforeTokens,
       afterTokenCount: after,
@@ -2128,6 +2124,8 @@ export class NativePiSessionRuntime {
       content: buildUserContent(input.text, input.images ?? []),
       timestamp: this.#now(),
     };
+    // Durable before dispatch: a crash after this point must not lose the user turn.
+    await this.#appendNewRecords([prompt]);
     // `pi-agent-core` keeps the thinking level across turns, so a boost must not leak forward.
     try {
       await this.#agent.prompt(prompt);
@@ -2154,6 +2152,7 @@ export class NativePiSessionRuntime {
     this.#coalescer.flushAll();
     this.#cancelUnreadSteers(state);
     this.#active = null;
+    await this.persistCurrentTranscript().catch(() => undefined);
     const outcome = this.#outcome(state);
     if (outcome.status === "interrupted" && this.#goal?.status === "active") {
       const snapshot = this.#snapshotGoalWithElapsed();
@@ -2278,6 +2277,7 @@ export class NativePiSessionRuntime {
     if (this.#disposed) return;
     this.#disposed = true;
     await this.abort();
+    await this.#writeTail;
     await this.#subagents?.stopAll("interrupted");
     await this.#backgroundJobs.stopAll();
     await this.#scratch.cleanup();
@@ -2311,6 +2311,7 @@ export class NativePiSessionRuntime {
   /** App threads can hand over new model context between turns; sections re-diff on the next request. */
   applyContextText(contextText: string): void {
     this.#contextText = contextText;
+    this.#persistAsync();
   }
 
   #leadingSystem(): AgentMessage | undefined {
@@ -2321,6 +2322,240 @@ export class NativePiSessionRuntime {
     this.#anchors = new FileSnapshotStore();
     this.#registers = new NamedRegisters();
     this.#recovery = new MutationRecoveryTracker();
+  }
+
+  get hasPersistedTranscript(): boolean {
+    return this.#restoredTranscript;
+  }
+
+  #newRecordId(): string {
+    return `pi-native-record-${host.crypto.randomUUID()}`;
+  }
+
+  #enqueueWrite(work: () => Promise<void>): Promise<void> {
+    const next = this.#writeTail.then(work);
+    this.#writeTail = next.catch(() => undefined);
+    return next;
+  }
+
+  /** Base64 never reaches durable rows; an admitted ref is the only restorable form. */
+  #serializeMessage(message: AgentMessage): string {
+    if (
+      (message.role !== "user" && message.role !== "toolResult") ||
+      typeof message.content === "string"
+    ) {
+      return JSON.stringify(message);
+    }
+    const content = message.content.map((block) => {
+      if (block.type !== "image") return block;
+      const ref = (block as { readonly ref?: string }).ref;
+      return {
+        type: "image" as const,
+        data: "",
+        mimeType: block.mimeType,
+        ...(ref === undefined || ref === "" ? {} : { ref }),
+      };
+    });
+    return JSON.stringify({ ...message, content });
+  }
+
+  async #appendNewRecords(messages: readonly AgentMessage[]): Promise<void> {
+    const store = this.#store;
+    if (store === null || this.#persistenceKey === "") return;
+    const records: PersistedTranscriptRecord[] = [];
+    for (const message of messages) {
+      if (message.role === "system") continue;
+      if (this.#recordIds.has(message) || this.#restoredMessages.has(message)) continue;
+      const id = this.#newRecordId();
+      const turnIndex =
+        message.role === "user" ? this.#turnCursor++ : Math.max(0, this.#turnCursor - 1);
+      this.#recordIds.set(message, id);
+      this.#lastRecordId = id;
+      records.push({
+        id,
+        providerThreadId: this.#persistenceKey,
+        sequence: this.#recordSequence++,
+        turnIndex,
+        role: message.role,
+        timestampMs: message.timestamp,
+        messageJson: this.#serializeMessage(message),
+        system: null,
+      });
+    }
+    if (records.length === 0) return;
+    await this.#enqueueWrite(() =>
+      Effect.runPromise(store.appendRecords({ providerThreadId: this.#persistenceKey, records })),
+    );
+  }
+
+  async #appendSystemDeclarations(messages: readonly AgentMessage[]): Promise<void> {
+    const store = this.#store;
+    if (store === null || this.#persistenceKey === "") return;
+    const declarations = this.#journal.declare(
+      messages,
+      (message) => this.#recordIds.get(message),
+      () => this.#newRecordId(),
+    );
+    if (declarations.length === 0) return;
+    const records: PersistedTranscriptRecord[] = declarations.map((declaration) => ({
+      id: declaration.id,
+      providerThreadId: this.#persistenceKey,
+      sequence: this.#recordSequence++,
+      // System rows survive every turn rollback.
+      turnIndex: -1,
+      role: "system",
+      timestampMs: declaration.timestampMs,
+      messageJson: declaration.messageJson,
+      system: {
+        version: 1,
+        beforeMessageId: declaration.beforeMessageId,
+        afterMessageId: declaration.afterMessageId,
+      },
+    }));
+    await this.#enqueueWrite(() =>
+      Effect.runPromise(store.appendRecords({ providerThreadId: this.#persistenceKey, records })),
+    );
+    for (const declaration of declarations) {
+      this.#journal.markPersisted(declaration.message, declaration.id);
+    }
+  }
+
+  async #persistMeta(): Promise<void> {
+    const store = this.#store;
+    if (store === null || this.#persistenceKey === "") return;
+    const meta = {
+      providerThreadId: this.#persistenceKey,
+      todosJson: JSON.stringify(this.#todos),
+      contextText: this.#contextText ?? null,
+      activatedToolNamesJson: JSON.stringify(this.#agent.state.tools.map((tool) => tool.name)),
+      updatedAtMs: this.#now(),
+    };
+    await this.#enqueueWrite(() => Effect.runPromise(store.saveMeta(meta)));
+  }
+
+  async #persistCheckpoint(
+    checkpoint: CompactionCheckpoint,
+    sourceMessages: readonly AgentMessage[],
+    installedMessages: readonly AgentMessage[],
+  ): Promise<void> {
+    const store = this.#store;
+    if (store === null || this.#persistenceKey === "") return;
+    const leadingSystemJson =
+      checkpoint.leadingSystem === undefined
+        ? null
+        : serializeSystemMessage(checkpoint.leadingSystem);
+    if (leadingSystemJson !== null) this.#journal.rememberCheckpoint(leadingSystemJson);
+    let throughMessageId: string | null = null;
+    for (let index = sourceMessages.length - 1; index >= 0; index -= 1) {
+      const candidate = sourceMessages[index];
+      if (candidate === undefined || candidate.role === "system") continue;
+      const id = this.#recordIds.get(candidate);
+      if (id !== undefined) {
+        throughMessageId = id;
+        break;
+      }
+    }
+    if (throughMessageId === null) throughMessageId = this.#lastRecordId;
+    for (const message of installedMessages) {
+      if (message.role === "system") {
+        this.#journal.markPersisted(message, this.#newRecordId());
+      } else {
+        this.#restoredMessages.add(message);
+      }
+    }
+    const record: PersistedCompactionCheckpoint = {
+      providerThreadId: this.#persistenceKey,
+      throughMessageId,
+      mode: checkpoint.mode,
+      summary: checkpoint.summary,
+      leadingSystemJson,
+      retainedMessagesJson: JSON.stringify(
+        checkpoint.retainedMessages.map((message) => JSON.parse(this.#serializeMessage(message))),
+      ),
+      summarizedMessageCount: checkpoint.summarizedMessageCount,
+      chunkCount: checkpoint.chunkCount,
+      usedFallback: checkpoint.usedFallback,
+      createdAtMs: checkpoint.timestamp,
+    };
+    await this.#enqueueWrite(() => Effect.runPromise(store.saveCheckpoint(record)));
+  }
+
+  /** Flushes user/assistant/tool/system rows and metadata for the current state. */
+  async persistCurrentTranscript(): Promise<void> {
+    if (this.#store === null || this.#persistenceKey === "") return;
+    await this.#appendNewRecords(this.#agent.state.messages);
+    await this.#appendSystemDeclarations(this.#agent.state.messages);
+    await this.#persistMeta();
+  }
+
+  #persistAsync(messages?: readonly AgentMessage[]): void {
+    if (this.#store === null || this.#persistenceKey === "") return;
+    void (async () => {
+      if (messages !== undefined) await this.#appendNewRecords(messages);
+      else await this.persistCurrentTranscript();
+    })().catch(() => undefined);
+  }
+
+  /** Restores the durable transcript; false when this thread has no native rows yet. */
+  restorePersistedSession(): Promise<boolean> {
+    if (this.#hydrating !== null) return this.#hydrating;
+    this.#hydrating = (async () => {
+      const store = this.#store;
+      if (store === null || this.#persistenceKey === "") return false;
+      const snapshot = await Effect.runPromise(store.loadThread(this.#persistenceKey)).catch(
+        () => null,
+      );
+      if (snapshot === null || snapshot.records.length === 0) return false;
+      const model = this.#binding.model;
+      const restored = await restoreTranscript({
+        snapshot,
+        model: { api: model.api, provider: model.provider, model: model.id },
+        now: this.#now(),
+        supportsVision: this.#binding.supportsImages,
+      }).catch(() => null);
+      if (restored === null) return false;
+      this.#agent.state.messages = [...restored.messages];
+      this.#todos = cloneTodoSnapshot(restored.todos);
+      if (
+        this.#contextText === undefined &&
+        snapshot.meta?.contextText !== null &&
+        snapshot.meta?.contextText !== undefined
+      ) {
+        this.#contextText = snapshot.meta.contextText;
+      }
+      this.#restoredTranscript = true;
+      this.#recordSequence = snapshot.records.reduce(
+        (next: number, record: PersistedTranscriptRecord) => Math.max(next, record.sequence + 1),
+        0,
+      );
+      this.#lastRecordId =
+        [...snapshot.records].reverse().find((record) => record.system === null)?.id ?? null;
+      this.#turnCursor = snapshot.records.reduce(
+        (next: number, record: PersistedTranscriptRecord) =>
+          record.turnIndex < 0 ? next : Math.max(next, record.turnIndex + 1),
+        0,
+      );
+      if (snapshot.checkpoint?.leadingSystemJson) {
+        this.#journal.rememberCheckpoint(snapshot.checkpoint.leadingSystemJson);
+      }
+      for (const [message, id] of restored.recordIds) {
+        this.#recordIds.set(message, id);
+      }
+      for (const message of this.#agent.state.messages) {
+        this.#restoredMessages.add(message);
+        if (message.role === "system") {
+          this.#journal.markPersisted(
+            message,
+            restored.recordIds.get(message) ?? this.#newRecordId(),
+          );
+        }
+      }
+      this.#clearTrackers();
+      this.#registry.resetActivation();
+      this.#rebuildTools();
+      return true;
+    })();
+    return this.#hydrating;
   }
 
   rehydrateFromHistory(
@@ -2353,12 +2588,15 @@ export class NativePiSessionRuntime {
     const leading = this.#leadingSystem();
     this.#agent.state.messages = leading === undefined ? converted : [leading, ...converted];
     this.#todos = EMPTY_TODO_SNAPSHOT;
+    this.#restoredMessages = new WeakSet();
+    this.#restoredTranscript = false;
+    this.#turnCursor = converted.filter((message) => message.role === "user").length;
     this.#clearTrackers();
     this.#registry.resetActivation();
     this.#rebuildTools();
   }
 
-  truncateToTurn(targetTurnCount: number): void {
+  async truncateToTurn(targetTurnCount: number): Promise<void> {
     const leading = this.#leadingSystem();
     const turns = splitUserTurns(
       this.#agent.state.messages.filter((message) => message.role !== "system"),
@@ -2366,9 +2604,27 @@ export class NativePiSessionRuntime {
     const kept = turns.slice(0, Math.max(0, targetTurnCount)).flat();
     this.#agent.state.messages = leading === undefined ? kept : [leading, ...kept];
     this.#todos = restoreTodosFromMessages(kept);
+    this.#turnCursor = Math.min(Math.max(0, targetTurnCount), turns.length);
+    this.#lastRecordId = null;
+    for (const message of this.#agent.state.messages) {
+      const id = this.#recordIds.get(message);
+      if (id !== undefined) this.#lastRecordId = id;
+    }
     this.#clearTrackers();
     this.#registry.resetActivation();
     this.#rebuildTools();
+    const store = this.#store;
+    if (store !== null && this.#persistenceKey !== "") {
+      await this.#enqueueWrite(() =>
+        Effect.runPromise(
+          store.truncateAfterTurn({
+            providerThreadId: this.#persistenceKey,
+            targetTurnCount,
+          }),
+        ),
+      );
+      await this.#persistMeta();
+    }
   }
 
   cloneForFork(targetTurnCount?: number): NativeForkClone {
@@ -2400,6 +2656,10 @@ export class NativePiSessionRuntime {
     if (contextText !== undefined && contextText.trim() !== "") {
       this.#contextText = contextText;
     }
+    this.#restoredMessages = new WeakSet();
+    this.#restoredTranscript = false;
+    this.#turnCursor = messages.filter((message) => message.role === "user").length;
+    this.#clearTrackers();
     this.#registry.resetActivation();
     this.#rebuildTools();
   }

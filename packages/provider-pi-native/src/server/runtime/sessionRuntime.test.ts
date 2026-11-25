@@ -378,13 +378,13 @@ describe("NativePiSessionRuntime", () => {
     await harness.runtime.runTurn({ text: "second" });
     assert.equal(harness.runtime.todos.revision, 2);
 
-    harness.runtime.truncateToTurn(1);
+    await harness.runtime.truncateToTurn(1);
     assert.deepStrictEqual(harness.runtime.todos, {
       revision: 1,
       steps: [{ id: "1", text: "Turn 1", status: "running" }],
     });
 
-    harness.runtime.truncateToTurn(0);
+    await harness.runtime.truncateToTurn(0);
     assert.deepStrictEqual(harness.runtime.todos, { revision: 0, steps: [] });
     await harness.runtime.dispose();
   });
@@ -784,7 +784,7 @@ describe("NativePiSessionRuntime", () => {
     const compacted = await harness.runtime.compactManually();
     assert.isAbove(compacted.summary.length, 0);
     assert.isAbove(compacted.beforeTokenCount, 0);
-    harness.runtime.truncateToTurn(1);
+    await harness.runtime.truncateToTurn(1);
     assert.lengthOf(harness.runtime.getSnapshot().turnBoundaries, 1);
     await harness.runtime.dispose();
   });
@@ -1502,7 +1502,7 @@ describe("NativePiSessionRuntime", () => {
     });
     await harness.runtime.runTurn({ text: "turn one" });
     harness.runtime.activateTools(["TodoRead"]);
-    harness.runtime.truncateToTurn(0);
+    await harness.runtime.truncateToTurn(0);
     await harness.runtime.runTurn({ text: "turn after rollback" });
     const declaredAfterRollback = (harness.streamFn.calls[2]?.context.messages ?? []).flatMap(
       (message) =>
