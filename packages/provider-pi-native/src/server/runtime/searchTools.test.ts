@@ -19,8 +19,19 @@ import {
 const windows = HostProcess.Platform.defaultValue() === "win32";
 const SEARCH_MAX_LINE_CHARS = 16_384;
 
-const mintFileTag = (content: string): string =>
-  NodeCrypto.createHash("sha256").update(content).digest("hex").slice(0, 4).toUpperCase();
+const normalizeForTag = (text: string): string =>
+  text
+    .replaceAll("\r\n", "\n")
+    .replaceAll("\r", "\n")
+    .split("\n")
+    .map((line) => line.replace(/[ \t\r]+$/u, ""))
+    .join("\n");
+
+const mintFileTag = (content: string): string => {
+  const digest = NodeCrypto.createHash("sha256").update(normalizeForTag(content), "utf8").digest();
+  const low = ((digest[30] ?? 0) << 8) | (digest[31] ?? 0);
+  return low.toString(16).toUpperCase().padStart(4, "0");
+};
 
 const withDirectory = async (body: (directory: string) => Promise<void>): Promise<void> => {
   const directory = await NodeFSP.realpath(
@@ -61,7 +72,7 @@ describe("searchFiles", () => {
   it("returns content hits newest first with tags and workspace ignores", async () => {
     await withDirectory(async (directory) => {
       const older = await write(directory, "src/a.ts", "first\nconst needle = 1;\n");
-      const newer = await write(directory, "src/b.ts", "needle\n");
+      const newer = await write(directory, "src/b.ts", "needle  \r\n");
       await setModified(older, 1_000);
       await setModified(newer, 2_000);
       await write(directory, "node_modules/skip.ts", "needle\n");

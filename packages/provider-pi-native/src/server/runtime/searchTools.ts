@@ -186,8 +186,19 @@ const clipLine = (line: string): { readonly text: string; readonly clipped: bool
   return { text: chars.slice(0, SEARCH_MAX_LINE_CHARS).join(""), clipped: true };
 };
 
-const mintFileTag = (content: string): string =>
-  NodeCrypto.createHash("sha256").update(content).digest("hex").slice(0, 4).toUpperCase();
+const normalizeForTag = (text: string): string =>
+  text
+    .replaceAll("\r\n", "\n")
+    .replaceAll("\r", "\n")
+    .split("\n")
+    .map((line) => line.replace(/[ \t\r]+$/u, ""))
+    .join("\n");
+
+const mintFileTag = (content: string): string => {
+  const digest = NodeCrypto.createHash("sha256").update(normalizeForTag(content), "utf8").digest();
+  const low = ((digest[30] ?? 0) << 8) | (digest[31] ?? 0);
+  return low.toString(16).toUpperCase().padStart(4, "0");
+};
 
 export const describeDirectoryReadHint = (target: string): string =>
   `Read requires a file, but ${target} is a directory; use Glob with path=${JSON.stringify(target)} and pattern="**/*" (activate Glob first if it is deferred).`;
