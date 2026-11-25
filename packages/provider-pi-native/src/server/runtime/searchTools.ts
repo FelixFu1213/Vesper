@@ -20,6 +20,7 @@ export type SearchOutputMode = "content" | "filesWithMatches" | "count";
 export const PATH_PARAM_ALIASES = { file_path: "path" } as const;
 export const SEARCH_PARAM_ALIASES = {
   query: "pattern",
+  glob: "include",
   output_mode: "outputMode",
   head_limit: "headLimit",
 } as const;
@@ -92,6 +93,7 @@ export interface GrepSearchOptions {
   readonly headLimit: number;
   readonly globalIgnoreFile?: string | null;
   readonly rgPath?: string | null;
+  readonly stdoutCapBytes?: number;
   readonly anchorSink?: SearchFileAnchorSink;
 }
 
@@ -326,7 +328,12 @@ interface RgRun {
   readonly failed: boolean;
 }
 
-const runRg = (rgPath: string, args: ReadonlyArray<string>, cwd: string): Promise<RgRun> =>
+const runRg = (
+  rgPath: string,
+  args: ReadonlyArray<string>,
+  cwd: string,
+  stdoutCapBytes: number,
+): Promise<RgRun> =>
   new Promise((resolve) => {
     let settled = false;
     let stdout = "";
@@ -352,8 +359,8 @@ const runRg = (rgPath: string, args: ReadonlyArray<string>, cwd: string): Promis
     child.stdout?.on("data", (chunk: Buffer) => {
       if (capped) return;
       received += chunk.length;
-      if (received > SEARCH_STDOUT_CAP_BYTES) {
-        const keep = Math.max(0, chunk.length - (received - SEARCH_STDOUT_CAP_BYTES));
+      if (received > stdoutCapBytes) {
+        const keep = Math.max(0, chunk.length - (received - stdoutCapBytes));
         stdout += chunk.subarray(0, keep).toString("utf8");
         capped = true;
         child.kill("SIGKILL");
@@ -413,7 +420,9 @@ const parseRgHits = (stdout: string, ignoreRoot: string): ReadonlyArray<RawSearc
 const systemRgSearch = async (
   options: GrepSearchOptions,
   rules: WorkspaceIgnoreRules,
-): Promise<ReadonlyArray<RawSearchFile> | undefined> => {
+): Promise<
+  { readonly files: ReadonlyArray<RawSearchFile>; readonly capped: boolean } | undefined
+> => {
   if (options.rgPath === null) return undefined;
   const args = ["--json", "--no-config", "--hidden"];
   if (options.outputMode === "filesWithMatches") {
@@ -427,7 +436,12 @@ const systemRgSearch = async (
   if (options.include !== undefined) args.push("--glob", options.include);
   args.push("-e", options.pattern, "--", options.root);
 
-  const run = await runRg(options.rgPath ?? "rg", args, options.ignoreRoot);
+  const run = await runRg(
+    options.rgPath ?? "rg",
+    args,
+    options.ignoreRoot,
+    options.stdoutCapBytes ?? SEARCH_STDOUT_CAP_BYTES,
+  );
   if (run.failed) return undefined;
   if (!run.capped && run.code !== 0 && run.code !== 1) return undefined;
 
@@ -441,7 +455,7 @@ const systemRgSearch = async (
       continue;
     }
   }
-  return withTimes;
+  return { files: withTimes, capped: run.capped };
 };
 
 const loadContent = async (
@@ -458,6 +472,7 @@ const loadContent = async (
 const finishSearch = async (
   options: GrepSearchOptions,
   rawFiles: ReadonlyArray<RawSearchFile>,
+  stdoutCapped = false,
 ): Promise<GrepSearchResult> => {
   const contentCache = new Map<string, string | undefined>();
   const sorted = sortNewestFirst(rawFiles);
@@ -467,7 +482,7 @@ const finishSearch = async (
     const totalAvailable = sorted.reduce((sum, file) => sum + file.hits.length, 0);
     let shown = 0;
     let bytes = 0;
-    let truncated = false;
+    let truncated = stdoutCapped;
     for (const rawFile of sorted) {
       const content = await loadContent(contentCache, rawFile.path);
       const tag = content === undefined ? "" : mintFileTag(content);
@@ -508,7 +523,7 @@ const finishSearch = async (
   }
 
   const limited = sorted.slice(0, options.headLimit);
-  const truncated = sorted.length > options.headLimit;
+  const truncated = stdoutCapped || sorted.length > options.headLimit;
   const files: Array<GrepFileResult> = [];
   for (const rawFile of limited) {
     const content = await loadContent(contentCache, rawFile.path);
@@ -543,8 +558,8 @@ export const searchFiles = async (options: GrepSearchOptions): Promise<GrepSearc
       : { globalIgnoreFile: options.globalIgnoreFile }),
   });
   const fromRg = await systemRgSearch(options, rules);
-  const rawFiles = fromRg ?? (await searchInProcess(options, rules));
-  return finishSearch(options, rawFiles);
+  const rawFiles = fromRg?.files ?? (await searchInProcess(options, rules));
+  return finishSearch(options, rawFiles, fromRg?.capped ?? false);
 };
 
 export const globFiles = async (options: GlobSearchOptions): Promise<GlobSearchResult> => {

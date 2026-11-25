@@ -11,6 +11,7 @@ import {
   describeDirectoryReadHint,
   globFiles,
   normalizeOutputMode,
+  SEARCH_PARAM_ALIASES,
   searchFiles,
   type SearchFileAnchorSink,
 } from "./searchTools.ts";
@@ -255,6 +256,35 @@ describe("searchFiles", () => {
       expect(result.totalMatches).toBe(1);
     });
   });
+
+  it.skipIf(windows)("propagates truncated when rg stdout hits stdoutCapBytes", async () => {
+    await withDirectory(async (directory) => {
+      const target = await write(directory, "a.ts", "const needle = 1;\n");
+      const event = JSON.stringify({
+        type: "match",
+        data: {
+          path: { text: target },
+          line_number: 1,
+          lines: { text: "const needle = 1;\n" },
+        },
+      });
+      const rg = await script(
+        directory,
+        "capped-rg",
+        `#!/bin/sh\nprintf '%s\\n' '${event}'\nprintf '%s\\n' '${event}'\n`,
+      );
+      const result = await searchFiles({
+        ...baseOptions(directory),
+        pattern: "needle",
+        outputMode: "filesWithMatches",
+        caseInsensitive: false,
+        headLimit: 200,
+        rgPath: rg,
+        stdoutCapBytes: 32,
+      });
+      expect(result.truncated).toBe(true);
+    });
+  });
 });
 
 describe("globFiles", () => {
@@ -290,10 +320,22 @@ describe("parameter aliases", () => {
   it("folds alias spellings onto canonical names", () => {
     expect(
       canonicalizeToolParams(
-        { file_path: "/tmp/a.ts", query: "needle", output_mode: "count", head_limit: 5 },
-        { file_path: "path", query: "pattern", output_mode: "outputMode", head_limit: "headLimit" },
+        {
+          file_path: "/tmp/a.ts",
+          query: "needle",
+          glob: "*.ts",
+          output_mode: "count",
+          head_limit: 5,
+        },
+        { file_path: "path", ...SEARCH_PARAM_ALIASES },
       ),
-    ).toEqual({ path: "/tmp/a.ts", pattern: "needle", outputMode: "count", headLimit: 5 });
+    ).toEqual({
+      path: "/tmp/a.ts",
+      pattern: "needle",
+      include: "*.ts",
+      outputMode: "count",
+      headLimit: 5,
+    });
   });
 
   it("keeps the canonical value when both spellings are present", () => {

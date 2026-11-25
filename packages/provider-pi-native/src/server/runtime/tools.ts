@@ -395,6 +395,7 @@ const GREP_PARAMS = obj({
   query: opt(str({ description: "Alias for pattern." })),
   path: opt(str({ description: "Directory or file to search; defaults to the workspace folder." })),
   include: opt(str({ description: 'Only search files matching this glob, such as "*.ts".' })),
+  glob: opt(str({ description: "Alias for include." })),
   outputMode: opt(
     str({ description: "content, filesWithMatches, or count. Defaults to content." }),
   ),
