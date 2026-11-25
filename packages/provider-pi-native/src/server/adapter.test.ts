@@ -2,6 +2,8 @@
 import { assert, describe, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
+  ChatAttachmentId,
+  CheckpointId,
   EnvironmentId,
   MessageId,
   NodeId,
@@ -19,6 +21,7 @@ import {
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import * as TestProviderHost from "@t3tools/provider-testing/TestProviderHost";
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 import type { AssistantMessageEventStream, Model, Api } from "@earendil-works/pi-ai";
@@ -45,6 +48,7 @@ import {
   type ScriptedTurn,
 } from "../testing.ts";
 import { makePiNativeAdapterV2, PI_NATIVE_DRIVER_KIND } from "./adapter.ts";
+import { makeInMemoryPiNativeSessionStore } from "./runtime/sessionStore.ts";
 
 const instanceId = ProviderInstanceId.make("piNative");
 const threadId = ThreadId.make("thread-pi-native-test");
@@ -92,8 +96,15 @@ const gatedStream = () => {
   }> = [];
   const queued: ScriptedTurn[] = [];
   let requests = 0;
+  let resolveFirstRequest: () => void = () => undefined;
+  // The adapter owns no runtime until its first provider request, and a steer sent
+  // before that is declined, so a test that steers waits for this.
+  const firstRequest = new Promise<void>((resolve) => {
+    resolveFirstRequest = resolve;
+  });
   const streamFn: StreamFn = (model) => {
     requests += 1;
+    resolveFirstRequest();
     const stream = createAssistantMessageEventStream();
     const turn = queued.shift();
     if (turn === undefined) waiting.push({ model, stream });
@@ -102,6 +113,7 @@ const gatedStream = () => {
   };
   return {
     streamFn,
+    firstRequest,
     requestCount: () => requests,
     release: (turn: ScriptedTurn) => {
       const next = waiting.shift();
@@ -144,6 +156,7 @@ const makeHarness = Effect.fnUntraced(function* (input: {
   readonly fetch?: typeof globalThis.fetch;
   readonly mcpEndpoint?: string;
   readonly appContext?: ProviderAdapter.ProviderAdapterV2TurnInput["appContext"];
+  readonly sessionStore?: ReturnType<typeof makeInMemoryPiNativeSessionStore> | undefined;
 }) {
   const idAllocator = yield* IdAllocator.IdAllocatorV2;
   const policy = input.policy ?? runtimePolicy();
@@ -155,6 +168,7 @@ const makeHarness = Effect.fnUntraced(function* (input: {
     sleep: async () => undefined,
     scheduleTimer: () => () => undefined,
     ...(input.fetch === undefined ? {} : { fetch: input.fetch }),
+    ...(input.sessionStore === undefined ? {} : { sessionStore: input.sessionStore }),
   });
   if (input.mcpEndpoint !== undefined) {
     yield* (yield* McpProviderSessions.McpProviderSessions).set({
@@ -530,6 +544,8 @@ describe("makePiNativeAdapterV2", () => {
     Effect.gen(function* () {
       const harness = yield* makeHarness({
         steps: [
+          // asktool is on demand, so the model activates it before the first call.
+          scriptedToolCallResponse([{ name: "ToolSearch", arguments: { query: "asktool" } }]),
           scriptedToolCallResponse([
             {
               name: "asktool",
@@ -662,6 +678,7 @@ describe("makePiNativeAdapterV2", () => {
         "provider_turn.updated",
         (event) => event.providerTurn.status === "running",
       );
+      yield* Effect.promise(() => gated.firstRequest);
       yield* harness.runtime.steerTurn({
         threadId,
         runId: RunId.make("run-1"),
@@ -712,6 +729,7 @@ describe("makePiNativeAdapterV2", () => {
         "provider_turn.updated",
         (event) => event.providerTurn.status === "running",
       );
+      yield* Effect.promise(() => gated.firstRequest);
       yield* harness.runtime
         .interruptTurn({
           providerThread: harness.providerThread,
@@ -729,6 +747,117 @@ describe("makePiNativeAdapterV2", () => {
         turnItems(harness).every((item) => item.status !== "running" && item.status !== "waiting"),
       );
       void settled;
+    }).pipe(Effect.provide(testLayer())),
+  );
+
+  it.effect("stops a turn gracefully at its next boundary", () =>
+    Effect.gen(function* () {
+      const gated = gatedStream();
+      const harness = yield* makeHarness({ streamFn: gated.streamFn });
+      yield* startTurnOn(harness);
+      const providerTurn = yield* harness.takeEvent(
+        "provider_turn.updated",
+        (event) => event.providerTurn.status === "running",
+      );
+      yield* Effect.promise(() => gated.firstRequest);
+      yield* harness.runtime
+        .interruptTurn({
+          providerThread: harness.providerThread,
+          providerTurnId: providerTurn.providerTurn.id,
+          mode: "graceful",
+        })
+        .pipe(Effect.forkScoped);
+      yield* harness.takeEvent("turn_phase.updated", (event) => event.phase === "stopping");
+      gated.release(scriptedTextResponse("wrapping up"));
+      const terminal = yield* harness.takeEvent("turn.terminal");
+      assert.equal(terminal.status, "interrupted");
+      assert.isNull(terminal.failure);
+      assert.deepStrictEqual(assistantTexts(harness), ["wrapping up"]);
+      assert.equal(gated.requestCount(), 1);
+      assert.include(
+        harness.all.flatMap((event) => (event.type === "turn_phase.updated" ? [event.phase] : [])),
+        "stopping",
+      );
+    }).pipe(Effect.provide(testLayer())),
+  );
+
+  it.effect("keeps steering images for a vision model", () =>
+    Effect.gen(function* () {
+      const host = yield* ProviderHost.ProviderHost;
+      const attachmentId = ChatAttachmentId.make("steer-image");
+      yield* Effect.promise(() =>
+        NodeFSP.writeFile(NodePath.join(host.paths.attachmentsDir, attachmentId), "png-bytes"),
+      );
+      const contexts: Array<{ readonly messages: ReadonlyArray<unknown> }> = [];
+      const gated = gatedStream();
+      const streamFn: StreamFn = (model, context, options) => {
+        contexts.push(context);
+        return gated.streamFn(model, context, options);
+      };
+      const harness = yield* makeHarness({ streamFn });
+      yield* startTurnOn(harness);
+      const providerTurn = yield* harness.takeEvent(
+        "provider_turn.updated",
+        (event) => event.providerTurn.status === "running",
+      );
+      yield* Effect.promise(() => gated.firstRequest);
+      yield* harness.runtime.steerTurn({
+        threadId,
+        runId: RunId.make("run-1"),
+        providerThread: harness.providerThread,
+        providerTurnId: providerTurn.providerTurn.id,
+        message: {
+          messageId: MessageId.make("message-steer-image"),
+          text: "what is this",
+          attachments: [
+            {
+              type: "image",
+              id: attachmentId,
+              name: "shot.png",
+              mimeType: "image/png",
+              sizeBytes: 9,
+            },
+          ],
+          createdBy: "user",
+          creationSource: "web",
+        },
+      });
+      yield* harness.takeEvent("steer.updated");
+      yield* Effect.promise(async () => {
+        gated.release(scriptedTextResponse("first"));
+        gated.release(scriptedTextResponse("second"));
+      });
+      yield* harness.takeEvent("turn.terminal");
+      const steered = contexts[1]?.messages.find((message) => {
+        const content = (message as { readonly content?: unknown }).content;
+        return (
+          Array.isArray(content) &&
+          content.some((block) => (block as { readonly type?: unknown }).type === "image")
+        );
+      });
+      assert.isDefined(steered);
+    }).pipe(Effect.provide(testLayer())),
+  );
+
+  it.effect("forwards ephemeral turn phases", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({ steps: [scriptedTextResponse("hello")] });
+      yield* startTurnOn(harness);
+      yield* harness.takeEvent("turn.terminal");
+      const phases = harness.all.flatMap((event) =>
+        event.type === "turn_phase.updated" ? [event.phase] : [],
+      );
+      assert.deepStrictEqual(phases.slice(0, 4), [
+        "starting",
+        "preparing",
+        "waiting-model",
+        "streaming",
+      ]);
+      assert.isTrue(
+        harness.all
+          .filter((event) => event.type === "turn_phase.updated")
+          .every((event) => event.threadId === threadId),
+      );
     }).pipe(Effect.provide(testLayer())),
   );
 
@@ -1095,6 +1224,49 @@ describe("makePiNativeAdapterV2", () => {
     }).pipe(Effect.provide(testLayer())),
   );
 
+  it.effect("tracks a background Bash job as pending work and stops it by native id", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        steps: [
+          scriptedToolCallResponse([
+            { name: "Bash", arguments: { command: "sleep 30", runInBackground: true } },
+          ]),
+          scriptedTextResponse("job started"),
+        ],
+      });
+      yield* startTurnOn(harness);
+      const terminal = yield* harness.takeEvent("turn.terminal");
+      assert.equal(terminal.status, "completed");
+
+      assert.isTrue(yield* harness.runtime.hasPendingBackgroundWork!);
+      assert.isTrue(
+        yield* harness.runtime.hasPendingBackgroundWorkForThread!(harness.providerThread, {
+          includeSubagents: false,
+        }),
+      );
+      // Reading `all` is deterministic: the pending event precedes the turn terminal.
+      const pending = harness.all.flatMap((event) =>
+        event.type === "background_work.updated" ? [event.pending] : [],
+      );
+      assert.deepEqual(pending, [true]);
+
+      const unknown = yield* harness.runtime.stopSubagent!({
+        providerThread: harness.providerThread,
+        nativeTaskId: "bash:bash-404",
+      });
+      assert.isUndefined(unknown);
+
+      const stopped = yield* harness.runtime.stopSubagent!({
+        providerThread: harness.providerThread,
+        nativeTaskId: "bash:bash-1",
+      });
+      assert.equal(stopped?.status, "cancelled");
+      const settled = yield* harness.takeEvent("background_work.updated");
+      assert.isFalse(settled.pending);
+      assert.isFalse(yield* harness.runtime.hasPendingBackgroundWork!);
+    }).pipe(Effect.provide(testLayer())),
+  );
+
   it.effect("reports the resolved model on the provider turn and passes app context through", () =>
     Effect.gen(function* () {
       const streamFn = createScriptedStreamFn([scriptedTextResponse("context seen")], {
@@ -1200,6 +1372,7 @@ describe("makePiNativeAdapterV2", () => {
       Effect.gen(function* () {
         const harness = yield* makeHarness({
           steps: [
+            scriptedToolCallResponse([{ name: "ToolSearch", arguments: { query: "todo" } }]),
             scriptedToolCallResponse([
               {
                 name: "TodoWrite",
@@ -1403,6 +1576,236 @@ describe("makePiNativeAdapterV2", () => {
       assert.equal(requests[1]?.reasoning, undefined);
       assert.equal(requests[2]?.reasoning, "high");
       assert.equal(requests[3]?.reasoning, undefined);
+    }).pipe(Effect.provide(testLayer())),
+  );
+
+  it.effect("restores tool pairs, checkpoints, rollback, and forks across sessions", () =>
+    Effect.gen(function* () {
+      const store = makeInMemoryPiNativeSessionStore({ durable: true });
+      const recorder = (steps: ScriptedTurn[], contexts: Array<ReadonlyArray<unknown>>) => {
+        const streamFn: StreamFn = (model, context) => {
+          contexts.push(context.messages);
+          const turn = steps.shift();
+          if (turn === undefined) throw new Error("No scripted turn left.");
+          return renderScriptedTurn(model, turn, 0);
+        };
+        return streamFn;
+      };
+      const firstContexts: Array<ReadonlyArray<unknown>> = [];
+      let providerThreadId = "";
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const harness = yield* makeHarness({
+            sessionStore: store,
+            streamFn: recorder(
+              [
+                scriptedToolCallResponse([
+                  { name: "Bash", arguments: { command: "printf hello" } },
+                ]),
+                scriptedTextResponse("done"),
+              ],
+              firstContexts,
+            ),
+          });
+          assert.isTrue(harness.runtime.canResumeAfterRestart);
+          providerThreadId = harness.providerThread.id;
+          yield* startTurnWithText(harness, 1, "first turn");
+          assert.equal((yield* harness.takeEvent("turn.terminal")).status, "completed");
+        }),
+      );
+      const persisted = yield* store.loadThread(providerThreadId);
+      assert.isNotNull(persisted);
+      if (persisted === null) return;
+      assert.isAbove(persisted.records.length, 0);
+
+      const secondContexts: Array<ReadonlyArray<unknown>> = [];
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const harness = yield* makeHarness({
+            sessionStore: store,
+            streamFn: recorder([scriptedTextResponse("after restart")], secondContexts),
+          });
+          assert.equal(harness.providerThread.id, providerThreadId);
+          yield* startTurnOn(harness, 2);
+          assert.equal((yield* harness.takeEvent("turn.terminal")).status, "completed");
+          const wire = JSON.stringify(secondContexts[0] ?? []);
+          assert.include(wire, "toolCall");
+          assert.include(wire, "toolResult");
+          assert.include(wire, "thinking");
+          assert.include(wire, "first turn");
+          assert.include(wire, "hello");
+
+          const forked = yield* harness.runtime.forkThread({
+            sourceProviderThread: harness.providerThread,
+            targetThreadId: ThreadId.make("forked-pi-native-thread"),
+          });
+          const forkedSnapshot = yield* store.loadThread(forked.id);
+          assert.isNotNull(forkedSnapshot);
+          if (forkedSnapshot === null) return;
+          assert.isAbove(forkedSnapshot.records.length, 0);
+
+          yield* harness.runtime.rollbackThread({
+            providerThread: harness.providerThread,
+            target: {
+              type: "thread_start",
+              checkpointId: CheckpointId.make("checkpoint-1"),
+              appRunOrdinal: 0,
+            },
+            providerThreadTurns: [],
+          });
+        }),
+      );
+      const rolledBack = yield* store.loadThread(providerThreadId);
+      assert.isNotNull(rolledBack);
+      if (rolledBack === null) return;
+      assert.deepStrictEqual(
+        rolledBack.records.filter((record) => record.role !== "system"),
+        [],
+      );
+
+      const thirdContexts: Array<ReadonlyArray<unknown>> = [];
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const harness = yield* makeHarness({
+            sessionStore: store,
+            streamFn: recorder([scriptedTextResponse("fresh")], thirdContexts),
+          });
+          assert.equal(harness.providerThread.id, providerThreadId);
+          yield* startTurnOn(harness, 1);
+          assert.equal((yield* harness.takeEvent("turn.terminal")).status, "completed");
+        }),
+      );
+      const afterRollback = JSON.stringify(thirdContexts[0] ?? []);
+      assert.notInclude(afterRollback, "first turn");
+      assert.notInclude(afterRollback, "toolResult");
+    }).pipe(Effect.provide(testLayer())),
+  );
+
+  it.effect(
+    "preserves compaction summaries across restart without duplicating retained messages",
+    () =>
+      Effect.gen(function* () {
+        const store = makeInMemoryPiNativeSessionStore({ durable: true });
+        const recorder = (steps: ScriptedTurn[], contexts: Array<ReadonlyArray<unknown>>) => {
+          const streamFn: StreamFn = (model, context) => {
+            contexts.push(context.messages);
+            const turn = steps.shift();
+            if (turn === undefined) throw new Error("No scripted turn left.");
+            return renderScriptedTurn(model, turn, 0);
+          };
+          return streamFn;
+        };
+        const firstContexts: Array<ReadonlyArray<unknown>> = [];
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const harness = yield* makeHarness({
+              sessionStore: store,
+              streamFn: recorder(
+                [
+                  scriptedTextResponse("answer one"),
+                  scriptedTextResponse("answer two"),
+                  scriptedTextResponse(
+                    "<compaction_summary>\n## Goals\nShip cleanly\n## Progress\nDone turn one\n## Files\n(none)\n## Decisions\n(none)\n## Next Steps\nContinue\n</compaction_summary>",
+                  ),
+                ],
+                firstContexts,
+              ),
+            });
+            yield* startTurnWithText(harness, 1, "turn one prompt");
+            assert.equal((yield* harness.takeEvent("turn.terminal")).status, "completed");
+            yield* startTurnWithText(harness, 2, "turn two prompt");
+            assert.equal((yield* harness.takeEvent("turn.terminal")).status, "completed");
+            const input = yield* harness.turnInput(3);
+            yield* harness.runtime.compactThread!(input);
+            assert.equal((yield* harness.takeEvent("turn.terminal")).status, "completed");
+          }),
+        );
+
+        const postRestartContexts: Array<ReadonlyArray<unknown>> = [];
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const harness = yield* makeHarness({
+              sessionStore: store,
+              streamFn: recorder([scriptedTextResponse("resumed")], postRestartContexts),
+            });
+            yield* startTurnWithText(harness, 3, "turn three prompt");
+            assert.equal((yield* harness.takeEvent("turn.terminal")).status, "completed");
+          }),
+        );
+        const sent = postRestartContexts[0] ?? [];
+        const wire = JSON.stringify(sent);
+        assert.include(wire, "<compaction_summary>");
+        assert.include(wire, "Ship cleanly");
+        assert.lengthOf(wire.match(/turn two prompt/gu) ?? [], 1);
+      }).pipe(Effect.provide(testLayer())),
+  );
+
+  it.effect("loads /skill:<id> for its turn and rejects a skill the workspace lacks", () =>
+    Effect.gen(function* () {
+      const cwd = yield* Effect.promise(makeWorkspace);
+      const folder = NodePath.join(cwd, ".agents", "skills", "review");
+      yield* Effect.promise(async () => {
+        await NodeFSP.mkdir(folder, { recursive: true });
+        await NodeFSP.writeFile(
+          NodePath.join(folder, "SKILL.md"),
+          "---\nname: Review\ndescription: Reviews changes\n---\n\nRead the diff first.\n",
+          "utf8",
+        );
+      });
+      const requests: Array<{ readonly text: string; readonly activation: string | null }> = [];
+      const streamFn: StreamFn = async (model, context) => {
+        const user = context.messages.filter((message) => message.role === "user").at(-1);
+        const last = context.messages.filter((message) => message.role === "system").at(-1);
+        const sections =
+          last !== undefined && typeof last === "object" && "sections" in last
+            ? ((last as { readonly sections?: Record<string, string | null> }).sections ?? {})
+            : {};
+        requests.push({
+          text:
+            user !== undefined && typeof user.content === "string"
+              ? user.content
+              : JSON.stringify(user?.content ?? ""),
+          activation: sections["tool_activation"] ?? null,
+        });
+        return renderScriptedTurn(model, scriptedTextResponse("done"), 0);
+      };
+      const harness = yield* makeHarness({
+        streamFn,
+        cwd,
+        policy: runtimePolicy({ cwd }),
+      });
+
+      yield* startTurnWithText(harness, 1, "/skill:review check main");
+      assert.equal((yield* harness.takeEvent("turn.terminal")).status, "completed");
+      assert.equal(requests[0]?.text, "check main");
+      assert.match(requests[0]?.activation ?? "", /<skill_content id="review"/u);
+      assert.match(requests[0]?.activation ?? "", /Read the diff first\./u);
+
+      yield* startTurnWithText(harness, 2, "/skill:missing");
+      assert.equal((yield* harness.takeEvent("turn.terminal")).status, "completed");
+      // The catalog also carries the machine's user skills, so only its shape is fixed.
+      assert.isTrue(
+        assistantTexts(harness).some(
+          (text) =>
+            text.startsWith('Unknown skill "missing". Available skills: ') &&
+            text.includes("review"),
+        ),
+      );
+
+      // A skill added to the workspace mid-session works immediately on `/skill:<id>`.
+      const dynamicDir = NodePath.join(cwd, ".agents", "skills", "dynamic");
+      yield* Effect.promise(async () => {
+        await NodeFSP.mkdir(dynamicDir, { recursive: true });
+        await NodeFSP.writeFile(
+          NodePath.join(dynamicDir, "SKILL.md"),
+          "---\nname: Dynamic\n---\n\nDynamic body.\n",
+          "utf8",
+        );
+      });
+      yield* startTurnWithText(harness, 3, "/skill:dynamic run now");
+      assert.equal((yield* harness.takeEvent("turn.terminal")).status, "completed");
+      assert.match(requests[1]?.activation ?? "", /<skill_content id="dynamic"/u);
+      assert.match(requests[1]?.activation ?? "", /Dynamic body\./u);
     }).pipe(Effect.provide(testLayer())),
   );
 });

@@ -149,6 +149,125 @@ describe("connectMcpSession", () => {
     expect(result.tools[0]?.name).toBe("mcp__t3-code-eager__list_threads");
   });
 
+  it("hides the raw search tool when the session is deferred", async () => {
+    const { fetchImpl } = createFetch((body) => {
+      if (body.method === "initialize") return jsonResponse(body.id, {});
+      if (body.method === "notifications/initialized") return new Response(null, { status: 202 });
+      return jsonResponse(body.id, {
+        tools: [{ name: "tool_search", description: "Search tools", inputSchema: {} }, TOOLS[0]],
+      });
+    });
+    const result = await connectMcpSession(config, { fetch: fetchImpl, toolExposure: "deferred" });
+    expect(result.tools.map((tool) => tool.name)).toEqual(["mcp__t3-code__list_threads"]);
+  });
+
+  it("refreshes declarations after the server announces a tool list change", async () => {
+    let listed = 1;
+    const { fetchImpl, calls } = createFetch((body) => {
+      if (body.method === "initialize") return jsonResponse(body.id, {});
+      if (body.method === "notifications/initialized") return new Response(null, { status: 202 });
+      if (body.method === "tools/list") {
+        const searchTool = { name: "tool_search", description: "Search tools", inputSchema: {} };
+        const tools =
+          listed === 1
+            ? [searchTool, TOOLS[0]]
+            : [
+                searchTool,
+                TOOLS[0],
+                {
+                  name: "t3_thread_list",
+                  description: "List T3 threads",
+                  inputSchema: { type: "object", properties: {} },
+                  annotations: { readOnlyHint: true },
+                },
+              ];
+        listed += 1;
+        return jsonResponse(body.id, { tools });
+      }
+      // The search result and the list_changed notification share one SSE response.
+      return new Response(
+        [
+          `data: ${JSON.stringify({
+            jsonrpc: "2.0",
+            method: "notifications/tools/list_changed",
+          })}`,
+          "",
+          `data: ${JSON.stringify({
+            jsonrpc: "2.0",
+            id: body.id,
+            result: { structuredContent: { tools: [{ name: "t3_thread_list" }] } },
+          })}`,
+          "",
+        ].join("\n"),
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      );
+    });
+    const result = await connectMcpSession(config, { fetch: fetchImpl, toolExposure: "deferred" });
+
+    const names = await result.searchTools("thread");
+    expect(names).toEqual(["mcp__t3-code__t3_thread_list"]);
+    expect(calls.at(-2)?.body.method).toBe("tools/call");
+    expect(calls.at(-2)?.body.params).toEqual({
+      name: "tool_search",
+      arguments: { query: "thread" },
+    });
+    expect(calls.at(-1)?.body.method).toBe("tools/list");
+
+    const refreshed = await result.refreshTools();
+    expect(refreshed.map((tool) => tool.name)).toContain("mcp__t3-code__t3_thread_list");
+    // Loading clears the notification flag so repeated refreshes reuse the cache.
+    await result.refreshTools();
+    expect(calls.filter((call) => call.body.method === "tools/list")).toHaveLength(2);
+    expect(result.metadata.get("mcp__t3-code__t3_thread_list")?.readOnlyHint).toBe(true);
+    const isReadOnly = mcpReadOnlyPredicate(result.metadata);
+    expect(isReadOnly("mcp__t3-code__t3_thread_list")).toBe(true);
+  });
+
+  it("skips or catches remote search errors and reloads missing tools without notifications", async () => {
+    const plain = createFetch(sessionHandler());
+    const plainResult = await connectMcpSession(config, {
+      fetch: plain.fetchImpl,
+      toolExposure: "deferred",
+    });
+    await expect(plainResult.searchTools("threads")).resolves.toEqual([]);
+    expect(plain.calls.some((call) => call.body.method === "tools/call")).toBe(false);
+
+    let listCount = 0;
+    const remote = createFetch((body) => {
+      if (body.method === "initialize") return jsonResponse(body.id, {});
+      if (body.method === "notifications/initialized") return new Response(null, { status: 202 });
+      if (body.method === "tools/list") {
+        listCount += 1;
+        const tools =
+          listCount === 1
+            ? [{ name: "tool_search", description: "Search tools", inputSchema: {} }, TOOLS[0]]
+            : [TOOLS[0], TOOLS[1]];
+        return jsonResponse(body.id, { tools });
+      }
+      if (
+        (body.params as { readonly arguments?: { readonly query?: string } })?.arguments?.query ===
+        "boom"
+      ) {
+        return new Response("down", { status: 503 });
+      }
+      return jsonResponse(body.id, { structuredContent: { tools: [{ name: "send_message" }] } });
+    });
+    const remoteResult = await connectMcpSession(config, {
+      fetch: remote.fetchImpl,
+      toolExposure: "deferred",
+    });
+    await expect(remoteResult.searchTools("boom")).resolves.toEqual([]);
+    await expect(remoteResult.searchTools("send")).resolves.toEqual(["mcp__t3-code__send_message"]);
+    expect(remoteResult.tools.map((tool) => tool.name)).toContain("mcp__t3-code__send_message");
+  });
+
+  it("does not search when the session is eager", async () => {
+    const { fetchImpl, calls } = createFetch(sessionHandler());
+    const result = await connectMcpSession(config, { fetch: fetchImpl });
+    await expect(result.searchTools("thread")).resolves.toEqual([]);
+    expect(calls.some((call) => call.body.method === "tools/call")).toBe(false);
+  });
+
   it("calls a remote tool and extracts text, image, and structured content", async () => {
     const { fetchImpl, calls } = createFetch(sessionHandler());
     const result = await connectMcpSession(config, { fetch: fetchImpl });

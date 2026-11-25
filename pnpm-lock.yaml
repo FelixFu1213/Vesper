@@ -2048,6 +2048,9 @@ importers:
       effect:
         specifier: 4.1.5
         version: 4.1.5
+      ignore:
+        specifier: 7.0.5
+        version: 7.0.5
       undici:
         specifier: 'catalog:'
         version: 8.12.4

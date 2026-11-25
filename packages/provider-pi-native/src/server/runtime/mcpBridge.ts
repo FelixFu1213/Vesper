@@ -11,6 +11,8 @@ const DEFAULT_SERVER_NAME = "t3-code";
 const DEFAULT_CLIENT_NAME = "t3-code-pi-native";
 const DEFAULT_CLIENT_VERSION = "1.0.0";
 const MAX_ERROR_BODY = 400;
+const MCP_TOOL_SEARCH = "tool_search";
+const LIST_CHANGED_NOTIFICATION = "notifications/tools/list_changed";
 
 type FetchLike = typeof globalThis.fetch;
 
@@ -44,11 +46,16 @@ export interface McpConnectResult {
   readonly metadata: ReadonlyMap<string, McpBridgeMetadata>;
   readonly sessionId?: string;
   readonly error?: string;
+  /** Refetches `tools/list` when the server announced a change, else returns the cache. */
+  readonly refreshTools: () => Promise<ReadonlyArray<McpAgentTool>>;
+  /** Runs the server's `tool_search` and returns the agent tool names it listed. */
+  readonly searchTools: (query: string) => Promise<ReadonlyArray<string>>;
 }
 
-interface JsonRpcEnvelope {
+interface ParsedEnvelope {
   readonly result?: unknown;
   readonly error?: { readonly message?: string } | undefined;
+  readonly notifications: ReadonlyArray<string>;
 }
 
 const asRecord = (value: unknown): Record<string, unknown> | undefined =>
@@ -62,16 +69,34 @@ const describe = (error: unknown): string =>
 const truncate = (text: string): string =>
   text.length <= MAX_ERROR_BODY ? text : `${text.slice(0, MAX_ERROR_BODY)}...`;
 
-const parseEnvelope = (text: string, id: number): JsonRpcEnvelope => {
+const parseEnvelope = (text: string, id: number): ParsedEnvelope => {
   const trimmed = text.trim();
-  if (trimmed === "") return {};
+  const notifications: string[] = [];
+  let result: unknown;
+  let error: { readonly message?: string } | undefined;
+  const absorb = (value: unknown): void => {
+    const record = asRecord(value);
+    if (record === undefined) return;
+    if (typeof record.method === "string" && record.id === undefined) {
+      notifications.push(record.method);
+      return;
+    }
+    if (record.id !== id && record.error === undefined) return;
+    if (record.error !== undefined) {
+      error = asRecord(record.error) ?? { message: JSON.stringify(record.error) };
+      return;
+    }
+    result = record.result;
+  };
+  if (trimmed === "") return { notifications };
   if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
     const parsed: unknown = JSON.parse(trimmed);
     if (Array.isArray(parsed)) {
-      const match = parsed.find((item) => asRecord(item)?.id === id);
-      return asRecord(match) ?? {};
+      for (const item of parsed) absorb(item);
+    } else {
+      absorb(parsed);
     }
-    return asRecord(parsed) ?? {};
+    return { result, notifications, ...(error === undefined ? {} : { error }) };
   }
   for (const chunk of trimmed.split(/\r?\n\r?\n/u)) {
     const data = chunk
@@ -80,18 +105,17 @@ const parseEnvelope = (text: string, id: number): JsonRpcEnvelope => {
       .map((line) => line.slice(5).trim())
       .join("\n");
     if (data === "") continue;
-    const parsed: unknown = JSON.parse(data);
-    const record = asRecord(parsed);
-    if (record === undefined) continue;
-    if (record.id === id || record.error !== undefined) return record;
+    absorb(JSON.parse(data));
   }
-  return {};
+  return { result, notifications, ...(error === undefined ? {} : { error }) };
 };
 
 interface McpTransport {
   readonly request: (method: string, params?: unknown) => Promise<unknown>;
   readonly notify: (method: string, params?: unknown) => Promise<void>;
   readonly sessionId: () => string | undefined;
+  readonly listChanged: () => boolean;
+  readonly clearListChanged: () => void;
 }
 
 const createTransport = (
@@ -103,6 +127,7 @@ const createTransport = (
   const exposure = options.toolExposure ?? "eager";
   let sessionId: string | undefined;
   let nextId = 1;
+  let listChanged = false;
 
   const headers = (): Record<string, string> => ({
     authorization: config.authorizationHeader,
@@ -137,6 +162,7 @@ const createTransport = (
       throw new Error(`MCP ${method} failed with HTTP ${response.status}: ${truncate(text)}`);
     }
     const envelope = parseEnvelope(text, id);
+    if (envelope.notifications.includes(LIST_CHANGED_NOTIFICATION)) listChanged = true;
     if (envelope.error !== undefined) {
       throw new Error(envelope.error.message ?? `MCP ${method} returned an error`);
     }
@@ -155,7 +181,15 @@ const createTransport = (
     await response.text();
   };
 
-  return { request, notify, sessionId: () => sessionId };
+  return {
+    request,
+    notify,
+    sessionId: () => sessionId,
+    listChanged: () => listChanged,
+    clearListChanged: () => {
+      listChanged = false;
+    },
+  };
 };
 
 const TOOL_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/u;
@@ -190,6 +224,32 @@ const toContent = (value: unknown): Array<TextContent | ImageContent> => {
     content.push({ type: "text", text: JSON.stringify(block) });
   }
   return content;
+};
+
+const toolNameList = (value: unknown): ReadonlyArray<string> => {
+  if (!Array.isArray(value)) return [];
+  const names: string[] = [];
+  for (const entry of value) {
+    const name = typeof entry === "string" ? entry : asRecord(entry)?.name;
+    if (typeof name === "string" && name !== "") names.push(name);
+  }
+  return [...new Set(names)];
+};
+
+/** `tool_search` answers with `{ tools }` in structured content or as JSON text. */
+const toolSearchNames = (result: Record<string, unknown> | undefined): ReadonlyArray<string> => {
+  const structured = asRecord(result?.structuredContent);
+  const direct = toolNameList(structured?.tools);
+  if (direct.length > 0) return direct;
+  const text = toContent(result?.content)
+    .map((block) => (block.type === "text" ? block.text : ""))
+    .join("\n");
+  if (text.trim() === "") return [];
+  try {
+    return toolNameList(asRecord(JSON.parse(text))?.tools);
+  } catch {
+    return [];
+  }
 };
 
 const createTool = (
@@ -250,10 +310,22 @@ export const connectMcpSession = async (
   options?: McpBridgeOptions,
 ): Promise<McpConnectResult> => {
   const server = options?.serverName ?? DEFAULT_SERVER_NAME;
-  let transport: McpTransport | undefined;
+  const exposure = options?.toolExposure ?? "eager";
+  const tools: McpAgentTool[] = [];
+  const metadata = new Map<string, McpBridgeMetadata>();
+
+  const unavailable = (error: string): McpConnectResult => ({
+    available: false,
+    tools,
+    metadata,
+    error,
+    refreshTools: async () => tools,
+    searchTools: async () => [],
+  });
+
   try {
-    transport = createTransport(config, options ?? {});
-    await transport.request("initialize", {
+    const session = createTransport(config, options ?? {});
+    await session.request("initialize", {
       protocolVersion: PROTOCOL_VERSION,
       capabilities: {},
       clientInfo: {
@@ -261,41 +333,78 @@ export const connectMcpSession = async (
         version: options?.clientVersion ?? DEFAULT_CLIENT_VERSION,
       },
     });
-    await transport.notify("notifications/initialized");
-    const listed = asRecord(await transport.request("tools/list"));
-    const remoteTools = Array.isArray(listed?.tools) ? listed.tools : [];
+    await session.notify("notifications/initialized");
 
-    const tools: Array<McpAgentTool> = [];
-    const metadata = new Map<string, McpBridgeMetadata>();
-    for (const entry of remoteTools) {
-      const record = asRecord(entry);
-      if (record === undefined) continue;
-      const tool = createTool(server, record, transport);
-      if (tool === undefined) continue;
-      if (metadata.has(tool.name)) continue;
-      tools.push(tool);
-      metadata.set(tool.name, {
-        server,
-        mcpToolName: String(record.name),
-        readOnlyHint: readOnlyHint(record.annotations),
-      });
-    }
+    let hasRemoteToolSearch = false;
 
-    const sessionId = transport.sessionId();
+    const loadTools = async (): Promise<ReadonlyArray<McpAgentTool>> => {
+      const listed = asRecord(await session.request("tools/list"));
+      session.clearListChanged();
+      const remoteTools = Array.isArray(listed?.tools) ? listed.tools : [];
+      const loaded: McpAgentTool[] = [];
+      const loadedMetadata = new Map<string, McpBridgeMetadata>();
+      hasRemoteToolSearch = false;
+      for (const entry of remoteTools) {
+        const record = asRecord(entry);
+        if (record === undefined) continue;
+        // Deferred sessions expose one search entrypoint: this bridge's own ToolSearch.
+        if (exposure === "deferred" && record.name === MCP_TOOL_SEARCH) {
+          hasRemoteToolSearch = true;
+          continue;
+        }
+        const tool = createTool(server, record, session);
+        if (tool === undefined) continue;
+        if (loadedMetadata.has(tool.name)) continue;
+        loaded.push(tool);
+        loadedMetadata.set(tool.name, {
+          server,
+          mcpToolName: String(record.name),
+          readOnlyHint: readOnlyHint(record.annotations),
+        });
+      }
+      tools.length = 0;
+      tools.push(...loaded);
+      metadata.clear();
+      for (const [name, value] of loadedMetadata) metadata.set(name, value);
+      return tools;
+    };
+
+    const refreshTools = async (): Promise<ReadonlyArray<McpAgentTool>> =>
+      session.listChanged() ? loadTools() : tools;
+
+    const searchTools = async (query: string): Promise<ReadonlyArray<string>> => {
+      if (exposure !== "deferred" || !hasRemoteToolSearch) return [];
+      let result: Record<string, unknown> | undefined;
+      try {
+        result = asRecord(
+          await session.request("tools/call", {
+            name: MCP_TOOL_SEARCH,
+            arguments: { query },
+          }),
+        );
+      } catch {
+        return [];
+      }
+      const names = toolSearchNames(result);
+      if (names.length === 0) return [];
+      const prefixed = names.map((name) => `mcp__${server}__${name}`);
+      if (session.listChanged() || prefixed.some((name) => !metadata.has(name))) {
+        await loadTools();
+      }
+      return prefixed;
+    };
+
+    await loadTools();
+    const sessionId = session.sessionId();
     return {
       available: true,
       tools,
       metadata,
+      refreshTools,
+      searchTools,
       ...(sessionId === undefined ? {} : { sessionId }),
     };
   } catch (error) {
-    const sessionId = transport?.sessionId();
-    return {
-      available: false,
-      tools: [],
-      metadata: new Map(),
-      error: describe(error),
-      ...(sessionId === undefined ? {} : { sessionId }),
-    };
+    return unavailable(describe(error));
   }
 };

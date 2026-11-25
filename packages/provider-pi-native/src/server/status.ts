@@ -11,6 +11,7 @@ import {
   type ModelCapabilities,
   type ProviderOptionDescriptor,
   type ServerProviderModel,
+  type ServerProviderSkill,
   settingsSecretLiteral,
 } from "@t3tools/contracts";
 import {
@@ -84,6 +85,8 @@ export interface CheckPiNativeStatusOptions {
   readonly fetchRemoteModels?: boolean;
   readonly fetch?: typeof globalThis.fetch;
   readonly remoteModelsTimeoutMs?: number;
+  /** Workspace skills to publish with the snapshot; the `$` menu reads them per cwd. */
+  readonly skills?: ReadonlyArray<ServerProviderSkill>;
 }
 
 const thinkingDescriptor = (model: Model<Api>): ProviderOptionDescriptor | undefined => {
@@ -370,6 +373,7 @@ const snapshot = (
   probe: Parameters<typeof buildServerProvider>[0]["probe"],
   supportsTextGeneration: boolean,
   discovered: ReadonlyArray<ServerProviderModel> = [],
+  skills: ReadonlyArray<ServerProviderSkill> = [],
 ): ServerProviderDraft => ({
   ...buildServerProvider({
     driver: PI_NATIVE_DRIVER_KIND,
@@ -378,6 +382,7 @@ const snapshot = (
     checkedAt,
     models: piNativeModels(settings, discovered),
     slashCommands: PI_NATIVE_SLASH_COMMANDS,
+    skills,
     probe,
   }),
   supportsTextGeneration,
@@ -428,6 +433,7 @@ export const checkPiNativeProviderStatus = Effect.fn("checkPiNativeProviderStatu
   options: CheckPiNativeStatusOptions = {},
 ) {
   const checkedAt = DateTime.formatIso(yield* DateTime.now);
+  const skills = options.skills ?? [];
   if (!settings.enabled) {
     return snapshot(
       settings,
@@ -440,6 +446,8 @@ export const checkPiNativeProviderStatus = Effect.fn("checkPiNativeProviderStatu
         message: "Pi Native is disabled in T3 Code settings.",
       },
       false,
+      [],
+      skills,
     );
   }
   const discovered = yield* discoverRemoteModelsForCheck(settings, options);
@@ -455,6 +463,7 @@ export const checkPiNativeProviderStatus = Effect.fn("checkPiNativeProviderStatu
       },
       true,
       discovered,
+      skills,
     );
   }
   if (settings.baseUrl !== "") {
@@ -470,6 +479,7 @@ export const checkPiNativeProviderStatus = Effect.fn("checkPiNativeProviderStatu
       },
       true,
       discovered,
+      skills,
     );
   }
   return snapshot(
@@ -484,5 +494,6 @@ export const checkPiNativeProviderStatus = Effect.fn("checkPiNativeProviderStatu
     },
     false,
     discovered,
+    skills,
   );
 });
