@@ -1,5 +1,8 @@
+import type { Api, Model } from "@earendil-works/pi-ai";
 import { contentText } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "@effect/vitest";
+
+import { createScriptedStreamFn, scriptedTextResponse } from "../../testing.ts";
 
 import {
   capSubagentReport,
@@ -338,5 +341,63 @@ describe("subagent model selection", () => {
     requireChild(factory.children, 1).complete("again");
     const secondResult = await second;
     expect(secondResult.details.model).toBe("parent-model-v2");
+  });
+});
+
+describe("subagent context degradation", () => {
+  const narrowModel: Model<Api> = {
+    id: "narrow-model",
+    name: "Narrow model",
+    api: "openai-responses",
+    provider: "openai",
+    baseUrl: "",
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    reasoning: false,
+    contextWindow: 4_000,
+    maxTokens: 1_000,
+  };
+
+  it("fails a delegated task with the structured overflow it cannot fit", async () => {
+    const recorder = createRecorder();
+    const manager = makeSubagentManager({
+      childAgent: {
+        defaultModel: narrowModel,
+        systemPrompt: "s".repeat(4 * 2_500),
+        streamFn: createScriptedStreamFn([scriptedTextResponse("unused")]),
+      },
+      onSubagentEvent: recorder.onSubagentEvent,
+      now: countingClock(),
+      nextId: sequentialIds(),
+      sleep: immediateSleep,
+    });
+
+    const result = await toolNamed(manager, "Task").execute("call-1", { prompt: "Do it" });
+
+    expect(result.details.status).toBe("failed");
+    expect(manager.getSubagent("sub-1")?.failureCode).toBe("SUBAGENT_CONTEXT_OVERFLOW");
+    expect(String(result.details.result)).toContain("SUBAGENT_CONTEXT_OVERFLOW");
+    expect(String(result.details.result)).toContain("narrow-model");
+  });
+
+  it("keeps a delegate that fits its own window on its own budget", async () => {
+    const recorder = createRecorder();
+    const manager = makeSubagentManager({
+      childAgent: {
+        defaultModel: narrowModel,
+        systemPrompt: "s".repeat(4 * 100),
+        streamFn: createScriptedStreamFn([scriptedTextResponse("the answer")]),
+      },
+      onSubagentEvent: recorder.onSubagentEvent,
+      now: countingClock(),
+      nextId: sequentialIds(),
+      sleep: immediateSleep,
+    });
+
+    const result = await toolNamed(manager, "Task").execute("call-1", { prompt: "Do it" });
+
+    expect(result.details.status).toBe("completed");
+    expect(result.details.result).toBe("the answer");
+    expect(manager.getSubagent("sub-1")?.failureCode).toBeUndefined();
   });
 });

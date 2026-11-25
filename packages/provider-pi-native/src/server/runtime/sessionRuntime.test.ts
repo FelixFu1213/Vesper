@@ -71,6 +71,7 @@ const makeRuntime = async (
     readonly streamFn?: StreamFn;
     readonly skills?: ReadonlyArray<PiNativeSkillDef>;
     readonly discoverSkills?: () => Promise<ReadonlyArray<PiNativeSkillDef>>;
+    readonly piAgentDir?: string;
   } = {},
 ): Promise<RuntimeHarness> => {
   const events: NativeSessionEvent[] = [];
@@ -92,20 +93,18 @@ const makeRuntime = async (
     requestUserInput: async () => input.answers ?? { answer: "yes" },
     ...(input.initialGoal === undefined ? {} : { initialGoal: input.initialGoal }),
     ...(input.maxGoalChecks === undefined ? {} : { maxGoalChecks: input.maxGoalChecks }),
+    // A developer's own global AGENTS.md and SYSTEM.md must never reach a test.
+    piAgentDir: input.piAgentDir ?? (await workspace()),
     now: () => 0,
     streamFn: input.streamFn ?? streamFn,
     scheduleTimer: () => () => undefined,
     sleep: async () => undefined,
     ...(input.fetch === undefined ? {} : { fetch: input.fetch }),
-    ...(input.discoverSkills !== undefined
-      ? {
-          discoverSkills: async () => ({ skills: await input.discoverSkills!(), serverSkills: [] }),
-        }
-      : input.skills === undefined
-        ? {}
-        : {
-            discoverSkills: async () => ({ skills: input.skills ?? [], serverSkills: [] }),
-          }),
+    // A developer's own installed skills must never reach a unit test.
+    discoverSkills:
+      input.discoverSkills !== undefined
+        ? async () => ({ skills: await input.discoverSkills!(), serverSkills: [] })
+        : async () => ({ skills: input.skills ?? [], serverSkills: [] }),
     ...(input.mcpSession === undefined
       ? {}
       : {
@@ -138,6 +137,35 @@ const workspace = async (files: Record<string, string> = {}): Promise<string> =>
   }
   return dir;
 };
+
+const writeFiles = async (root: string, files: Record<string, string>): Promise<void> => {
+  for (const [name, content] of Object.entries(files)) {
+    const target = NodePath.join(root, name);
+    await NodeFSP.mkdir(NodePath.dirname(target), { recursive: true });
+    await NodeFSP.writeFile(target, content, "utf8");
+  }
+};
+
+const isSystem = (message: { readonly role: string }): boolean => message.role === "system";
+
+const systemSections = (message: unknown): Record<string, string | null> =>
+  typeof message === "object" && message !== null && "sections" in message
+    ? ((message as { readonly sections?: Record<string, string | null> }).sections ?? {})
+    : {};
+
+/** Only the system deltas of one request, never the leading system message. */
+const requestDeltas = (
+  messages: ReadonlyArray<unknown>,
+): ReadonlyArray<Record<string, string | null>> =>
+  messages
+    .slice(1)
+    .filter(
+      (message): message is { readonly role: "system" } =>
+        typeof message === "object" &&
+        message !== null &&
+        (message as { readonly role?: unknown }).role === "system",
+    )
+    .map((message) => systemSections(message));
 
 describe("NativePiSessionRuntime", () => {
   it("streams assistant text and reasoning with usage", async () => {
@@ -1035,12 +1063,7 @@ describe("NativePiSessionRuntime", () => {
   it("boosts thinking for one workflow turn and restores it afterwards", async () => {
     const requests: Array<{ reasoning: string | undefined; activation: string | null }> = [];
     const streamFn: StreamFn = async (model, context, options) => {
-      const systems = context.messages.filter((message) => message.role === "system");
-      const last = systems.at(-1);
-      const sections =
-        last !== undefined && typeof last === "object" && "sections" in last
-          ? ((last as { readonly sections?: Record<string, string | null> }).sections ?? {})
-          : {};
+      const sections = systemSections(context.messages.filter(isSystem).at(-1));
       requests.push({
         reasoning: (options as { readonly reasoning?: string } | undefined)?.reasoning,
         activation: sections["tool_activation"] ?? null,
@@ -1067,12 +1090,7 @@ describe("NativePiSessionRuntime", () => {
       toolActivation: string | null | undefined;
     }> = [];
     const streamFn: StreamFn = async (model, context) => {
-      const systems = context.messages.filter((message) => message.role === "system");
-      const last = systems.at(-1);
-      const sections =
-        last !== undefined && typeof last === "object" && "sections" in last
-          ? ((last as { readonly sections?: Record<string, string | null> }).sections ?? {})
-          : {};
+      const sections = systemSections(context.messages.filter(isSystem).at(-1));
       requests.push({
         hasToolActivationKey: Object.hasOwn(sections, "tool_activation"),
         toolActivation: sections["tool_activation"],
@@ -1093,6 +1111,144 @@ describe("NativePiSessionRuntime", () => {
     assert.isTrue(requests[1]?.hasToolActivationKey);
     assert.isNull(requests[1]?.toolActivation);
     assert.match(requests[2]?.toolActivation ?? "", /workflow_command name="review"/u);
+    await harness.runtime.dispose();
+  });
+
+  it("leads with the custom system prompt and places the append and project rules after runtime", async () => {
+    const cwd = await workspace();
+    await writeFiles(cwd, { ".pi/SYSTEM.md": "Custom persona.", "AGENTS.md": "Repo rules." });
+    const piAgentDir = await workspace({
+      "SYSTEM.md": "Global persona.",
+      "APPEND_SYSTEM.md": "Global append.",
+      "AGENTS.md": "Global rules.",
+    });
+    const requests: Array<{
+      content: string | null;
+      sections: Record<string, string | null>;
+    }> = [];
+    const streamFn: StreamFn = async (model, context) => {
+      const leading = context.messages[0];
+      requests.push({
+        content: typeof leading?.content === "string" ? leading.content : null,
+        sections: systemSections(leading),
+      });
+      return renderScriptedTurn(model, scriptedTextResponse("ok"), 0);
+    };
+
+    const harness = await makeRuntime({ cwd, piAgentDir, streamFn });
+    await harness.runtime.runTurn({ text: "hi" });
+
+    assert.equal(requests[0]?.content, "Custom persona.");
+    assert.deepStrictEqual(Object.keys(requests[0]?.sections ?? {}), [
+      "runtime",
+      "custom_append",
+      "project_instructions",
+    ]);
+    assert.equal(requests[0]?.sections["custom_append"], "Global append.");
+    assert.include(requests[0]?.sections["project_instructions"] ?? "", "Global rules.");
+    assert.include(requests[0]?.sections["project_instructions"] ?? "", "Repo rules.");
+    await harness.runtime.dispose();
+  });
+
+  it("adds a nested AGENTS.md once a tool reaches its directory, and only when the chain changes", async () => {
+    const cwd = await workspace();
+    await writeFiles(cwd, {
+      "AGENTS.md": "root rules",
+      "pkg/AGENTS.md": "package rules",
+      "pkg/note.txt": "hello\n",
+      "pkg/other.txt": "again\n",
+    });
+    const scripted = createScriptedStreamFn(
+      [
+        scriptedToolCallResponse([
+          { name: "Read", arguments: { path: "pkg/note.txt" } },
+          { name: "Read", arguments: { path: "pkg/other.txt" } },
+        ]),
+        scriptedTextResponse("done"),
+        scriptedTextResponse("again"),
+      ],
+      { now: () => 0 },
+    );
+    const deltas: Array<Record<string, string | null>> = [];
+    const streamFn: StreamFn = async (model, context, options) => {
+      deltas.push(...requestDeltas(context.messages));
+      return scripted(model, context, options);
+    };
+
+    const harness = await makeRuntime({ cwd, streamFn });
+    await harness.runtime.runTurn({ text: "look at pkg" });
+    await harness.runtime.runTurn({ text: "keep going" });
+
+    const instructionDeltas = deltas.filter(
+      (sections) => sections["project_instructions"] !== undefined,
+    );
+    assert.lengthOf(instructionDeltas, 1);
+    assert.deepStrictEqual(Object.keys(instructionDeltas[0] ?? {}), ["project_instructions"]);
+    assert.include(instructionDeltas[0]?.["project_instructions"] ?? "", "root rules");
+    assert.include(instructionDeltas[0]?.["project_instructions"] ?? "", "package rules");
+    await harness.runtime.dispose();
+  });
+});
+
+/** Request-only reminders never reach the transcript, so they are counted in the request. */
+const reminderMessages = (messages: ReadonlyArray<{ readonly content?: unknown }>): number =>
+  messages.filter((message) => {
+    const content = message.content;
+    return typeof content === "string"
+      ? content.includes("<context_budget>")
+      : JSON.stringify(content ?? "").includes("<context_budget>");
+  }).length;
+
+describe("NativePiSessionRuntime context budget", () => {
+  it("reminds the model once per checkpoint window and not again on the next turn", async () => {
+    const harness = await makeRuntime({
+      settings: settings({
+        modelBindings: [
+          {
+            id: "default",
+            contextWindow: 20_000,
+            maxTokens: 2_000,
+            thinkingLevels: [],
+            defaultThinkingLevel: null,
+          },
+        ],
+      }),
+      steps: [scriptedTextResponse("one"), scriptedTextResponse("two")],
+    });
+
+    await harness.runtime.runTurn({ text: "a".repeat(4 * 4_000) });
+    const first = harness.streamFn.calls[0]?.context.messages ?? [];
+    assert.equal(reminderMessages(first), 1);
+
+    await harness.runtime.runTurn({ text: "again" });
+    const second = harness.streamFn.calls[1]?.context.messages ?? [];
+    assert.equal(reminderMessages(second), 0);
+    await harness.runtime.dispose();
+  });
+
+  it("reports why a compaction summary was abandoned", async () => {
+    const harness = await makeRuntime({
+      settings: settings({ autoCompact: true }),
+      steps: [
+        scriptedErrorResponse("prompt is too long: 250000 tokens > 200000 maximum"),
+        scriptedTextResponse("I could not summarize this conversation."),
+        scriptedTextResponse("recovered answer"),
+      ],
+    });
+
+    const outcome = await harness.runtime.runTurn({ text: "start" });
+    assert.equal(outcome.status, "completed");
+    assert.deepStrictEqual(streamTexts(harness.events), ["recovered answer"]);
+
+    const completed = harness.events.filter(
+      (event) => event.type === "compaction" && event.status === "completed",
+    );
+    assert.isAbove(completed.length, 0);
+    const reason = completed.at(-1);
+    assert.include(
+      reason?.type === "compaction" ? (reason.failureReason ?? "") : "",
+      "no recognizable sections",
+    );
     await harness.runtime.dispose();
   });
 });

@@ -38,23 +38,33 @@ import { settingsSecretLiteral } from "@t3tools/contracts";
 import type { ProviderAdapterV2RuntimePolicy } from "@t3tools/provider-core/server/ProviderAdapter";
 import type { McpProviderSessionConfig } from "@t3tools/provider-core/server/mcpSession";
 import * as DateTime from "effect/DateTime";
+import * as Schema from "effect/Schema";
 
 import type { PiNativeSettings } from "../../settings.ts";
 import { piNativeSkillMentions } from "../commands.ts";
 import {
   buildCompactionCheckpoint,
+  CompactionBudgetError,
   installCompactionCheckpoint,
   type CompactionCheckpoint,
   type CompactionMode,
   type CompactionSummarizeFn,
 } from "./compaction.ts";
+import { compactionRequestOptions } from "./compactionRequest.ts";
+import { ContextEstimateCalibration } from "./contextCalibration.ts";
 import {
   computeContextBudget,
-  ContextEstimateCalibration,
+  ContextBudgetReminderTracker,
   estimateAgentMessagesTokens,
   evaluateContextPressure,
+  projectContextRequest,
+  supportsMidConversationSystemMessages,
+  type ContextProjection,
+  type ContextRequestTool,
 } from "./contextBudget.ts";
-import { SeenLinesTracker } from "./hashline.ts";
+import { loadCustomSystemPrompt, type CustomSystemPrompt } from "./customSystemPrompt.ts";
+import { NamedRegisters } from "./editEngine.ts";
+import { FileSnapshotStore } from "./fileSnapshotStore.ts";
 import { connectMcpSession, mcpReadOnlyPredicate, type McpAgentTool } from "./mcpBridge.ts";
 import { MutationRecoveryTracker } from "./mutationRecovery.ts";
 import { PathMutex } from "./pathLock.ts";
@@ -63,6 +73,7 @@ import {
   type ToolApprovalRequest,
   type ToolApprovalResponse,
 } from "./permissions.ts";
+import { ProjectInstructionTracker, renderProjectInstructions } from "./projectInstructions.ts";
 import {
   createProviderStreamFn,
   ProviderHttpPool,
@@ -169,6 +180,8 @@ export interface NativeSessionCompactionUpdate {
   readonly beforeTokenCount?: number | undefined;
   readonly afterTokenCount?: number | undefined;
   readonly summary?: string | undefined;
+  /** Why summarization was abandoned and a retained tail installed instead. */
+  readonly failureReason?: string | undefined;
 }
 
 export interface NativeSessionSubagentUpdate {
@@ -271,6 +284,8 @@ export interface NativePiSessionRuntimeOptions {
   readonly requestUserInput: (input: NativeUserInputRequest) => Promise<Record<string, unknown>>;
   readonly now?: (() => number) | undefined;
   readonly random?: (() => number) | undefined;
+  /** Overrides `~/.pi/agent`, where the global `AGENTS.md` and `SYSTEM.md` files live. */
+  readonly piAgentDir?: string | undefined;
   readonly streamFn?: StreamFn | undefined;
   readonly sleep?: ProviderRetrySleep | undefined;
   readonly scheduleTimer?: ScheduleTimer | undefined;
@@ -327,7 +342,8 @@ interface ActiveTurnState {
   readonly toolOutput: Map<string, string>;
   messageIndex: number;
   itemSequence: number;
-  preRequestRawEstimate: number | null;
+  /** The full-request projection the pending request was gated on. */
+  preRequest: ContextProjection | null;
   overflowRecoveryTried: boolean;
   silentTurnTried: boolean;
   manualCompactionRequested: string | null;
@@ -374,6 +390,18 @@ const asText = (value: unknown): string => {
   );
   return contentText(blocks);
 };
+
+const isCompactionBudgetError = Schema.is(CompactionBudgetError);
+
+/** The request-visible shape of an executable tool, for the budget estimate. */
+const contextRequestTools = (
+  tools: ReadonlyArray<AgentTool<any>> | undefined,
+): ReadonlyArray<ContextRequestTool> =>
+  (tools ?? []).map((tool) => ({
+    name: tool.name,
+    description: tool.description,
+    parameters: tool.parameters,
+  }));
 
 const renderForSummary = (messages: readonly AgentMessage[]): string =>
   messages
@@ -576,7 +604,7 @@ const newTurnState = (): ActiveTurnState => ({
   toolOutput: new Map(),
   messageIndex: 0,
   itemSequence: 0,
-  preRequestRawEstimate: null,
+  preRequest: null,
   overflowRecoveryTried: false,
   silentTurnTried: false,
   manualCompactionRequested: null,
@@ -592,6 +620,21 @@ const newTurnState = (): ActiveTurnState => ({
   goalChecksThisTurn: 0,
 });
 
+/** The instructions a tool run may widen; only file tools can reveal nested rules. */
+const PATH_SCOPED_INSTRUCTION_TOOLS: ReadonlySet<string> = new Set(["Read", "Write", "Edit"]);
+
+/** Project instructions and prompts are scoped to the thread's main folder. */
+function instructionWorkspaceRoot(policy: ProviderAdapterV2RuntimePolicy): string | null {
+  const cwd = policy.cwd?.trim();
+  if (cwd !== undefined && cwd !== "") return cwd;
+  return policy.workspace?.folders[0]?.path ?? null;
+}
+
+interface ResolvedSessionPrompts {
+  readonly customPrompt: CustomSystemPrompt | undefined;
+  readonly instructions: ProjectInstructionTracker;
+}
+
 /**
  * One in-process Pi agent per native thread. It owns the transcript, tools, permissions,
  * retries, and compaction; the adapter above it only maps its events onto T3 contracts.
@@ -601,6 +644,7 @@ export class NativePiSessionRuntime {
   readonly #agent: Agent;
   readonly #systemManager: SystemTranscriptManager;
   readonly #calibration: ContextEstimateCalibration;
+  readonly #reminders = new ContextBudgetReminderTracker();
   readonly #coalescer: StreamDeltaCoalescer<string>;
   readonly #pool: ProviderHttpPool;
   readonly #sandbox: WorkspaceSandbox;
@@ -608,7 +652,8 @@ export class NativePiSessionRuntime {
   readonly #now: () => number;
   readonly #sessionId: string;
   readonly #unsubscribe: () => void;
-  #seen = new SeenLinesTracker();
+  #anchors = new FileSnapshotStore();
+  #registers = new NamedRegisters();
   #recovery = new MutationRecoveryTracker();
   #todos: TodoSnapshot = EMPTY_TODO_SNAPSHOT;
   #goal: OrchestrationV2ProviderGoal | null = null;
@@ -630,12 +675,15 @@ export class NativePiSessionRuntime {
   #abortPromise: Promise<void> | null = null;
   #disposed = false;
   #contextText: string | undefined;
+  readonly #instructions: ProjectInstructionTracker;
+  readonly #customAppend: string | undefined;
   #sequence = 0;
 
   private constructor(
     options: NativePiSessionRuntimeOptions,
     binding: ResolvedModelBinding,
     skills: ReadonlyArray<PiNativeSkillDef>,
+    prompts: ResolvedSessionPrompts,
   ) {
     this.#options = options;
     this.#skills = skills;
@@ -648,6 +696,8 @@ export class NativePiSessionRuntime {
     this.#selection = options.modelSelection;
     this.#policy = options.runtimePolicy;
     this.#contextText = options.contextText;
+    this.#instructions = prompts.instructions;
+    this.#customAppend = prompts.customPrompt?.append;
     const initialGoal = options.initialGoal ?? null;
     this.#goal =
       initialGoal === null
@@ -670,7 +720,8 @@ export class NativePiSessionRuntime {
     });
     this.#baseStreamFn = this.#makeBaseStreamFn();
     this.#systemManager = new SystemTranscriptManager({
-      basePrompt: "",
+      // A custom `SYSTEM.md` owns the persona slot; the operational rules stay in sections.
+      basePrompt: prompts.customPrompt?.replace ?? "",
       sections: this.#desiredSections(),
       timestamp: this.#now(),
     });
@@ -693,10 +744,17 @@ export class NativePiSessionRuntime {
   }
 
   static async create(options: NativePiSessionRuntimeOptions): Promise<NativePiSessionRuntime> {
+    const workspaceRoot = instructionWorkspaceRoot(options.runtimePolicy);
+    const agentDir = options.piAgentDir === undefined ? {} : { agentDir: options.piAgentDir };
+    const instructions = new ProjectInstructionTracker({ workspaceRoot, ...agentDir });
+    // Root instructions belong to the leading system message, so read them before the first request.
+    await instructions.visit();
+    const customPrompt = await loadCustomSystemPrompt({ workspaceRoot, ...agentDir });
     const runtime = new NativePiSessionRuntime(
       options,
       resolvePiNativeModelBinding(options.settings, options.modelSelection),
       await discoverSkillCatalog(options),
+      { customPrompt, instructions },
     );
     await runtime.#connectMcp();
     runtime.#rebuildTools();
@@ -791,7 +849,10 @@ export class NativePiSessionRuntime {
   }
 
   tokenEstimate(): number {
-    return estimateAgentMessagesTokens(this.#agent.state.messages);
+    return projectContextRequest(
+      this.#agent.state.messages,
+      contextRequestTools(this.#agent.state.tools),
+    ).cost.totalTokens;
   }
 
   contextBudget(): { readonly usedTokens: number; readonly maxTokens: number } {
@@ -843,7 +904,8 @@ export class NativePiSessionRuntime {
   #toolDependencies(): Parameters<typeof createPiNativeTools>[0] {
     return {
       sandbox: this.#sandbox,
-      seen: this.#seen,
+      anchors: this.#anchors,
+      registers: this.#registers,
       recovery: this.#recovery,
       locks: this.#locks,
       requestUserInput: (questions, signal) =>
@@ -1020,6 +1082,7 @@ export class NativePiSessionRuntime {
   }
 
   #desiredSections(contextBudget?: string): SystemSectionMap {
+    const projectInstructions = renderProjectInstructions(this.#instructions.current);
     const sections = buildT3SystemSections({
       harness: "Pi Native",
       model: this.#binding.modelId,
@@ -1039,15 +1102,18 @@ export class NativePiSessionRuntime {
         : { context: this.#contextText }),
       ...(contextBudget === undefined ? {} : { contextBudget }),
       skillSections: piNativeSkillsPromptSections(this.#skills),
+      ...(this.#customAppend === undefined ? {} : { customAppend: this.#customAppend }),
+      ...(projectInstructions === undefined ? {} : { projectInstructions }),
       toolActivation: this.#options.settings.enableSubagents
         ? "<tool_activation>Task, TaskWait, TaskList, and TaskStop delegate self-contained work to in-process subagents.</tool_activation>"
         : "",
     });
     return {
       ...sections,
-      // Explicitly null out cleared skills / tool_activation so revoking the last skill clears the header too.
+      // Explicitly null empty sections so a cleared one (or revoked last skill) emits a reset delta instead of staying cached.
       skills: sections.skills ?? null,
       tool_activation: sections.tool_activation ?? null,
+      project_instructions: sections.project_instructions ?? null,
     };
   }
 
@@ -1070,10 +1136,6 @@ export class NativePiSessionRuntime {
       documents.push(formatPiNativeSkillContent(loaded.skill, loaded.body));
     }
     return documents.length === 0 ? undefined : documents.join("\n\n");
-  }
-
-  #contextBudgetSection(usedTokens: number, limit: number): string {
-    return `<context_budget>About ${usedTokens} of ${limit} context tokens are in use. Summarize or compact before the limit.</context_budget>`;
   }
 
   #emit(event: NativeSessionEvent): void {
@@ -1231,8 +1293,9 @@ export class NativePiSessionRuntime {
       this.#completeStreamItem(key, item);
     }
     const promptTokens = message.usage.input + message.usage.cacheRead + message.usage.cacheWrite;
-    if (state.preRequestRawEstimate !== null && promptTokens > 0) {
-      this.#calibration.recordSample(state.preRequestRawEstimate, promptTokens);
+    const projection = state.preRequest;
+    if (projection !== null && promptTokens > 0) {
+      this.#recordCalibrationSample(projection, promptTokens);
     }
     if (promptTokens > 0) {
       this.#emit({
@@ -1315,28 +1378,45 @@ export class NativePiSessionRuntime {
     }
     const decision = await this.#permissions.evaluate(context.toolCall.name, context.args, signal);
     if (!decision.allowed) return { block: true, reason: decision.reason };
+    await this.#refreshPathInstructions(context.toolCall.name, context.args);
     return undefined;
   };
+
+  /** Nested rules only matter once a turn reaches their directory, so they load there. */
+  async #refreshPathInstructions(toolName: string, args: unknown): Promise<void> {
+    if (!PATH_SCOPED_INSTRUCTION_TOOLS.has(toolName)) return;
+    const workspacePath =
+      typeof args === "object" && args !== null
+        ? (args as { readonly path?: unknown }).path
+        : undefined;
+    if (typeof workspacePath !== "string" || workspacePath.trim() === "") return;
+    await this.#instructions.visit(workspacePath.trim());
+  }
 
   #prepareRequest: PrepareRequest = async (request) => {
     const state = this.#active;
     if (state === null) return undefined;
-    const pressure = evaluateContextPressure(
-      request.context.messages,
-      request.model,
-      this.#calibration,
-    );
-    state.preRequestRawEstimate = pressure.rawTokens;
-    const budgetSection =
-      pressure.warningLevel === "none"
-        ? undefined
-        : this.#contextBudgetSection(pressure.calibratedTokens, pressure.hardLimit);
+    const pressure = this.#evaluatePressure(request.context.messages, request.context.tools);
+    state.preRequest = pressure.projection;
+    const reminder = this.#reminders.select({
+      remainingTokens: pressure.remainingTokens,
+      hardLimit: pressure.hardLimit,
+      midConversationSystem: supportsMidConversationSystemMessages(this.#binding.model),
+    });
     const delta = this.#systemManager.diffSections(
-      this.#desiredSections(budgetSection),
+      this.#desiredSections(reminder?.role === "system" ? reminder.text : undefined),
       this.#now(),
     );
     let messages = request.context.messages;
     if (delta !== null) messages = [...messages, delta];
+    if (reminder?.role === "user") {
+      // Request-only: a synthetic user reminder protects the cached prefix on the
+      // providers whose adapters cannot carry a mid-conversation system message.
+      messages = [
+        ...messages,
+        { role: "user", content: reminder.text, timestamp: this.#now() } satisfies UserMessage,
+      ];
+    }
     this.#consumeSteers(messages);
     if (this.#options.settings.autoCompact && pressure.shouldCompact) {
       const compacted = await this.#compactWith("active_turn", undefined, messages);
@@ -1472,6 +1552,31 @@ export class NativePiSessionRuntime {
     return append.length === 0 ? undefined : { messages: append };
   };
 
+  #evaluatePressure(
+    messages: ReadonlyArray<AgentMessage>,
+    tools: ReadonlyArray<AgentTool<any>> | undefined,
+  ) {
+    return evaluateContextPressure({
+      messages,
+      model: this.#binding.model,
+      tools: contextRequestTools(tools),
+      calibration: this.#calibration,
+    });
+  }
+
+  /** One real provider report, folded into the series that can measure it. */
+  #recordCalibrationSample(projection: ContextProjection, realTotal: number): void {
+    if (projection.calibration.lastUsageIndex === null) {
+      this.#calibration.recordUnanchored(projection.calibration.tokens, realTotal);
+      return;
+    }
+    this.#calibration.recordAnchored(
+      projection.calibration.usageTokens,
+      projection.calibration.trailingTokens,
+      realTotal,
+    );
+  }
+
   #makeSummarizeFn(): CompactionSummarizeFn {
     return async (request) => {
       const rendered = renderForSummary(request.messages);
@@ -1493,7 +1598,11 @@ export class NativePiSessionRuntime {
         ],
         tools: [],
       });
-      const stream = await this.#baseStreamFn(this.#binding.model, context, { maxRetries: 0 });
+      const stream = await this.#baseStreamFn(
+        this.#binding.model,
+        context,
+        compactionRequestOptions({ sessionId: this.#sessionId, model: this.#binding.model }),
+      );
       let text = "";
       for await (const event of stream) {
         if (event.type === "done") text = contentText(event.message.content);
@@ -1517,34 +1626,47 @@ export class NativePiSessionRuntime {
     const itemId = `compaction:${++this.#sequence}`;
     const before = estimateAgentMessagesTokens(source);
     this.#emit({ type: "compaction", itemId, status: "running", beforeTokenCount: before });
-    try {
-      const checkpoint = await buildCompactionCheckpoint({
+    const build = (strategy: CompactionMode): Promise<CompactionCheckpoint> =>
+      buildCompactionCheckpoint({
         messages: source,
-        mode,
+        mode: strategy,
         model: this.#binding.model,
         timestamp: this.#now(),
         summarizeFn: this.#makeSummarizeFn(),
-        pinnedRecentTurns: mode === "completed_turn" ? (pinnedRecentTurns ?? 1) : undefined,
+        pinnedRecentTurns: strategy === "completed_turn" ? (pinnedRecentTurns ?? 1) : undefined,
       });
-      const installed = installCompactionCheckpoint(source, checkpoint);
-      const after = estimateAgentMessagesTokens(installed);
-      this.#emit({
-        type: "compaction",
-        itemId,
-        status: "completed",
-        beforeTokenCount: before,
-        afterTokenCount: after,
-        summary: checkpoint.summary,
-      });
-      return { messages: installed, summarizedMessageCount: checkpoint.summarizedMessageCount };
-    } catch {
-      this.#emit({ type: "compaction", itemId, status: "failed", beforeTokenCount: before });
-      return null;
+    let checkpoint: CompactionCheckpoint;
+    try {
+      checkpoint = await build(mode);
+    } catch (cause) {
+      if (!isCompactionBudgetError(cause)) {
+        this.#emit({ type: "compaction", itemId, status: "failed", beforeTokenCount: before });
+        return null;
+      }
+      // Even the summary could not make the retained turn fit, so the only
+      // remaining move is a new window that carries just the active goal.
+      try {
+        checkpoint = await build("fresh_window");
+      } catch {
+        this.#emit({ type: "compaction", itemId, status: "failed", beforeTokenCount: before });
+        return null;
+      }
     }
+    const installed = installCompactionCheckpoint(source, checkpoint);
+    this.#reminders.reset();
+    this.#emit({
+      type: "compaction",
+      itemId,
+      status: "completed",
+      beforeTokenCount: checkpoint.beforeTokens,
+      afterTokenCount: checkpoint.afterTokens,
+      summary: checkpoint.summary,
+      ...(checkpoint.failureReason === null ? {} : { failureReason: checkpoint.failureReason }),
+    });
+    return { messages: installed, summarizedMessageCount: checkpoint.summarizedMessageCount };
   }
 
   async compactManually(instructions?: string): Promise<NativeManualCompactionResult> {
-    const before = this.tokenEstimate();
     const checkpoint: CompactionCheckpoint = await buildCompactionCheckpoint({
       messages: this.#agent.state.messages,
       mode: "completed_turn",
@@ -1565,18 +1687,20 @@ export class NativePiSessionRuntime {
       ];
     }
     this.#agent.state.messages = installed;
+    this.#reminders.reset();
     const itemId = `compaction:${++this.#sequence}`;
     const after = estimateAgentMessagesTokens(installed);
     this.#emit({
       type: "compaction",
       itemId,
       status: "completed",
-      beforeTokenCount: before,
+      beforeTokenCount: checkpoint.beforeTokens,
       afterTokenCount: after,
       summary: checkpoint.summary,
+      ...(checkpoint.failureReason === null ? {} : { failureReason: checkpoint.failureReason }),
     });
     return {
-      beforeTokenCount: before,
+      beforeTokenCount: checkpoint.beforeTokens,
       afterTokenCount: after,
       summary: checkpoint.summary,
       itemId,
@@ -1837,7 +1961,8 @@ export class NativePiSessionRuntime {
   }
 
   #clearTrackers(): void {
-    this.#seen = new SeenLinesTracker();
+    this.#anchors = new FileSnapshotStore();
+    this.#registers = new NamedRegisters();
     this.#recovery = new MutationRecoveryTracker();
   }
 

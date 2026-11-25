@@ -8,6 +8,8 @@ import { t3OrchestrationSystemPrompt } from "@t3tools/provider-core/server/orche
 /** Sections render in this order; later sections may depend on earlier ones. */
 export const CANONICAL_SYSTEM_SECTIONS = [
   "runtime",
+  "custom_append",
+  "project_instructions",
   "skills",
   "tool_activation",
   "context",
@@ -213,6 +215,10 @@ export interface BuildT3SystemSectionsInput {
   readonly skillSummary?: string | undefined;
   /** Per-section skill catalog; `skill:<id>` keys append as the catalog changes. */
   readonly skillSections?: Readonly<Record<string, string | null>> | undefined;
+  /** `APPEND_SYSTEM.md`: after the base prompt and before project instructions. */
+  readonly customAppend?: string | undefined;
+  /** The rendered `AGENTS.md` chain: after the custom append and before skills. */
+  readonly projectInstructions?: string | undefined;
   readonly toolActivation?: string | undefined;
   readonly context?: string | undefined;
   readonly contextBudget?: string | undefined;
@@ -248,6 +254,12 @@ export function buildT3SystemSections(input: BuildT3SystemSectionsInput): System
     .join("\n\n");
   return {
     runtime,
+    ...(input.customAppend === undefined || input.customAppend === ""
+      ? {}
+      : { custom_append: input.customAppend }),
+    ...(input.projectInstructions === undefined || input.projectInstructions === ""
+      ? {}
+      : { project_instructions: input.projectInstructions }),
     ...(input.skillSummary === undefined || input.skillSummary === ""
       ? {}
       : { skills: input.skillSummary }),
