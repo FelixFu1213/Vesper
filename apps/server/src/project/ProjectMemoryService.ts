@@ -13,7 +13,7 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 
-import * as ProjectService from "./ProjectService.ts";
+import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
 
 const FORMAT = "entries-v1";
 /** A row from a content-only writer reads back as one untitled entry. */
@@ -66,7 +66,7 @@ export class ProjectMemoryService extends Context.Service<
 
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
-  const projects = yield* ProjectService.ProjectService;
+  const projects = yield* ProjectStore.ProjectStoreV2;
 
   const get = Effect.fn("ProjectMemoryService.get")(function* (projectId: ProjectId) {
     const rows = yield* sql<typeof MemoryRow.Type>`
@@ -106,7 +106,7 @@ const make = Effect.gen(function* () {
     rawEntries: ReadonlyArray<ProjectMemoryEntry>,
   ) {
     const existing = yield* projects
-      .getById(projectId)
+      .get(projectId)
       .pipe(
         Effect.mapError((cause) => failure(projectId, "Could not verify this project.", cause)),
       );

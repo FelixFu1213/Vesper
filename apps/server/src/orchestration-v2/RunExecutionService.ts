@@ -727,6 +727,9 @@ export const layer: Layer.Layer<
     const finalizationObserver = yield* RunFinalizationService.RunFinalizationObserver;
     const turnAnalytics = yield* ProviderUsageAnalytics.ProviderTurnAnalytics;
     const threadCommands = yield* ThreadCommandExecutor.ThreadCommandExecutor;
+    const projectMemoryService = yield* Effect.serviceOption(
+      ProjectMemoryService.ProjectMemoryService,
+    );
 
     const writeFinalRunEvents = Effect.fn("RunExecutionService.writeFinalRunEvents")(
       function* (input: {
@@ -2271,10 +2274,7 @@ export const layer: Layer.Layer<
           mcpAppModelContext,
           input.run.threadId,
         );
-        // Optional so harnesses without project memory keep running; a failed read sends none.
-        const projectMemoryService = yield* Effect.serviceOption(
-          ProjectMemoryService.ProjectMemoryService,
-        );
+        // Uses layer-captured serviceOption so harnesses without project memory keep running and a failed read sends none.
         const projectMemory = Option.isNone(projectMemoryService)
           ? undefined
           : yield* projectMemoryService.value.get(input.appThread.projectId).pipe(

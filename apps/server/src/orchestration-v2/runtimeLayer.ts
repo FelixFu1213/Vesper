@@ -107,6 +107,10 @@ const layerLegacyV1ThreadImporterProvided = LegacyV1ThreadImporter.layer.pipe(
   Layer.provide(layerEventSink),
 );
 
+const layerProjectMemoryService = ProjectMemoryService.layer.pipe(
+  Layer.provide(ProjectStore.layer),
+);
+
 export const layerProjectService = ProjectService.layer.pipe(
   Layer.provide(
     Layer.mergeAll(
@@ -115,12 +119,9 @@ export const layerProjectService = ProjectService.layer.pipe(
       layerEventSink,
       IdAllocator.layer,
       layerLegacyV1ThreadImporterProvided,
+      layerProjectMemoryService,
     ),
   ),
-);
-
-const layerProjectMemoryService = ProjectMemoryService.layer.pipe(
-  Layer.provide(layerProjectService),
 );
 
 const layerProviderEventIngestorProvided = ProviderEventIngestor.layer.pipe(
@@ -173,6 +174,7 @@ const layerRunExecutionServiceProvided = RunExecutionService.layer.pipe(
     Layer.mergeAll(
       McpAppModelContext.layer,
       PreviewAgentActivity.layer,
+      layerProjectMemoryService,
       layerCheckpointServiceProvided,
       layerEventSink,
       IdAllocator.layer,

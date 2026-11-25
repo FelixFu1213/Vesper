@@ -33,6 +33,11 @@ function newEntry(): ProjectMemoryEntry {
 
 function renderEntries(entries: ReadonlyArray<ProjectMemoryEntry>): string {
   return entries
+    .map((entry) => ({
+      title: entry.title.trim(),
+      content: entry.content.trim(),
+    }))
+    .filter((entry) => entry.content !== "")
     .map((entry) => (entry.title === "" ? entry.content : `## ${entry.title}\n\n${entry.content}`))
     .join("\n\n");
 }

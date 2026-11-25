@@ -7,18 +7,18 @@ import * as Option from "effect/Option";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import { runMigrations } from "../persistence/Migrations.ts";
-import * as ProjectService from "./ProjectService.ts";
+import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
 import * as ProjectMemoryService from "./ProjectMemoryService.ts";
 
 const projectId = ProjectId.make("project:memory");
 const missingProjectId = ProjectId.make("project:missing");
 
 const projectLayer = Layer.succeed(
-  ProjectService.ProjectService,
-  ProjectService.ProjectService.of({
-    getById: (id: ProjectId) =>
-      Effect.succeed(id === projectId ? Option.some({ id } as never) : Option.none()),
-  } as unknown as ProjectService.ProjectService["Service"]),
+  ProjectStore.ProjectStoreV2,
+  ProjectStore.ProjectStoreV2.of({
+    get: (id: ProjectId) =>
+      Effect.succeed(id === projectId ? Option.some({ projectId: id } as never) : Option.none()),
+  } as unknown as ProjectStore.ProjectStoreV2["Service"]),
 );
 
 const sqlLayer = NodeSqliteClient.layer({ filename: ":memory:" });
