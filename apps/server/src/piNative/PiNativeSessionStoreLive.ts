@@ -329,6 +329,10 @@ const make = Effect.gen(function* () {
               WHERE provider_thread_id = ${input.providerThreadId} AND id = ${row.id}
             `;
           }
+          yield* sql`
+            UPDATE pi_native_thread_meta SET todos_json = NULL
+            WHERE provider_thread_id = ${input.providerThreadId}
+          `;
         }),
       )
       .pipe(Effect.mapError(fail("PiNativeSessionStore.truncateAfterTurn")));

@@ -1462,4 +1462,63 @@ describe("makePiNativeAdapterV2", () => {
       assert.notInclude(afterRollback, "toolResult");
     }).pipe(Effect.provide(testLayer())),
   );
+
+  it.effect(
+    "preserves compaction summaries across restart without duplicating retained messages",
+    () =>
+      Effect.gen(function* () {
+        const store = makeInMemoryPiNativeSessionStore({ durable: true });
+        const recorder = (steps: ScriptedTurn[], contexts: Array<ReadonlyArray<unknown>>) => {
+          const streamFn: StreamFn = (model, context) => {
+            contexts.push(context.messages);
+            const turn = steps.shift();
+            if (turn === undefined) throw new Error("No scripted turn left.");
+            return renderScriptedTurn(model, turn, 0);
+          };
+          return streamFn;
+        };
+        const firstContexts: Array<ReadonlyArray<unknown>> = [];
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const harness = yield* makeHarness({
+              sessionStore: store,
+              streamFn: recorder(
+                [
+                  scriptedTextResponse("answer one"),
+                  scriptedTextResponse("answer two"),
+                  scriptedTextResponse(
+                    "<compaction_summary>\n## Goals\nShip cleanly\n## Progress\nDone turn one\n## Files\n(none)\n## Decisions\n(none)\n## Next Steps\nContinue\n</compaction_summary>",
+                  ),
+                ],
+                firstContexts,
+              ),
+            });
+            yield* startTurnWithText(harness, 1, "turn one prompt");
+            assert.equal((yield* harness.takeEvent("turn.terminal")).status, "completed");
+            yield* startTurnWithText(harness, 2, "turn two prompt");
+            assert.equal((yield* harness.takeEvent("turn.terminal")).status, "completed");
+            const input = yield* harness.turnInput(3);
+            yield* harness.runtime.compactThread!(input);
+            assert.equal((yield* harness.takeEvent("turn.terminal")).status, "completed");
+          }),
+        );
+
+        const postRestartContexts: Array<ReadonlyArray<unknown>> = [];
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const harness = yield* makeHarness({
+              sessionStore: store,
+              streamFn: recorder([scriptedTextResponse("resumed")], postRestartContexts),
+            });
+            yield* startTurnWithText(harness, 3, "turn three prompt");
+            assert.equal((yield* harness.takeEvent("turn.terminal")).status, "completed");
+          }),
+        );
+        const sent = postRestartContexts[0] ?? [];
+        const wire = JSON.stringify(sent);
+        assert.include(wire, "<compaction_summary>");
+        assert.include(wire, "Ship cleanly");
+        assert.lengthOf(wire.match(/turn two prompt/gu) ?? [], 1);
+      }).pipe(Effect.provide(testLayer())),
+  );
 });

@@ -1445,7 +1445,7 @@ export class NativePiSessionRuntime {
         afterTokenCount: after,
         summary: checkpoint.summary,
       });
-      await this.#persistCheckpoint(checkpoint);
+      await this.#persistCheckpoint(checkpoint, source, installed);
       return { messages: installed, summarizedMessageCount: checkpoint.summarizedMessageCount };
     } catch {
       this.#emit({ type: "compaction", itemId, status: "failed", beforeTokenCount: before });
@@ -1455,24 +1455,25 @@ export class NativePiSessionRuntime {
 
   async compactManually(instructions?: string): Promise<NativeManualCompactionResult> {
     const before = this.tokenEstimate();
+    const source = this.#agent.state.messages;
     const checkpoint: CompactionCheckpoint = await buildCompactionCheckpoint({
-      messages: this.#agent.state.messages,
+      messages: source,
       mode: "completed_turn",
       model: this.#binding.model,
       timestamp: this.#now(),
       summarizeFn: this.#makeSummarizeFn(),
       pinnedRecentTurns: 1,
     });
-    let installed = installCompactionCheckpoint(this.#agent.state.messages, checkpoint);
+    const installedBase = installCompactionCheckpoint(source, checkpoint);
+    let instructionMessage: UserMessage | undefined;
+    let installed: AgentMessage[] = installedBase;
     if (instructions !== undefined && instructions.trim() !== "") {
-      installed = [
-        ...installed,
-        {
-          role: "user",
-          content: `<compaction_instructions>${instructions.trim()}</compaction_instructions>`,
-          timestamp: this.#now(),
-        } satisfies UserMessage,
-      ];
+      instructionMessage = {
+        role: "user",
+        content: `<compaction_instructions>${instructions.trim()}</compaction_instructions>`,
+        timestamp: this.#now(),
+      };
+      installed = [...installedBase, instructionMessage];
     }
     this.#agent.state.messages = installed;
     const itemId = `compaction:${++this.#sequence}`;
@@ -1485,7 +1486,10 @@ export class NativePiSessionRuntime {
       afterTokenCount: after,
       summary: checkpoint.summary,
     });
-    await this.#persistCheckpoint(checkpoint);
+    await this.#persistCheckpoint(checkpoint, source, installedBase);
+    if (instructionMessage !== undefined) {
+      await this.#appendNewRecords([instructionMessage]);
+    }
     await this.#persistMeta();
     return {
       beforeTokenCount: before,
@@ -1843,7 +1847,6 @@ export class NativePiSessionRuntime {
     for (const declaration of declarations) {
       this.#journal.markPersisted(declaration.message, declaration.id);
     }
-    this.#lastRecordId = records.at(-1)?.id ?? this.#lastRecordId;
   }
 
   async #persistMeta(): Promise<void> {
@@ -1859,7 +1862,11 @@ export class NativePiSessionRuntime {
     await this.#enqueueWrite(() => Effect.runPromise(store.saveMeta(meta)));
   }
 
-  async #persistCheckpoint(checkpoint: CompactionCheckpoint): Promise<void> {
+  async #persistCheckpoint(
+    checkpoint: CompactionCheckpoint,
+    sourceMessages: readonly AgentMessage[],
+    installedMessages: readonly AgentMessage[],
+  ): Promise<void> {
     const store = this.#store;
     if (store === null || this.#persistenceKey === "") return;
     const leadingSystemJson =
@@ -1867,9 +1874,27 @@ export class NativePiSessionRuntime {
         ? null
         : serializeSystemMessage(checkpoint.leadingSystem);
     if (leadingSystemJson !== null) this.#journal.rememberCheckpoint(leadingSystemJson);
+    let throughMessageId: string | null = null;
+    for (let index = sourceMessages.length - 1; index >= 0; index -= 1) {
+      const candidate = sourceMessages[index];
+      if (candidate === undefined || candidate.role === "system") continue;
+      const id = this.#recordIds.get(candidate);
+      if (id !== undefined) {
+        throughMessageId = id;
+        break;
+      }
+    }
+    if (throughMessageId === null) throughMessageId = this.#lastRecordId;
+    for (const message of installedMessages) {
+      if (message.role === "system") {
+        this.#journal.markPersisted(message, this.#newRecordId());
+      } else {
+        this.#restoredMessages.add(message);
+      }
+    }
     const record: PersistedCompactionCheckpoint = {
       providerThreadId: this.#persistenceKey,
-      throughMessageId: this.#lastRecordId,
+      throughMessageId,
       mode: checkpoint.mode,
       summary: checkpoint.summary,
       leadingSystemJson,
@@ -1920,20 +1945,39 @@ export class NativePiSessionRuntime {
       if (restored === null) return false;
       this.#agent.state.messages = [...restored.messages];
       this.#todos = cloneTodoSnapshot(restored.todos);
+      if (
+        this.#contextText === undefined &&
+        snapshot.meta?.contextText !== null &&
+        snapshot.meta?.contextText !== undefined
+      ) {
+        this.#contextText = snapshot.meta.contextText;
+      }
       this.#restoredTranscript = true;
       this.#recordSequence = snapshot.records.reduce(
         (next: number, record: PersistedTranscriptRecord) => Math.max(next, record.sequence + 1),
         0,
       );
-      this.#lastRecordId = snapshot.records.at(-1)?.id ?? null;
+      this.#lastRecordId =
+        [...snapshot.records].reverse().find((record) => record.system === null)?.id ?? null;
       this.#turnCursor = snapshot.records.reduce(
         (next: number, record: PersistedTranscriptRecord) =>
           record.turnIndex < 0 ? next : Math.max(next, record.turnIndex + 1),
         0,
       );
+      if (snapshot.checkpoint?.leadingSystemJson) {
+        this.#journal.rememberCheckpoint(snapshot.checkpoint.leadingSystemJson);
+      }
+      for (const [message, id] of restored.recordIds) {
+        this.#recordIds.set(message, id);
+      }
       for (const message of this.#agent.state.messages) {
         this.#restoredMessages.add(message);
-        if (message.role === "system") this.#journal.markPersisted(message, this.#newRecordId());
+        if (message.role === "system") {
+          this.#journal.markPersisted(
+            message,
+            restored.recordIds.get(message) ?? this.#newRecordId(),
+          );
+        }
       }
       return true;
     })();
@@ -2003,6 +2047,7 @@ export class NativePiSessionRuntime {
           }),
         ),
       );
+      await this.#persistMeta();
     }
   }
 

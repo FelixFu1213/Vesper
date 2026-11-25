@@ -167,6 +167,9 @@ export const makeInMemoryPiNativeSessionStore = (options?: {
           target.checkpoint,
           new Set(target.records.map((record) => record.id)),
         );
+        if (target.meta !== null) {
+          target.meta = { ...target.meta, todosJson: null };
+        }
       }),
     cloneThread: ({ sourceProviderThreadId, targetProviderThreadId, targetTurnCount }) =>
       Effect.sync(() => {

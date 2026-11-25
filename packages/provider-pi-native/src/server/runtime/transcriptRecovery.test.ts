@@ -1,5 +1,10 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, ToolResultMessage, UserMessage } from "@earendil-works/pi-ai";
+import type {
+  AssistantMessage,
+  SystemMessage,
+  ToolResultMessage,
+  UserMessage,
+} from "@earendil-works/pi-ai";
 import { assert, describe, it } from "@effect/vitest";
 
 import type {
@@ -170,10 +175,38 @@ describe("restoreTranscript", () => {
     });
     assert.isTrue(restored.checkpoint);
     assert.lengthOf(restored.messages, 3);
+    const system = restored.messages[0] as SystemMessage;
+    assert.include(String(system.content), "base");
+    assert.include(String(system.content), "<compaction_summary>done</compaction_summary>");
     const kept = restored.messages[1] as AssistantMessage;
     assert.equal(kept.usage.input, 0);
     assert.equal(kept.usage.output, 0);
     assert.equal((restored.messages[2] as UserMessage).content, "new");
+    assert.equal(restored.recordIds.get(restored.messages[2] as AgentMessage), "u2");
+  });
+
+  it("restores a whole-thread checkpoint when throughMessageId is null", async () => {
+    const checkpoint: PersistedCompactionCheckpoint = {
+      providerThreadId: "thread",
+      throughMessageId: null,
+      mode: "completed_turn",
+      summary: "<compaction_summary>whole</compaction_summary>",
+      leadingSystemJson: JSON.stringify({ role: "system", content: "base", timestamp }),
+      retainedMessagesJson: "[]",
+      summarizedMessageCount: 2,
+      chunkCount: 1,
+      usedFallback: false,
+      createdAtMs: timestamp,
+    };
+    const restored = await restoreTranscript({
+      snapshot: snapshot([row("u1", user("old"), 0)], { checkpoint }),
+      model,
+      now: timestamp,
+    });
+    assert.isTrue(restored.checkpoint);
+    assert.lengthOf(restored.messages, 1);
+    const system = restored.messages[0] as SystemMessage;
+    assert.include(String(system.content), "<compaction_summary>whole</compaction_summary>");
   });
 
   it("degrades missing and oversized image refs to placeholder notes", async () => {

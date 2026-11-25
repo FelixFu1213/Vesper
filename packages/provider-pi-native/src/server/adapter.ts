@@ -2277,6 +2277,9 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
           },
         });
         if (sessionStore !== null) {
+          if (source.runtime !== null) {
+            yield* Effect.promise(() => source.runtime!.persistCurrentTranscript());
+          }
           yield* sessionStore
             .cloneThread({
               sourceProviderThreadId: source.providerThread.id,

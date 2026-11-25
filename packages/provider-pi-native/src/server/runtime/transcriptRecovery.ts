@@ -1,11 +1,13 @@
 // @effect-diagnostics nodeBuiltinImport:off -- Restored image refs are read from the session's filesystem roots.
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type {
-  AssistantMessage,
-  TextContent,
-  ToolCall,
-  ToolResultMessage,
-  UserMessage,
+import {
+  contentText,
+  type AssistantMessage,
+  type SystemMessage,
+  type TextContent,
+  type ToolCall,
+  type ToolResultMessage,
+  type UserMessage,
 } from "@earendil-works/pi-ai";
 import * as NodeFSP from "node:fs/promises";
 
@@ -39,6 +41,7 @@ export interface RestoreTranscriptInput {
 
 export interface RestoredTranscript {
   readonly messages: readonly AgentMessage[];
+  readonly recordIds: ReadonlyMap<AgentMessage, string>;
   readonly todos: TodoSnapshot;
   readonly activatedToolNames: readonly string[];
   readonly checkpoint: boolean;
@@ -200,6 +203,7 @@ async function admitImages(
   messages: AgentMessage[],
   readImage: ReadRestoredImage,
   supportsVision: boolean,
+  recordIds: Map<AgentMessage, string>,
 ): Promise<AgentMessage[]> {
   const slots: ImageSlot[] = [];
   messages.forEach((message, messageIndex) => {
@@ -292,7 +296,13 @@ async function admitImages(
         ? decision.note
         : { type: "image" as const, data: decision.data, mimeType: block.mimeType };
     });
-    return { ...message, content } as AgentMessage;
+    const updated = { ...message, content } as AgentMessage;
+    const id = recordIds.get(message);
+    if (id !== undefined) {
+      recordIds.delete(message);
+      recordIds.set(updated, id);
+    }
+    return updated;
   });
 }
 
@@ -383,6 +393,7 @@ function reconstructRows(
   now: number,
   retainedCalls: readonly { readonly id: string; readonly name: string }[],
   retainedCallIds: ReadonlySet<string>,
+  recordIds: Map<AgentMessage, string>,
 ): AgentMessage[] {
   const messages: AgentMessage[] = [];
   let pending: { readonly id: string; readonly name: string }[] = [...retainedCalls];
@@ -390,17 +401,21 @@ function reconstructRows(
     for (const call of pending) messages.push(errorResult(call, now));
     pending = [];
   };
+  const pushWithId = (message: AgentMessage, id: string): void => {
+    recordIds.set(message, id);
+    messages.push(message);
+  };
   const knownCalls = new Set(retainedCallIds);
   for (const row of rows) {
     try {
       if (row.role === "system") {
-        messages.push(readSystemMessage(row.messageJson));
+        pushWithId(readSystemMessage(row.messageJson), row.id);
         continue;
       }
       if (row.role === "user") {
         flush();
         const message = parseUserMessage(row.messageJson);
-        if (message !== null) messages.push(message);
+        if (message !== null) pushWithId(message, row.id);
         continue;
       }
       if (row.role === "assistant") {
@@ -408,7 +423,7 @@ function reconstructRows(
         const message = parseAssistantMessage(row.messageJson);
         if (message === null) continue;
         if (message.content.length === 0) continue;
-        messages.push(message);
+        pushWithId(message, row.id);
         for (const call of toolCallsOf(message)) {
           pending.push({ id: call.id, name: call.name });
           knownCalls.add(call.id);
@@ -420,18 +435,18 @@ function reconstructRows(
       const index = pending.findIndex((call) => call.id === result.toolCallId);
       if (index >= 0) {
         pending.splice(index, 1);
-        messages.push(result);
+        pushWithId(result, row.id);
         continue;
       }
       if (knownCalls.has(result.toolCallId)) {
-        messages.push(result);
+        pushWithId(result, row.id);
         continue;
       }
       flush();
       messages.push(
         carrierFor({ id: result.toolCallId, name: result.toolName }, model, result.timestamp),
       );
-      messages.push(result);
+      pushWithId(result, row.id);
       knownCalls.add(result.toolCallId);
     } catch {
       // A malformed row must not cost the rest of the transcript.
@@ -446,12 +461,27 @@ const zeroUsage = (message: AgentMessage): AgentMessage =>
 
 function checkpointPrefix(checkpoint: PersistedCompactionCheckpoint, now: number): AgentMessage[] {
   const messages: AgentMessage[] = [];
+  let leadingSystem: SystemMessage | undefined;
   if (checkpoint.leadingSystemJson !== null) {
     try {
-      messages.push(readSystemMessage(checkpoint.leadingSystemJson));
+      leadingSystem = readSystemMessage(checkpoint.leadingSystemJson);
     } catch {
       // The summary still survives without the folded system prompt.
     }
+  }
+  const summary = checkpoint.summary.trim();
+  if (leadingSystem !== undefined) {
+    const base = contentText(leadingSystem.content);
+    messages.push(
+      summary !== "" && !base.includes(summary)
+        ? {
+            ...leadingSystem,
+            content: base === "" ? summary : `${base}\n\n${summary}`,
+          }
+        : leadingSystem,
+    );
+  } else if (summary !== "") {
+    messages.push(leadingFallback(checkpoint, now));
   }
   const retained: unknown = JSON.parse(checkpoint.retainedMessagesJson);
   if (Array.isArray(retained)) {
@@ -586,34 +616,42 @@ export async function restoreTranscript(
 ): Promise<RestoredTranscript> {
   const rows = orderSystemRows(input.snapshot.records);
   const checkpoint = input.snapshot.checkpoint;
+  const recordIds = new Map<AgentMessage, string>();
   const boundary =
-    checkpoint?.throughMessageId === null || checkpoint?.throughMessageId === undefined
+    checkpoint === null || checkpoint.throughMessageId === null
       ? undefined
       : rows.findIndex((row) => row.id === checkpoint.throughMessageId);
   let messages: AgentMessage[];
   let restoredCheckpoint = false;
-  if (checkpoint !== null && boundary !== undefined && boundary >= 0) {
+  if (
+    checkpoint !== null &&
+    (checkpoint.throughMessageId === null || (boundary !== undefined && boundary >= 0))
+  ) {
     const retained = retainedUsage(checkpoint, input.now);
+    const afterRows = boundary === undefined ? [] : rows.slice(boundary + 1);
     const after = reconstructRows(
-      rows.slice(boundary + 1),
+      afterRows,
       input.model,
       input.now,
       retained.retainedCalls,
       retained.callIds,
+      recordIds,
     );
     messages = [...retained.messages, ...after];
     restoredCheckpoint = true;
   } else {
-    messages = reconstructRows(rows, input.model, input.now, [], new Set());
+    messages = reconstructRows(rows, input.model, input.now, [], new Set(), recordIds);
   }
   messages = await admitImages(
     messages,
     input.readImage ?? readRestoredImageFromDisk,
     input.supportsVision !== false,
+    recordIds,
   );
   const meta = input.snapshot.meta;
   return {
     messages,
+    recordIds,
     todos: parseTodos(meta?.todosJson ?? null) ?? restoreTodosFromMessages(messages),
     activatedToolNames: parseToolNames(meta?.activatedToolNamesJson ?? "[]"),
     checkpoint: restoredCheckpoint,
