@@ -9,6 +9,7 @@ import { t3OrchestrationSystemPrompt } from "@t3tools/provider-core/server/orche
 export const CANONICAL_SYSTEM_SECTIONS = [
   "runtime",
   "skills",
+  "on_demand_tools",
   "tool_activation",
   "context",
   "context_budget",
@@ -175,6 +176,8 @@ export interface BuildT3SystemSectionsInput {
   readonly hasDeviceTools?: boolean | undefined;
   /** Skill names and descriptions available to this thread. */
   readonly skillSummary?: string | undefined;
+  /** Bounded `# On-demand tools` catalog of tools the model must search for first. */
+  readonly onDemandTools?: string | undefined;
   readonly toolActivation?: string | undefined;
   readonly context?: string | undefined;
   readonly contextBudget?: string | undefined;
@@ -213,6 +216,9 @@ export function buildT3SystemSections(input: BuildT3SystemSectionsInput): System
     ...(input.skillSummary === undefined || input.skillSummary === ""
       ? {}
       : { skills: input.skillSummary }),
+    ...(input.onDemandTools === undefined || input.onDemandTools === ""
+      ? {}
+      : { on_demand_tools: input.onDemandTools }),
     ...(toolActivation === "" ? {} : { tool_activation: toolActivation }),
     ...(input.context === undefined || input.context === "" ? {} : { context: input.context }),
     ...(input.contextBudget === undefined || input.contextBudget === ""

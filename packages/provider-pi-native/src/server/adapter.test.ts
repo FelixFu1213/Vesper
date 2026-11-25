@@ -528,6 +528,8 @@ describe("makePiNativeAdapterV2", () => {
     Effect.gen(function* () {
       const harness = yield* makeHarness({
         steps: [
+          // asktool is on demand, so the model activates it before the first call.
+          scriptedToolCallResponse([{ name: "ToolSearch", arguments: { query: "asktool" } }]),
           scriptedToolCallResponse([
             {
               name: "asktool",
@@ -1151,6 +1153,7 @@ describe("makePiNativeAdapterV2", () => {
       Effect.gen(function* () {
         const harness = yield* makeHarness({
           steps: [
+            scriptedToolCallResponse([{ name: "ToolSearch", arguments: { query: "todo" } }]),
             scriptedToolCallResponse([
               {
                 name: "TodoWrite",

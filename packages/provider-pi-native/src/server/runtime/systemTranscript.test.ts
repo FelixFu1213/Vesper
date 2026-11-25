@@ -184,6 +184,23 @@ describe("buildT3SystemSections", () => {
     assert.isUndefined(cleared.tool_activation);
   });
 
+  it("renders the on-demand tool catalog between skills and tool activation", () => {
+    const sections = buildT3SystemSections({
+      harness: "Pi Native",
+      skillSummary: "skill: orca-cli",
+      onDemandTools: "# On-demand tools\n- TodoWrite: Replace the visible todo list.",
+      planMode: true,
+    });
+
+    assert.deepEqual(
+      Object.keys(sections),
+      CANONICAL_SYSTEM_SECTIONS.filter((name) => sections[name] !== undefined),
+    );
+    assert.equal(CANONICAL_SYSTEM_SECTIONS.indexOf("on_demand_tools"), 2);
+    assert.include(sections.on_demand_tools ?? "", "- TodoWrite:");
+    assert.include(sections.tool_activation ?? "", "plan_mode");
+  });
+
   it("leaves optional sections out when they have no content", () => {
     const sections = buildT3SystemSections({
       harness: "Pi",

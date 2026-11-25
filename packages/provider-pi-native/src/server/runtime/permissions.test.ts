@@ -329,6 +329,7 @@ describe("plan mode", () => {
       );
       expect((await test.evaluate("Task", { prompt: "look around" })).allowed).toBe(true);
       expect((await test.evaluate("mcp__t3-code__list_threads", {})).allowed).toBe(true);
+      expect((await test.evaluate("ToolSearch", { query: "SubmitPlan" })).allowed).toBe(true);
 
       const write = await test.evaluate("Write", { path: inWorkspace(workspace, "a.ts") });
       expect(write.allowed).toBe(false);
