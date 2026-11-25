@@ -178,6 +178,34 @@ describe("command permissions", () => {
     }),
   );
 
+  it.effect("guards project memory reads by read scope and writes by operate scope", () =>
+    Effect.gen(function* () {
+      const registry = yield* setup;
+      const read = createCommandPermissions(runtime, WS_METHODS.projectsGetMemory);
+      const write = createCommandPermissions(runtime, WS_METHODS.projectsSetMemory);
+      registry.set(sessions(env), AsyncResult.success(grant(false)));
+      expect(registry.get(read.permissionAtom(env))).toBe(false);
+      expect(registry.get(write.permissionAtom(env))).toBe(false);
+      registry.set(
+        sessions(env),
+        AsyncResult.success({
+          ...grant(false),
+          scopes: [AuthOrchestrationReadScope],
+          permissions: [AuthOrchestrationReadScope],
+        }),
+      );
+      expect(registry.get(read.permissionAtom(env))).toBe(true);
+      yield* read.authorize(registry, env);
+      expect(registry.get(write.permissionAtom(env))).toBe(false);
+      expect((yield* write.authorize(registry, env).pipe(Effect.flip)).requiredScope).toBe(
+        AuthOrchestrationOperateScope,
+      );
+      registry.set(sessions(env), AsyncResult.success(grant(true)));
+      expect(registry.get(write.permissionAtom(env))).toBe(true);
+      yield* write.authorize(registry, env);
+    }),
+  );
+
   it.effect.each([WS_METHODS.serverCheckOtlpEndpoint, WS_METHODS.serverCheckSecretSource])(
     "requires the destination settings grant for %s",
     (method) =>

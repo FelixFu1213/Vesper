@@ -19,6 +19,7 @@ import {
   type OrchestrationV2StoredEvent,
   type OrchestrationV2Subagent,
   type OrchestrationV2TurnItem,
+  ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderSessionId,
@@ -60,6 +61,7 @@ import * as ProviderEventIngestor from "./ProviderEventIngestor.ts";
 import * as ProviderUsageAnalytics from "../telemetry/ProviderUsageAnalytics.ts";
 import * as McpAppModelContext from "../mcpApps/McpAppModelContext.ts";
 import * as PreviewAgentActivity from "../preview/PreviewAgentActivity.ts";
+import * as ProjectMemoryService from "../project/ProjectMemoryService.ts";
 import * as RunExecutionService from "./RunExecutionService.ts";
 import * as RunFinalizationService from "./RunFinalizationService.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
@@ -984,6 +986,92 @@ it.effect("passes the thread's MCP app context to the provider under a safe key"
                     text: "2 overdue",
                   },
                 ]),
+            }),
+            Layer.mock(CheckpointService.CheckpointServiceV2)({
+              captureBaseline: () => Effect.void,
+            }),
+            layerTurnItemPositionsTest,
+            mockEventSink({}),
+            IdAllocator.layer,
+            ThreadCommandExecutor.layer,
+            Layer.mock(ProviderEventIngestor.ProviderEventIngestorV2)({
+              ingestNormalized: () => Effect.succeed([]),
+            }),
+            ServerSettings.layerTest(),
+          ),
+        ),
+      ),
+    ),
+  ),
+);
+
+it.effect("passes project memory captured at layer construction into provider turns", () =>
+  Effect.gen(function* () {
+    const runExecution = yield* RunExecutionService.RunExecutionServiceV2;
+    const started = yield* Deferred.make<ProviderAdapter.ProviderAdapterV2TurnInput>();
+    const threadId = ThreadId.make("thread:run-execution-project-memory");
+    const projectId = ProjectId.make("project:run-execution-memory");
+    const providerInstanceId = ProviderInstanceId.make("codex");
+    const attemptId = RunAttemptId.make("attempt:run-execution-project-memory");
+    const session = {
+      events: Stream.never,
+      startTurn: (input: ProviderAdapter.ProviderAdapterV2TurnInput) =>
+        Deferred.succeed(started, input),
+    } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime;
+
+    yield* runExecution.startRootRun({
+      commandId: CommandId.make("command:run-execution-project-memory"),
+      appThread: { ...rootAppThread(threadId), projectId },
+      providerSessionId: ProviderSessionId.make("session:run-execution-project-memory"),
+      session,
+      run: {
+        id: RunId.make("run:run-execution-project-memory"),
+        threadId,
+        ordinal: 1,
+        providerInstanceId,
+      } as OrchestrationV2Run,
+      rootNode: {
+        id: NodeId.make("node:run-execution-project-memory"),
+      } as OrchestrationV2ExecutionNode,
+      checkpointScope: {
+        id: CheckpointScopeId.make("checkpoint-scope:run-execution-project-memory"),
+      } as OrchestrationV2CheckpointScope,
+      providerThread: {
+        id: ProviderThreadId.make("provider-thread:run-execution-project-memory"),
+        driver,
+      } as OrchestrationV2ProviderThread,
+      attempt: { id: attemptId, providerTurnId: null } as OrchestrationV2RunAttempt,
+      attemptId,
+      providerTurnOrdinal: 1,
+      message: {
+        messageId: MessageId.make("message:run-execution-project-memory"),
+        text: "Check memory",
+        attachments: [],
+        createdBy: "user",
+        creationSource: "web",
+      },
+      modelSelection: { instanceId: providerInstanceId, model: "gpt-5.4" },
+      runtimePolicy: { runtimeMode: "full-access", interactionMode: "default", cwd: process.cwd() },
+    });
+
+    const input = yield* Deferred.await(started);
+    assert.strictEqual(input.projectMemory, "Use staging DB.");
+  }).pipe(
+    Effect.provide(
+      RunExecutionService.layer.pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            McpAppModelContext.layerEmpty,
+            PreviewAgentActivity.layer,
+            Layer.mock(ProjectMemoryService.ProjectMemoryService)({
+              get: (id) =>
+                Effect.succeed({
+                  projectId: id,
+                  content:
+                    id === ProjectId.make("project:run-execution-memory") ? "Use staging DB." : "",
+                  entries: [],
+                  updatedAt: null,
+                }),
             }),
             Layer.mock(CheckpointService.CheckpointServiceV2)({
               captureBaseline: () => Effect.void,

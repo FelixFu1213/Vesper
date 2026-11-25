@@ -13,6 +13,8 @@ import {
   ProviderInteractionMode,
   Project,
   ProjectCreatePayload,
+  ProjectMemory,
+  ProjectMemoryEntry,
   ProjectUpdatePayload,
   ProjectId,
   OrchestratorMcpClientRequestId,
@@ -32,6 +34,7 @@ import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Schema from "effect/Schema";
 import { Tool, Toolkit } from "effect/ai";
 import * as ProjectService from "../../../project/ProjectService.ts";
+import * as ProjectMemoryService from "../../../project/ProjectMemoryService.ts";
 import * as ProjectCloneTracker from "../../../project/ProjectCloneTracker.ts";
 import * as ManagedProjectFolders from "../../../project/ManagedProjectFolders.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
@@ -190,6 +193,32 @@ const ThreadLaunchTool = Tool.make("t3_thread_launch", {
   .annotate(Tool.Destructive, true)
   .annotate(Tool.OpenWorld, true);
 
+const ProjectMemoryReadTool = Tool.make("t3_project_memory_read", {
+  ...shared,
+  description:
+    "Read one project's memory: durable notes the user keeps for it. `projectId` defaults to the calling thread's project.",
+  parameters: Schema.Struct({
+    environmentId: OrchestratorMcpEnvironmentTarget,
+    projectId: Schema.optional(ProjectId),
+  }),
+  success: ProjectMemory,
+  dependencies: [...shared.dependencies, ProjectMemoryService.ProjectMemoryService],
+})
+  .annotate(Tool.Readonly, true)
+  .annotate(Tool.Destructive, false);
+const ProjectMemorySetTool = Tool.make("t3_project_memory_set", {
+  ...shared,
+  description:
+    "Replace one project's memory with `entries`, each an optional title and content. `projectId` defaults to the calling thread's project. Pass an empty list to clear it.",
+  parameters: Schema.Struct({
+    environmentId: OrchestratorMcpEnvironmentTarget,
+    projectId: Schema.optional(ProjectId),
+    entries: Schema.Array(ProjectMemoryEntry),
+  }),
+  success: ProjectMemory,
+  dependencies: [...shared.dependencies, ProjectMemoryService.ProjectMemoryService],
+}).annotate(Tool.Destructive, true);
+
 export const ProjectToolkit = Toolkit.make(
   ThreadLaunchTool,
   ProjectListTool,
@@ -198,4 +227,6 @@ export const ProjectToolkit = Toolkit.make(
   ProjectUpdateTool,
   ProjectDeleteTool,
   ProjectCloneTool,
+  ProjectMemoryReadTool,
+  ProjectMemorySetTool,
 );

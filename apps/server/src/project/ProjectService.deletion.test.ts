@@ -33,6 +33,7 @@ import * as ServerSettings from "../serverSettings.ts";
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
 import * as ProjectEnrichmentService from "./ProjectEnrichmentService.ts";
 import * as ProjectFaviconResolver from "./ProjectFaviconResolver.ts";
+import * as ProjectMemoryService from "./ProjectMemoryService.ts";
 import * as ProjectService from "./ProjectService.ts";
 import * as RepositoryIdentityResolver from "./RepositoryIdentityResolver.ts";
 
@@ -563,4 +564,32 @@ it.effect.each([
         });
       }).pipe(Effect.provide(layerServices));
     }).pipe(Effect.provide(layerDatabase)),
+);
+
+it.effect("deletes stored project memory when deleting a project through the layer", () =>
+  Effect.gen(function* () {
+    const projectId = ProjectId.make("project:memory-cleanup");
+    yield* seedProject(projectId);
+
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`
+      INSERT INTO project_memory (project_id, format, entries_json, content, updated_at)
+      VALUES (${projectId}, 'entries-v1', '[]', 'Remember me.', '2026-01-01T00:00:00.000Z')
+    `;
+
+    const layerTestProjectService = ProjectService.layer.pipe(
+      Layer.provide(ProjectMemoryService.layer),
+      Layer.provide(layerServices),
+    );
+    yield* Effect.gen(function* () {
+      const service = yield* ProjectService.ProjectService;
+      yield* service.delete({
+        commandId: CommandId.make("command:memory-cleanup:project-delete"),
+        projectId,
+      });
+    }).pipe(Effect.provide(layerTestProjectService));
+
+    const rows = yield* sql`SELECT project_id FROM project_memory WHERE project_id = ${projectId}`;
+    assert.strictEqual(rows.length, 0);
+  }).pipe(Effect.provide(layerDatabase)),
 );

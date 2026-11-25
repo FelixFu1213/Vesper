@@ -34,6 +34,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schedule from "effect/Schedule";
@@ -43,6 +44,7 @@ import * as Stream from "effect/Stream";
 import * as McpSessionRegistry from "../mcp/McpSessionRegistry.ts";
 import * as McpAppModelContext from "../mcpApps/McpAppModelContext.ts";
 import * as PreviewAgentActivity from "../preview/PreviewAgentActivity.ts";
+import * as ProjectMemoryService from "../project/ProjectMemoryService.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as CheckpointService from "./CheckpointService.ts";
 import * as EventSink from "./EventSink.ts";
@@ -726,6 +728,9 @@ export const layer: Layer.Layer<
     const finalizationObserver = yield* RunFinalizationService.RunFinalizationObserver;
     const turnAnalytics = yield* ProviderUsageAnalytics.ProviderTurnAnalytics;
     const threadCommands = yield* ThreadCommandExecutor.ThreadCommandExecutor;
+    const projectMemoryService = yield* Effect.serviceOption(
+      ProjectMemoryService.ProjectMemoryService,
+    );
 
     const writeFinalRunEvents = Effect.fn("RunExecutionService.writeFinalRunEvents")(
       function* (input: {
@@ -2270,6 +2275,17 @@ export const layer: Layer.Layer<
           mcpAppModelContext,
           input.run.threadId,
         );
+        // Uses layer-captured serviceOption so harnesses without project memory keep running and a failed read sends none.
+        const projectMemory = Option.isNone(projectMemoryService)
+          ? undefined
+          : yield* projectMemoryService.value.get(input.appThread.projectId).pipe(
+              Effect.map((memory) => (memory.content.trim() === "" ? undefined : memory.content)),
+              Effect.catch((cause) =>
+                Effect.logWarning("Failed to read project memory.", { cause }).pipe(
+                  Effect.as(undefined),
+                ),
+              ),
+            );
         const turnInput = {
           appThread: input.appThread,
           threadId: input.run.threadId,
@@ -2291,6 +2307,7 @@ export const layer: Layer.Layer<
           modelSelection: input.modelSelection,
           runtimePolicy: input.runtimePolicy,
           ...(appContext.length === 0 ? {} : { appContext }),
+          ...(projectMemory === undefined ? {} : { projectMemory }),
         };
         // Check after the context read: ingestion can settle the run while
         // it awaits. A failed ownership read fails the start below.

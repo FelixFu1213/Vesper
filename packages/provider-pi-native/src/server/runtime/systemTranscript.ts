@@ -4,6 +4,7 @@ import type { OrchestrationV2ProviderGoal } from "@t3tools/contracts";
 import type { ProviderAdapterV2RuntimePolicy } from "@t3tools/provider-core/server/ProviderAdapter";
 import { buildRuntimeInstructions } from "@t3tools/provider-core/server/runtimeInstructions";
 import { t3OrchestrationSystemPrompt } from "@t3tools/provider-core/server/orchestrationInstructions";
+import { projectMemoryPrompt } from "./projectMemoryPrompt.ts";
 
 /** Sections render in this order; later sections may depend on earlier ones. */
 export const CANONICAL_SYSTEM_SECTIONS = [
@@ -14,6 +15,7 @@ export const CANONICAL_SYSTEM_SECTIONS = [
   "on_demand_tools",
   "tool_activation",
   "context",
+  "project_memory",
   "context_budget",
 ] as const;
 
@@ -226,6 +228,7 @@ export interface BuildT3SystemSectionsInput {
   /** Advertised once the session's scratch directory exists. */
   readonly scratchDir?: string | undefined;
   readonly context?: string | undefined;
+  readonly projectMemory?: string | undefined;
   readonly contextBudget?: string | undefined;
   readonly planMode?: boolean | undefined;
   readonly goal?: OrchestrationV2ProviderGoal | null | undefined;
@@ -263,6 +266,7 @@ export function buildT3SystemSections(input: BuildT3SystemSectionsInput): System
   ]
     .filter((part): part is string => part !== undefined && part !== "")
     .join("\n\n");
+  const projectMemory = projectMemoryPrompt(input.projectMemory);
   return {
     runtime,
     ...(input.customAppend === undefined || input.customAppend === ""
@@ -280,6 +284,7 @@ export function buildT3SystemSections(input: BuildT3SystemSectionsInput): System
       : { on_demand_tools: input.onDemandTools }),
     ...(toolActivation === "" ? {} : { tool_activation: toolActivation }),
     ...(input.context === undefined || input.context === "" ? {} : { context: input.context }),
+    ...(projectMemory === undefined ? {} : { project_memory: projectMemory }),
     ...(input.contextBudget === undefined || input.contextBudget === ""
       ? {}
       : { context_budget: input.contextBudget }),

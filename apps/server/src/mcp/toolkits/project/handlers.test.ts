@@ -10,6 +10,7 @@ import {
   type Project as ProjectRecord,
   type ModelSelection,
   type ProjectScript,
+  type ProjectMemory,
   type RuntimeMode,
   type OrchestrationV2ThreadShell,
   ThreadId,
@@ -36,6 +37,7 @@ import * as ThreadManagement from "../../../orchestration-v2/ThreadManagementSer
 import * as ServerConfig from "../../../config.ts";
 import * as ServerSettings from "../../../serverSettings.ts";
 import * as Project from "../../../project/ProjectService.ts";
+import * as ProjectMemoryService from "../../../project/ProjectMemoryService.ts";
 import * as ProjectCloneTracker from "../../../project/ProjectCloneTracker.ts";
 import * as ManagedProjectFolders from "../../../project/ManagedProjectFolders.ts";
 import * as PeerForwarding from "../../../peer/PeerForwarding.ts";
@@ -62,6 +64,8 @@ const clientLaunchHarness = (input: {
   readonly workspaceRoot?: string;
   readonly checkWorktreeBase?: ThreadLaunch.ThreadLaunchService["Service"]["checkWorktreeBase"];
   readonly hostedAppUrl?: string;
+  /** Set a live calling thread, so tools that default their target to it can resolve. */
+  readonly callerThreadId?: ThreadId;
   /** The orchestrator refuses the new thread's mode, as under a managed ceiling. */
   readonly refusedByCeiling?: true;
 }) => {
@@ -73,6 +77,9 @@ const clientLaunchHarness = (input: {
   // The project's own default model, which a test can clear between launches.
   const projectDefaults: { model: ModelSelection | null } = {
     model: input.overrideModel === undefined ? modelSelection : null,
+  };
+  const projectMemory: { current: ProjectMemory } = {
+    current: { projectId, content: "", entries: [], updatedAt: null },
   };
   const layerDependencies = Layer.mergeAll(
     Layer.mock(ProviderRegistry.ProviderRegistry)({
@@ -107,7 +114,14 @@ const clientLaunchHarness = (input: {
     Layer.succeed(McpInvocationContext.McpInvocationContext, {
       environmentId: EnvironmentId.make("environment"),
       requestNamespace: "client:session-1",
-      thread: undefined,
+      thread:
+        input.callerThreadId === undefined
+          ? undefined
+          : {
+              threadId: input.callerThreadId,
+              providerSessionId: "session-1",
+              providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+            },
       client: {
         sessionId: "session-1",
         label: "Claude Code",
@@ -120,6 +134,20 @@ const clientLaunchHarness = (input: {
     Layer.mock(ThreadManagement.ThreadManagementService)({
       // A thread exists once a launch started it.
       getThreadShell: (threadId) => {
+        if (threadId === input.callerThreadId && input.callerThreadId !== undefined) {
+          return Effect.succeed({
+            id: threadId,
+            projectId,
+            modelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            deletedAt: null,
+            archivedAt: null,
+            activeRunId: "run:caller",
+            providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+            pendingBackgroundTasks: [],
+          } as unknown as OrchestrationV2ThreadShell);
+        }
         const launch = input.launched.find((candidate) => candidate.threadId === threadId);
         return Effect.succeed(
           launch === undefined
@@ -183,6 +211,31 @@ const clientLaunchHarness = (input: {
       workspaceScanDirectory: Effect.succeed,
     }),
     Layer.mock(PeerForwarding.PeerForwarding)({}),
+    Layer.succeed(
+      ProjectMemoryService.ProjectMemoryService,
+      ProjectMemoryService.ProjectMemoryService.of({
+        get: (id) =>
+          Effect.succeed(
+            id === projectId
+              ? projectMemory.current
+              : { projectId: id, content: "", entries: [], updatedAt: null },
+          ),
+        set: (id, entries) => {
+          projectMemory.current = {
+            projectId: id,
+            content: entries
+              .map((entry) =>
+                entry.title === "" ? entry.content : `## ${entry.title}\n\n${entry.content}`,
+              )
+              .join("\n\n"),
+            entries: [...entries],
+            updatedAt: "2026-01-01T00:00:00.000Z",
+          };
+          return Effect.succeed(projectMemory.current);
+        },
+        delete: () => Effect.void,
+      }),
+    ),
     Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
       namedProjectsRoot: "/projects",
       isScratchProject: () => Effect.succeed(false),
@@ -198,7 +251,13 @@ const clientLaunchHarness = (input: {
     ),
     Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
   );
-  return { projectId, modelSelection, projectDefaults, dependencies: layerDependencies };
+  return {
+    projectId,
+    modelSelection,
+    projectDefaults,
+    dependencies: layerDependencies,
+    projectMemory,
+  };
 };
 
 it.effect(
@@ -1285,5 +1344,66 @@ it.effect("a project update or create that is refused tells the agent why", () =
       })
       .pipe(Stream.unwrap, Stream.runCollect, Effect.provide(dependencies));
     expect(dropped.at(-1)?.result).toMatchObject({ code: "invalid_request" });
+  }),
+);
+
+it.effect("project memory reads and writes the calling thread's project", () =>
+  Effect.gen(function* () {
+    const callerThreadId = ThreadId.make("thread:memory-caller");
+    const harness = clientLaunchHarness({
+      runtimeModeCeiling: "full-access",
+      launched: [],
+      callerThreadId,
+    });
+    const toolkit = yield* ProjectToolkit.pipe(
+      Effect.provide(
+        McpToolAccess.HandlersLayer.layer(ProjectHandlers.layer).pipe(
+          Layer.provide(harness.dependencies),
+        ),
+      ),
+    );
+    const initial = yield* toolkit
+      .handle("t3_project_memory_read", {})
+      .pipe(Stream.unwrap, Stream.runCollect, Effect.provide(harness.dependencies));
+    expect(initial.at(-1)?.result).toMatchObject({
+      projectId: harness.projectId,
+      content: "",
+      entries: [],
+    });
+
+    const written = yield* toolkit
+      .handle("t3_project_memory_set", {
+        entries: [{ id: "note", title: "Rules", content: "Use tabs." }],
+      })
+      .pipe(Stream.unwrap, Stream.runCollect, Effect.provide(harness.dependencies));
+    expect(written.at(-1)?.result).toMatchObject({
+      projectId: harness.projectId,
+      content: "## Rules\n\nUse tabs.",
+      entries: [{ id: "note", title: "Rules", content: "Use tabs." }],
+    });
+
+    const reread = yield* toolkit
+      .handle("t3_project_memory_read", {})
+      .pipe(Stream.unwrap, Stream.runCollect, Effect.provide(harness.dependencies));
+    expect(reread.at(-1)?.result).toMatchObject({
+      entries: [{ id: "note", title: "Rules", content: "Use tabs." }],
+    });
+  }),
+);
+
+it.effect("project memory asks an outside client for a project", () =>
+  Effect.gen(function* () {
+    const harness = clientLaunchHarness({ runtimeModeCeiling: "full-access", launched: [] });
+    const toolkit = yield* ProjectToolkit.pipe(
+      Effect.provide(
+        McpToolAccess.HandlersLayer.layer(ProjectHandlers.layer).pipe(
+          Layer.provide(harness.dependencies),
+        ),
+      ),
+    );
+    const result = yield* toolkit
+      .handle("t3_project_memory_read", {})
+      .pipe(Stream.unwrap, Stream.runCollect, Effect.provide(harness.dependencies));
+    expect(result.at(-1)?.result).toMatchObject({ code: "target_required" });
   }),
 );

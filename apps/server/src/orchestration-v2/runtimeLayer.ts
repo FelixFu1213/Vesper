@@ -17,6 +17,7 @@ import * as ProviderInstallationGate from "../provider/ProviderInstallationGate.
 import * as AgentSessionImporter from "../project/AgentSessionImporter.ts";
 import * as AgentSessionScanner from "../project/AgentSessionScanner.ts";
 import * as ProjectService from "../project/ProjectService.ts";
+import * as ProjectMemoryService from "../project/ProjectMemoryService.ts";
 import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
 import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
 import * as ScratchThreadPromotion from "../project/ScratchThreadPromotion.ts";
@@ -106,6 +107,10 @@ const layerLegacyV1ThreadImporterProvided = LegacyV1ThreadImporter.layer.pipe(
   Layer.provide(layerEventSink),
 );
 
+const layerProjectMemoryService = ProjectMemoryService.layer.pipe(
+  Layer.provide(ProjectStore.layer),
+);
+
 export const layerProjectService = ProjectService.layer.pipe(
   Layer.provide(
     Layer.mergeAll(
@@ -114,6 +119,7 @@ export const layerProjectService = ProjectService.layer.pipe(
       layerEventSink,
       IdAllocator.layer,
       layerLegacyV1ThreadImporterProvided,
+      layerProjectMemoryService,
     ),
   ),
 );
@@ -168,6 +174,7 @@ const layerRunExecutionServiceProvided = RunExecutionService.layer.pipe(
     Layer.mergeAll(
       McpAppModelContext.layer,
       PreviewAgentActivity.layer,
+      layerProjectMemoryService,
       layerCheckpointServiceProvided,
       layerEventSink,
       IdAllocator.layer,
@@ -438,6 +445,7 @@ export const layerProduction = Layer.mergeAll(
 ).pipe(
   Layer.provide(ResourceCleanupService.layer.pipe(Layer.provide(layerScheduledTaskProvided))),
   Layer.provideMerge(layerProjectService),
+  Layer.provideMerge(layerProjectMemoryService),
   Layer.provide(Scheduler.layer),
   Layer.provideMerge(layerEventInfrastructure),
 );

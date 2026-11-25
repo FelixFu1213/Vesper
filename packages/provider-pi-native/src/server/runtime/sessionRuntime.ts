@@ -130,6 +130,7 @@ import {
   SystemTranscriptManager,
   type SystemSectionMap,
 } from "./systemTranscript.ts";
+import { projectMemoryPrompt } from "./projectMemoryPrompt.ts";
 import { serializeSystemMessage, SystemTranscriptJournal } from "./systemTranscriptJournal.ts";
 import {
   createPiNativeTools,
@@ -349,6 +350,8 @@ export interface NativePiSessionRuntimeOptions {
   readonly threadId?: string | undefined;
   readonly mcpSession?: McpProviderSessionConfig | undefined;
   readonly contextText?: string | undefined;
+  /** Durable user-authored notes for the project, rendered after app context. */
+  readonly projectMemory?: string | undefined;
   /** Roots the session may read but never write, such as the host's attachments folder. */
   readonly readOnlyRoots?: ReadonlyArray<string> | undefined;
   readonly onEvent: (event: NativeSessionEvent) => void;
@@ -735,6 +738,7 @@ export class NativePiSessionRuntime {
   #abortPromise: Promise<void> | null = null;
   #disposed = false;
   #contextText: string | undefined;
+  #projectMemory: string | undefined;
   readonly #instructions: ProjectInstructionTracker;
   readonly #customAppend: string | undefined;
   #sequence = 0;
@@ -769,6 +773,7 @@ export class NativePiSessionRuntime {
     this.#selection = options.modelSelection;
     this.#policy = options.runtimePolicy;
     this.#contextText = options.contextText;
+    this.#projectMemory = options.projectMemory;
     this.#instructions = prompts.instructions;
     this.#customAppend = prompts.customPrompt?.append;
     const initialGoal = options.initialGoal ?? null;
@@ -1312,6 +1317,9 @@ export class NativePiSessionRuntime {
       ...(this.#contextText === undefined || this.#contextText === ""
         ? {}
         : { context: this.#contextText }),
+      ...(this.#projectMemory === undefined || this.#projectMemory === ""
+        ? {}
+        : { projectMemory: this.#projectMemory }),
       ...(this.#scratch.created ? { scratchDir: this.#scratch.path } : {}),
       ...(contextBudget === undefined ? {} : { contextBudget }),
       onDemandTools: this.#registry.catalogSection(),
@@ -1331,11 +1339,12 @@ export class NativePiSessionRuntime {
       .join("\n\n");
     return {
       ...sections,
-      // Explicitly null empty sections so a cleared one (or revoked last skill) emits a reset delta instead of staying cached.
+      // Explicitly null empty sections so a cleared one (or revoked last skill / cleared memory) emits a reset delta instead of staying cached.
       skills: sections.skills ?? null,
       on_demand_tools: sections.on_demand_tools ?? null,
       tool_activation: toolActivation === "" ? null : toolActivation,
       project_instructions: sections.project_instructions ?? null,
+      project_memory: sections.project_memory ?? null,
     };
   }
 
@@ -2312,6 +2321,11 @@ export class NativePiSessionRuntime {
   applyContextText(contextText: string): void {
     this.#contextText = contextText;
     this.#persistAsync();
+  }
+
+  /** Updated or cleared project memory lands on the next request as a section delta. */
+  applyProjectMemory(content: string | undefined): void {
+    this.#projectMemory = projectMemoryPrompt(content) === undefined ? undefined : content;
   }
 
   #leadingSystem(): AgentMessage | undefined {

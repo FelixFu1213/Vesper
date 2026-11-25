@@ -33,6 +33,7 @@ import * as ProviderReplayHarness from "../orchestration-v2/testkit/ProviderRepl
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
 import * as ProjectCloneTracker from "../project/ProjectCloneTracker.ts";
+import * as ProjectMemoryService from "../project/ProjectMemoryService.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
@@ -173,7 +174,12 @@ const layerTools = Layer.mergeAll(
         }),
     }),
   ),
-  Layer.provide(Layer.mock(ProjectCloneTracker.ProjectCloneTracker)({})),
+  Layer.provide(
+    Layer.mergeAll(
+      Layer.mock(ProjectCloneTracker.ProjectCloneTracker)({}),
+      Layer.mock(ProjectMemoryService.ProjectMemoryService)({}),
+    ),
+  ),
   Layer.provide(Layer.mock(SecretRequests.SecretRequests)({})),
   Layer.provide(Layer.mock(PeerForwarding.PeerForwarding)({})),
   Layer.provide(Layer.mock(PeerLinkRequests.PeerLinkRequests)({})),
