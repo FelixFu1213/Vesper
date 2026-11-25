@@ -2,6 +2,7 @@
 import { assert, describe, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
+  CheckpointId,
   EnvironmentId,
   MessageId,
   NodeId,
@@ -45,6 +46,7 @@ import {
   type ScriptedTurn,
 } from "../testing.ts";
 import { makePiNativeAdapterV2, PI_NATIVE_DRIVER_KIND } from "./adapter.ts";
+import { makeInMemoryPiNativeSessionStore } from "./runtime/sessionStore.ts";
 
 const instanceId = ProviderInstanceId.make("piNative");
 const threadId = ThreadId.make("thread-pi-native-test");
@@ -144,6 +146,7 @@ const makeHarness = Effect.fnUntraced(function* (input: {
   readonly fetch?: typeof globalThis.fetch;
   readonly mcpEndpoint?: string;
   readonly appContext?: ProviderAdapter.ProviderAdapterV2TurnInput["appContext"];
+  readonly sessionStore?: ReturnType<typeof makeInMemoryPiNativeSessionStore> | undefined;
 }) {
   const idAllocator = yield* IdAllocator.IdAllocatorV2;
   const policy = input.policy ?? runtimePolicy();
@@ -155,6 +158,7 @@ const makeHarness = Effect.fnUntraced(function* (input: {
     sleep: async () => undefined,
     scheduleTimer: () => () => undefined,
     ...(input.fetch === undefined ? {} : { fetch: input.fetch }),
+    ...(input.sessionStore === undefined ? {} : { sessionStore: input.sessionStore }),
   });
   if (input.mcpEndpoint !== undefined) {
     yield* (yield* McpProviderSessions.McpProviderSessions).set({
@@ -1354,6 +1358,108 @@ describe("makePiNativeAdapterV2", () => {
       assert.equal(requests[1]?.reasoning, undefined);
       assert.equal(requests[2]?.reasoning, "high");
       assert.equal(requests[3]?.reasoning, undefined);
+    }).pipe(Effect.provide(testLayer())),
+  );
+
+  it.effect("restores tool pairs, checkpoints, rollback, and forks across sessions", () =>
+    Effect.gen(function* () {
+      const store = makeInMemoryPiNativeSessionStore({ durable: true });
+      const recorder = (steps: ScriptedTurn[], contexts: Array<ReadonlyArray<unknown>>) => {
+        const streamFn: StreamFn = (model, context) => {
+          contexts.push(context.messages);
+          const turn = steps.shift();
+          if (turn === undefined) throw new Error("No scripted turn left.");
+          return renderScriptedTurn(model, turn, 0);
+        };
+        return streamFn;
+      };
+      const firstContexts: Array<ReadonlyArray<unknown>> = [];
+      let providerThreadId = "";
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const harness = yield* makeHarness({
+            sessionStore: store,
+            streamFn: recorder(
+              [
+                scriptedToolCallResponse([
+                  { name: "Bash", arguments: { command: "printf hello" } },
+                ]),
+                scriptedTextResponse("done"),
+              ],
+              firstContexts,
+            ),
+          });
+          assert.isTrue(harness.runtime.canResumeAfterRestart);
+          providerThreadId = harness.providerThread.id;
+          yield* startTurnWithText(harness, 1, "first turn");
+          assert.equal((yield* harness.takeEvent("turn.terminal")).status, "completed");
+        }),
+      );
+      const persisted = yield* store.loadThread(providerThreadId);
+      assert.isNotNull(persisted);
+      if (persisted === null) return;
+      assert.isAbove(persisted.records.length, 0);
+
+      const secondContexts: Array<ReadonlyArray<unknown>> = [];
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const harness = yield* makeHarness({
+            sessionStore: store,
+            streamFn: recorder([scriptedTextResponse("after restart")], secondContexts),
+          });
+          assert.equal(harness.providerThread.id, providerThreadId);
+          yield* startTurnOn(harness, 2);
+          assert.equal((yield* harness.takeEvent("turn.terminal")).status, "completed");
+          const wire = JSON.stringify(secondContexts[0] ?? []);
+          assert.include(wire, "toolCall");
+          assert.include(wire, "toolResult");
+          assert.include(wire, "thinking");
+          assert.include(wire, "first turn");
+          assert.include(wire, "hello");
+
+          const forked = yield* harness.runtime.forkThread({
+            sourceProviderThread: harness.providerThread,
+            targetThreadId: ThreadId.make("forked-pi-native-thread"),
+          });
+          const forkedSnapshot = yield* store.loadThread(forked.id);
+          assert.isNotNull(forkedSnapshot);
+          if (forkedSnapshot === null) return;
+          assert.isAbove(forkedSnapshot.records.length, 0);
+
+          yield* harness.runtime.rollbackThread({
+            providerThread: harness.providerThread,
+            target: {
+              type: "thread_start",
+              checkpointId: CheckpointId.make("checkpoint-1"),
+              appRunOrdinal: 0,
+            },
+            providerThreadTurns: [],
+          });
+        }),
+      );
+      const rolledBack = yield* store.loadThread(providerThreadId);
+      assert.isNotNull(rolledBack);
+      if (rolledBack === null) return;
+      assert.deepStrictEqual(
+        rolledBack.records.filter((record) => record.role !== "system"),
+        [],
+      );
+
+      const thirdContexts: Array<ReadonlyArray<unknown>> = [];
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const harness = yield* makeHarness({
+            sessionStore: store,
+            streamFn: recorder([scriptedTextResponse("fresh")], thirdContexts),
+          });
+          assert.equal(harness.providerThread.id, providerThreadId);
+          yield* startTurnOn(harness, 1);
+          assert.equal((yield* harness.takeEvent("turn.terminal")).status, "completed");
+        }),
+      );
+      const afterRollback = JSON.stringify(thirdContexts[0] ?? []);
+      assert.notInclude(afterRollback, "first turn");
+      assert.notInclude(afterRollback, "toolResult");
     }).pipe(Effect.provide(testLayer())),
   );
 });

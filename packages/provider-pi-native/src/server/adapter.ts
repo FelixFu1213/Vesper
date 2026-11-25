@@ -47,6 +47,7 @@ import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderS
 import { turnScopedSelectionTransition } from "@t3tools/provider-core/server/selectionTransition";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
@@ -67,6 +68,7 @@ import type { ToolApprovalRequest, ToolApprovalResponse, ToolRisk } from "./runt
 import { resolvePiNativeModelBinding } from "./runtime/providerBinding.ts";
 import type { ProviderRetrySleep } from "./runtime/providerRetry.ts";
 import type { ScheduleTimer } from "./runtime/streamCoalescer.ts";
+import { PiNativeSessionStore, type PiNativeSessionStoreService } from "./runtime/sessionStore.ts";
 import type { SubagentRecord } from "./runtime/subagent.ts";
 
 export { PI_NATIVE_DRIVER_KIND };
@@ -89,6 +91,7 @@ export interface PiNativeAdapterV2Options {
   readonly scheduleTimer?: ScheduleTimer;
   readonly random?: () => number;
   readonly fetch?: typeof globalThis.fetch;
+  readonly sessionStore?: PiNativeSessionStoreService | undefined;
 }
 
 export type PiNativeAdapterV2DriverEnv =
@@ -362,6 +365,15 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
   const idAllocator = yield* IdAllocator.IdAllocatorV2;
   const hostService = yield* ProviderHost.ProviderHost;
   const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
+  const sessionStore =
+    options.sessionStore ?? Option.getOrNull(yield* Effect.serviceOption(PiNativeSessionStore));
+  const capabilities =
+    sessionStore?.durable === true
+      ? {
+          ...PI_NATIVE_CAPABILITIES,
+          turns: { ...PI_NATIVE_CAPABILITIES.turns, supportsNativeResume: true },
+        }
+      : PI_NATIVE_CAPABILITIES;
   const services = yield* Effect.context<
     IdAllocator.IdAllocatorV2 | ProviderHost.ProviderHost | McpProviderSessions.McpProviderSessions
   >();
@@ -394,7 +406,7 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
       status: "starting",
       cwd: input.runtimePolicy.cwd ?? hostService.paths.cwd,
       model: binding.modelId,
-      capabilities: PI_NATIVE_CAPABILITIES,
+      capabilities,
       extensionStatuses: [],
       createdAt: at(),
       updatedAt: at(),
@@ -1410,6 +1422,8 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
         runtimePolicy: state.policy,
         ...(state.goal === null ? {} : { initialGoal: state.goal }),
         threadId: state.appThreadId,
+        ...(sessionStore === null ? {} : { sessionStore }),
+        providerThreadId: state.providerThread.id,
         ...(mcpSession === undefined ? {} : { mcpSession }),
         ...(state.contextText === undefined ? {} : { contextText: state.contextText }),
         readOnlyRoots: [hostService.paths.attachmentsDir],
@@ -1423,6 +1437,7 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
         ...(options.scheduleTimer === undefined ? {} : { scheduleTimer: options.scheduleTimer }),
         ...(options.random === undefined ? {} : { random: options.random }),
       });
+      await runtime.restorePersistedSession();
       state.runtime = runtime;
       return runtime;
     };
@@ -1949,7 +1964,7 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
       driver: DRIVER,
       providerSessionId: input.providerSessionId,
       providerSession: session,
-      canResumeAfterRestart: false,
+      canResumeAfterRestart: sessionStore?.durable === true,
       backgroundTasksEndWithProcess: true,
       events: Stream.fromQueue(queue),
       hasPendingBackgroundWork: Effect.sync(
@@ -1987,14 +2002,19 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
             }),
         }),
       resumeThread: (args) =>
-        Effect.try({
-          try: () =>
-            registerThread({
+        Effect.tryPromise({
+          try: async () => {
+            const providerThread = registerThread({
               threadId: args.threadId ?? args.providerThread.appThreadId ?? input.threadId,
               modelSelection: args.modelSelection ?? input.modelSelection,
               runtimePolicy: args.runtimePolicy ?? input.runtimePolicy,
               existingProviderThread: args.providerThread,
-            }),
+            });
+            const state = threadFor(providerThread);
+            const runtime = await ensureRuntime(state);
+            await runtime.restorePersistedSession();
+            return providerThread;
+          },
           catch: (cause) =>
             new ProviderAdapter.ProviderAdapterResumeThreadError({
               driver: DRIVER,
@@ -2014,10 +2034,18 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
             }),
         });
         const runtime = yield* Effect.promise(() => ensureRuntime(state));
+        if (runtime.hasPersistedTranscript) {
+          yield* Effect.sync(() => {
+            state.contextText = args.context;
+            runtime.applyContextText(args.context);
+          });
+          return true;
+        }
         yield* Effect.sync(() => {
           runtime.rehydrateFromHistory(args.messages, args.context);
           state.contextText = args.context;
         });
+        yield* Effect.promise(() => runtime.persistCurrentTranscript());
         return true;
       }),
       startTurn: (args) =>
@@ -2172,8 +2200,27 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
                 );
                 return index >= 0 ? index + 1 : Math.max(1, target.providerTurn.ordinal);
               })();
+        const runtime = state.runtime;
+        if (runtime !== null) {
+          yield* Effect.promise(() => runtime.truncateToTurn(targetTurnCount));
+        } else if (sessionStore !== null) {
+          yield* sessionStore
+            .truncateAfterTurn({
+              providerThreadId: state.providerThread.id,
+              targetTurnCount,
+            })
+            .pipe(
+              Effect.mapError(
+                (cause) =>
+                  new ProviderAdapter.ProviderAdapterRollbackThreadError({
+                    driver: DRIVER,
+                    providerThreadId: args.providerThread.id,
+                    cause,
+                  }),
+              ),
+            );
+        }
         yield* Effect.sync(() => {
-          state.runtime?.truncateToTurn(targetTurnCount);
           if (targetTurnCount === 0) {
             state.latestTodoPlan = null;
             state.goal = null;
@@ -2229,11 +2276,32 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
             ...(args.providerTurnId === undefined ? {} : { providerTurnId: args.providerTurnId }),
           },
         });
-        if (clone !== undefined) {
+        if (sessionStore !== null) {
+          yield* sessionStore
+            .cloneThread({
+              sourceProviderThreadId: source.providerThread.id,
+              targetProviderThreadId: state.providerThread.id,
+              ...(targetTurnCount === undefined ? {} : { targetTurnCount }),
+            })
+            .pipe(
+              Effect.mapError(
+                (cause) =>
+                  new ProviderAdapter.ProviderAdapterForkThreadError({
+                    driver: DRIVER,
+                    providerThreadId: args.sourceProviderThread.id,
+                    cause,
+                  }),
+              ),
+            );
+        }
+        if (sessionStore !== null || clone !== undefined) {
           const runtime = yield* Effect.promise(() => ensureRuntime(state));
-          yield* Effect.sync(() =>
-            runtime.installMessages(clone.messages, source.contextText, clone.todos),
-          );
+          if (!runtime.hasPersistedTranscript && clone !== undefined) {
+            yield* Effect.sync(() =>
+              runtime.installMessages(clone.messages, source.contextText, clone.todos),
+            );
+            yield* Effect.promise(() => runtime.persistCurrentTranscript());
+          }
         }
         return state.providerThread;
       }),
@@ -2246,7 +2314,7 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
     instanceId: options.instanceId,
     driver: DRIVER,
     getCapabilities: Effect.fn("PiNativeAdapter.getCapabilities")(() =>
-      Effect.succeed(PI_NATIVE_CAPABILITIES),
+      Effect.succeed(capabilities),
     ),
     planSelectionTransition: Effect.fn("PiNativeAdapter.planSelectionTransition")(() =>
       Effect.succeed(turnScopedSelectionTransition()),
