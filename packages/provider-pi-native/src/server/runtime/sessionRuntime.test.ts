@@ -240,6 +240,7 @@ describe("NativePiSessionRuntime", () => {
         scriptedTextResponse("done"),
       ],
     });
+    harness.runtime.activateTools(["TodoWrite"]);
     await harness.runtime.runTurn({ text: "make a plan" });
     const todo = harness.events.find((event) => event.type === "todo_updated");
     assert.equal(todo?.type === "todo_updated" ? todo.steps.length : 0, 2);
@@ -294,6 +295,7 @@ describe("NativePiSessionRuntime", () => {
         scriptedTextResponse("confirmed after compaction"),
       ],
     });
+    harness.runtime.activateTools(["TodoWrite", "TodoRead"]);
     const outcome = await harness.runtime.runTurn({ text: "track tasks" });
     assert.equal(outcome.status, "completed");
 
@@ -370,6 +372,7 @@ describe("NativePiSessionRuntime", () => {
         scriptedTextResponse("turn 2 done"),
       ],
     });
+    harness.runtime.activateTools(["TodoWrite"]);
     await harness.runtime.runTurn({ text: "first" });
     await harness.runtime.runTurn({ text: "second" });
     assert.equal(harness.runtime.todos.revision, 2);
@@ -410,6 +413,7 @@ describe("NativePiSessionRuntime", () => {
         scriptedTextResponse("parent done"),
       ],
     });
+    harness.runtime.activateTools(["TodoWrite", "TodoRead"]);
     const outcome = await harness.runtime.runTurn({ text: "delegate" });
     assert.equal(outcome.status, "completed");
 
@@ -649,6 +653,121 @@ describe("NativePiSessionRuntime", () => {
     await harness.runtime.dispose();
   });
 
+  it("loads a deferred MCP tool through ToolSearch and calls it on the next step", async () => {
+    const requests: Array<{ readonly method: string; readonly exposure?: string }> = [];
+    let listed = 0;
+    const fetchImpl: typeof globalThis.fetch = async (_input, init) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as {
+        readonly id?: number;
+        readonly method: string;
+        readonly params?: { readonly name?: string };
+      };
+      const headers = Object.fromEntries(new Headers(init?.headers).entries());
+      requests.push({
+        method: body.method,
+        ...(headers["t3-tool-exposure"] === undefined
+          ? {}
+          : { exposure: headers["t3-tool-exposure"] }),
+      });
+      const json = (result: unknown): Response =>
+        new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      if (body.method === "initialize") return json({});
+      if (body.method === "notifications/initialized") {
+        return new Response(null, { status: 202 });
+      }
+      if (body.method === "tools/list") {
+        listed += 1;
+        const threads = {
+          name: "t3_thread_list",
+          description: "List T3 threads",
+          inputSchema: { type: "object", properties: {} },
+          annotations: { readOnlyHint: true },
+        };
+        return json({
+          tools: [
+            { name: "tool_search", description: "Search tools", inputSchema: {} },
+            { name: "orchestrator_capabilities", description: "Capabilities", inputSchema: {} },
+            ...(listed === 1 ? [] : [threads]),
+          ],
+        });
+      }
+      if (body.params?.name === "tool_search") {
+        return new Response(
+          [
+            `data: ${JSON.stringify({
+              jsonrpc: "2.0",
+              method: "notifications/tools/list_changed",
+            })}`,
+            "",
+            `data: ${JSON.stringify({
+              jsonrpc: "2.0",
+              id: body.id,
+              result: { structuredContent: { tools: [{ name: "t3_thread_list" }] } },
+            })}`,
+            "",
+          ].join("\n"),
+          { status: 200, headers: { "content-type": "text/event-stream" } },
+        );
+      }
+      return json({ content: [{ type: "text", text: "threads: none" }] });
+    };
+
+    const harness = await makeRuntime({
+      mcpSession: { endpoint: "http://127.0.0.1:9/mcp", authorizationHeader: "Bearer x" },
+      fetch: fetchImpl,
+      steps: [
+        scriptedToolCallResponse([{ name: "ToolSearch", arguments: { query: "thread" } }]),
+        scriptedToolCallResponse([{ name: "mcp__t3-code__t3_thread_list", arguments: {} }]),
+        scriptedTextResponse("listed"),
+      ],
+    });
+    assert.isTrue(harness.runtime.mcpAvailable);
+    const outcome = await harness.runtime.runTurn({ text: "list the threads" });
+    assert.equal(outcome.status, "completed");
+    assert.deepStrictEqual(toolNames(harness.events), [
+      "ToolSearch",
+      "mcp__t3-code__t3_thread_list",
+    ]);
+    const call = harness.events.findLast((event) => event.type === "tool" && event.phase === "end");
+    assert.equal(call?.type === "tool" ? call.isError === true : true, false);
+    assert.include(call?.type === "tool" ? (call.output ?? "") : "", "threads: none");
+
+    const exposures = requests
+      .map((request) => request.exposure)
+      .filter((value) => value !== undefined);
+    assert.isTrue(exposures.length > 0);
+    assert.isTrue(exposures.every((exposure) => exposure === "deferred"));
+    assert.include(
+      requests.map((request) => request.method),
+      "tools/call",
+    );
+
+    const declared = (index: number): string[] =>
+      (harness.streamFn.calls[index]?.context.messages ?? []).flatMap((message) =>
+        (
+          (message as { readonly toolsAdded?: ReadonlyArray<{ readonly name: string }> })
+            .toolsAdded ?? []
+        ).map((tool) => tool.name),
+      );
+    assert.include(declared(0), "ToolSearch");
+    assert.notInclude(declared(0), "mcp__t3-code__t3_thread_list");
+    assert.include(declared(1), "mcp__t3-code__t3_thread_list");
+    const catalog = (harness.streamFn.calls[1]?.context.messages ?? [])
+      .flatMap((message) =>
+        Object.entries(
+          (message as { readonly sections?: Record<string, string | null> }).sections ?? {},
+        ).filter(([name]) => name === "on_demand_tools"),
+      )
+      .map(([, value]) => value ?? "")
+      .join("\n");
+    assert.include(catalog, "# On-demand tools");
+    assert.include(catalog, "mcp__t3-code__t3_thread_list");
+    await harness.runtime.dispose();
+  });
+
   it("delegates to a subagent and stops it on demand", async () => {
     const harness = await makeRuntime({
       settings: settings({ enableSubagents: true }),
@@ -833,6 +952,7 @@ describe("NativePiSessionRuntime", () => {
         scriptedTextResponse("must not run"),
       ],
     });
+    planned.runtime.activateTools(["SubmitPlan"]);
     const plannedOutcome = await planned.runtime.runTurn({ text: "plan it" });
     assert.equal(plannedOutcome.status, "completed");
     assert.deepStrictEqual(streamTexts(planned.events), ["plan ready"]);
@@ -909,6 +1029,7 @@ describe("NativePiSessionRuntime", () => {
         },
       ],
     });
+    harness.runtime.activateTools(["UpdateGoalStatus"]);
     await harness.runtime.runTurn({ text: "delegate" });
     assert.include(calls[0] ?? [], "UpdateGoalStatus");
     assert.notInclude(calls[1] ?? [], "UpdateGoalStatus");
@@ -1171,6 +1292,35 @@ describe("NativePiSessionRuntime", () => {
     await harness.runtime.dispose();
   });
 
+  it("clears activated deferred tools across truncateToTurn rollback", async () => {
+    const harness = await makeRuntime({
+      steps: [
+        scriptedToolCallResponse([{ name: "ToolSearch", arguments: { query: "TodoWrite" } }]),
+        scriptedTextResponse("activated"),
+        scriptedToolCallResponse([{ name: "TodoRead", arguments: {} }]),
+        scriptedTextResponse("after rollback"),
+      ],
+    });
+    await harness.runtime.runTurn({ text: "turn one" });
+    harness.runtime.activateTools(["TodoRead"]);
+    harness.runtime.truncateToTurn(0);
+    await harness.runtime.runTurn({ text: "turn after rollback" });
+    const declaredAfterRollback = (harness.streamFn.calls[2]?.context.messages ?? []).flatMap(
+      (message) =>
+        (
+          (message as { readonly toolsAdded?: ReadonlyArray<{ readonly name: string }> })
+            .toolsAdded ?? []
+        ).map((tool) => tool.name),
+    );
+    assert.notInclude(declaredAfterRollback, "TodoWrite");
+    assert.notInclude(declaredAfterRollback, "TodoRead");
+    const blockedEnd = harness.events.findLast(
+      (event) => event.type === "tool" && event.phase === "end",
+    );
+    assert.equal(blockedEnd?.type === "tool" ? blockedEnd.isError === true : false, true);
+    await harness.runtime.dispose();
+  });
+
   it("leads with the custom system prompt and places the append and project rules after runtime", async () => {
     const cwd = await workspace();
     await writeFiles(cwd, { ".pi/SYSTEM.md": "Custom persona.", "AGENTS.md": "Repo rules." });
@@ -1200,6 +1350,7 @@ describe("NativePiSessionRuntime", () => {
       "runtime",
       "custom_append",
       "project_instructions",
+      "on_demand_tools",
     ]);
     assert.equal(requests[0]?.sections["custom_append"], "Global append.");
     assert.include(requests[0]?.sections["project_instructions"] ?? "", "Global rules.");

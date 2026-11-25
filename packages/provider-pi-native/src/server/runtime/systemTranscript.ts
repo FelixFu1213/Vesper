@@ -11,6 +11,7 @@ export const CANONICAL_SYSTEM_SECTIONS = [
   "custom_append",
   "project_instructions",
   "skills",
+  "on_demand_tools",
   "tool_activation",
   "context",
   "context_budget",
@@ -213,6 +214,8 @@ export interface BuildT3SystemSectionsInput {
   readonly hasDeviceTools?: boolean | undefined;
   /** Skill names and descriptions available to this thread, as one rendered block. */
   readonly skillSummary?: string | undefined;
+  /** Bounded `# On-demand tools` catalog of tools the model must search for first. */
+  readonly onDemandTools?: string | undefined;
   /** Per-section skill catalog; `skill:<id>` keys append as the catalog changes. */
   readonly skillSections?: Readonly<Record<string, string | null>> | undefined;
   /** `APPEND_SYSTEM.md`: after the base prompt and before project instructions. */
@@ -272,6 +275,9 @@ export function buildT3SystemSections(input: BuildT3SystemSectionsInput): System
       ? {}
       : { skills: input.skillSummary }),
     ...input.skillSections,
+    ...(input.onDemandTools === undefined || input.onDemandTools === ""
+      ? {}
+      : { on_demand_tools: input.onDemandTools }),
     ...(toolActivation === "" ? {} : { tool_activation: toolActivation }),
     ...(input.context === undefined || input.context === "" ? {} : { context: input.context }),
     ...(input.contextBudget === undefined || input.contextBudget === ""

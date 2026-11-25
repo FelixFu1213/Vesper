@@ -46,6 +46,7 @@ const PLAN_MODE_ALLOWED_TOOLS: ReadonlySet<string> = new Set([
   "TaskList",
   "TaskStop",
   "new_context",
+  "ToolSearch",
 ]);
 
 const READ_ONLY_TOOL_NAMES: ReadonlySet<string> = new Set([
@@ -59,6 +60,7 @@ const READ_ONLY_TOOL_NAMES: ReadonlySet<string> = new Set([
   "UpdateGoalStatus",
   "asktool",
   "new_context",
+  "ToolSearch",
 ]);
 
 const FILE_TOOL_NAMES: ReadonlySet<string> = new Set(["Read", "Write", "Edit", "Glob", "Grep"]);

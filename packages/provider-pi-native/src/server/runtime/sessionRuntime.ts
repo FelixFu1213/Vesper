@@ -64,10 +64,21 @@ import {
 } from "./contextBudget.ts";
 import { BackgroundJobManager, type BackgroundJobSnapshot } from "./backgroundJobs.ts";
 import { loadCustomSystemPrompt, type CustomSystemPrompt } from "./customSystemPrompt.ts";
+import { DeferredToolRegistry } from "./deferredTools.ts";
 import { NamedRegisters } from "./editEngine.ts";
 import { FileSnapshotStore } from "./fileSnapshotStore.ts";
+import {
+  syncToolActivation,
+  toolActivationSection,
+  toolDeclarationPolicy,
+} from "./fixedToolDeclarations.ts";
 import { createJobToolRouting, type JobToolRouting } from "./jobToolRouting.ts";
-import { connectMcpSession, mcpReadOnlyPredicate, type McpAgentTool } from "./mcpBridge.ts";
+import {
+  connectMcpSession,
+  mcpReadOnlyPredicate,
+  type McpAgentTool,
+  type McpConnectResult,
+} from "./mcpBridge.ts";
 import { MutationRecoveryTracker } from "./mutationRecovery.ts";
 import { PathMutex } from "./pathLock.ts";
 import {
@@ -684,8 +695,11 @@ export class NativePiSessionRuntime {
   #selection: ModelSelection;
   #baseStreamFn: StreamFn;
   #mcpTools: ReadonlyArray<McpAgentTool> = [];
+  #mcpSession: McpConnectResult | undefined;
   #mcpReadOnly: (toolName: string) => boolean = () => false;
   #mcpAvailable = false;
+  readonly #registry: DeferredToolRegistry;
+  #fixedDeclarationKey: string | null = null;
   #skills: ReadonlyArray<PiNativeSkillDef>;
   #subagents: SubagentManager | null = null;
   #jobRouting: JobToolRouting | null = null;
@@ -743,11 +757,16 @@ export class NativePiSessionRuntime {
       scratchRoots: [this.#scratch.path],
     });
     this.#permissions = this.#makePermissions();
+    this.#registry = new DeferredToolRegistry({
+      searchRemoteTools: (query) => this.#searchRemoteTools(query),
+    });
     this.#coalescer = new StreamDeltaCoalescer<string>({
       ...(options.scheduleTimer === undefined ? {} : { scheduleTimer: options.scheduleTimer }),
       onFlush: (key) => this.#flushKey(key),
     });
     this.#baseStreamFn = this.#makeBaseStreamFn();
+    // Build the loadout first so the cached leading prompt already carries its catalog.
+    const initialTools = this.#buildToolList();
     this.#systemManager = new SystemTranscriptManager({
       // A custom `SYSTEM.md` owns the persona slot; the operational rules stay in sections.
       basePrompt: prompts.customPrompt?.replace ?? "",
@@ -760,7 +779,7 @@ export class NativePiSessionRuntime {
       initialState: {
         model: binding.model,
         thinkingLevel: binding.thinkingLevel ?? "off",
-        tools: this.#buildToolList(),
+        tools: initialTools,
         ...(initialSystem === undefined ? {} : { messages: [initialSystem] }),
       },
       streamFn: this.#makeRetryStreamFn(this.#baseStreamFn),
@@ -876,6 +895,8 @@ export class NativePiSessionRuntime {
       this.#goalActiveStartedAtMs = this.#now();
     }
     this.#goal = goal === null ? null : { ...goal, timeUsedSeconds: this.#goalAccumulatedSeconds };
+    // Entering or leaving an active goal changes which goal tools the next request declares.
+    if (wasActive !== (goal?.status === "active")) this.#rebuildTools();
     const normalized = this.#snapshotGoalWithElapsed();
     if (options?.emit !== false) this.#emit({ type: "goal_updated", goal: normalized });
     return normalized;
@@ -1057,7 +1078,7 @@ export class NativePiSessionRuntime {
     while (this.#backgroundNotes.length > 5) this.#backgroundNotes.shift();
   }
 
-  #buildToolList(): AgentTool<any>[] {
+  #allTools(): AgentTool<any>[] {
     const subagentTools = (this.#subagents?.tools ?? []) as AgentTool<any>[];
     const delegate = (name: string): AgentTool<any> | undefined =>
       subagentTools.find((tool) => tool.name === name);
@@ -1084,8 +1105,58 @@ export class NativePiSessionRuntime {
     ];
   }
 
+  /**
+   * Partitions the catalog into core and on-demand tools, then returns what this request
+   * declares. Mode-required tools are activated here so a plan or goal never stalls.
+   */
+  #buildToolList(): AgentTool<any>[] {
+    const tools = this.#allTools();
+    this.#registry.setTools(tools);
+    if (this.#policy.interactionMode === "plan") this.#registry.activate(["asktool", "SubmitPlan"]);
+    if (this.#goal?.status === "active") this.#registry.activate(["UpdateGoalStatus"]);
+    const policy = toolDeclarationPolicy(
+      this.#binding.model,
+      tools,
+      this.#registry.deferredNames,
+      Object.values(this.#desiredSections())
+        .filter((section): section is string => typeof section === "string")
+        .join("\n\n"),
+      this.#options.modelSelection.instanceId,
+    );
+    this.#fixedDeclarationKey = policy.tools === undefined ? null : policy.key;
+    this.#registry.restore(
+      this.#agent?.state.messages ?? [],
+      this.#fixedDeclarationKey ?? undefined,
+    );
+    return this.#declaredTools();
+  }
+
+  #declaredTools(): AgentTool<any>[] {
+    return this.#fixedDeclarationKey === null
+      ? this.#registry.activeTools()
+      : this.#registry.allDeclarations();
+  }
+
   #rebuildTools(): void {
     this.#agent.state.tools = this.#buildToolList();
+  }
+
+  /** Restores on-demand activation, for example from a transcript or an adapter handoff. */
+  activateTools(names: ReadonlyArray<string>): ReadonlyArray<string> {
+    const activated = this.#registry.activate(names);
+    if (activated.length > 0) this.#rebuildTools();
+    return activated;
+  }
+
+  async #searchRemoteTools(query: string): Promise<ReadonlyArray<string>> {
+    const session = this.#mcpSession;
+    if (session === undefined) return [];
+    const names = await session.searchTools(query);
+    if (names.length === 0) return [];
+    this.#mcpTools = await session.refreshTools();
+    this.#mcpReadOnly = mcpReadOnlyPredicate(session.metadata);
+    this.#rebuildTools();
+    return names;
   }
 
   async #connectMcp(): Promise<void> {
@@ -1095,7 +1166,7 @@ export class NativePiSessionRuntime {
       return;
     }
     const result = await connectMcpSession(config, {
-      toolExposure: "eager",
+      toolExposure: "deferred",
       ...(this.#options.fetch === undefined ? {} : { fetch: this.#options.fetch }),
     });
     // An unreachable T3 MCP server removes tools; it must never fail the turn.
@@ -1103,6 +1174,7 @@ export class NativePiSessionRuntime {
       this.#clearMcp();
       return;
     }
+    this.#mcpSession = result;
     this.#mcpTools = result.tools;
     this.#mcpReadOnly = mcpReadOnlyPredicate(result.metadata);
     this.#mcpAvailable = true;
@@ -1111,6 +1183,7 @@ export class NativePiSessionRuntime {
   }
 
   #clearMcp(): void {
+    this.#mcpSession = undefined;
     this.#mcpTools = [];
     this.#mcpReadOnly = () => false;
     this.#mcpAvailable = false;
@@ -1203,6 +1276,7 @@ export class NativePiSessionRuntime {
         : { context: this.#contextText }),
       ...(this.#scratch.created ? { scratchDir: this.#scratch.path } : {}),
       ...(contextBudget === undefined ? {} : { contextBudget }),
+      onDemandTools: this.#registry.catalogSection(),
       skillSections: piNativeSkillsPromptSections(this.#skills),
       ...(this.#customAppend === undefined ? {} : { customAppend: this.#customAppend }),
       ...(projectInstructions === undefined ? {} : { projectInstructions }),
@@ -1210,11 +1284,19 @@ export class NativePiSessionRuntime {
         ? "<tool_activation>Task delegates self-contained work to in-process subagents. TaskWait, TaskList, and TaskStop cover both subagents and background Bash jobs.</tool_activation>"
         : "",
     });
+    const activationRecord =
+      this.#fixedDeclarationKey === null
+        ? undefined
+        : toolActivationSection(this.#fixedDeclarationKey, new Set(this.#registry.activeNames));
+    const toolActivation = [sections.tool_activation, activationRecord]
+      .filter((part): part is string => part !== undefined && part !== "")
+      .join("\n\n");
     return {
       ...sections,
       // Explicitly null empty sections so a cleared one (or revoked last skill) emits a reset delta instead of staying cached.
       skills: sections.skills ?? null,
-      tool_activation: sections.tool_activation ?? null,
+      on_demand_tools: sections.on_demand_tools ?? null,
+      tool_activation: toolActivation === "" ? null : toolActivation,
       project_instructions: sections.project_instructions ?? null,
     };
   }
@@ -1478,7 +1560,14 @@ export class NativePiSessionRuntime {
     if (batch.length > 0) {
       this.#agent.toolExecution = resolveBatchExecutionMode(batch);
     }
-    const decision = await this.#permissions.evaluate(context.toolCall.name, context.args, signal);
+    const toolName = context.toolCall.name;
+    if (this.#registry.isDeferred(toolName) && !this.#registry.isActive(toolName)) {
+      return {
+        block: true,
+        reason: `Tool ${toolName} is on demand. Call ToolSearch with "${toolName}" first, then call it on the next step.`,
+      };
+    }
+    const decision = await this.#permissions.evaluate(toolName, context.args, signal);
     if (!decision.allowed) return { block: true, reason: decision.reason };
     await this.#refreshPathInstructions(context.toolCall.name, context.args);
     return undefined;
@@ -1510,7 +1599,8 @@ export class NativePiSessionRuntime {
       this.#now(),
     );
     let messages = request.context.messages;
-    if (delta !== null) messages = [...messages, delta];
+    if (delta !== null) messages = syncToolActivation(messages, delta);
+    const tools = this.#declaredTools();
     if (this.#backgroundNotes.length > 0) {
       const notes = this.#backgroundNotes.splice(0);
       messages = [
@@ -1538,14 +1628,8 @@ export class NativePiSessionRuntime {
         messages = compacted.messages;
       }
     }
-    if (messages === request.context.messages) return undefined;
-    return {
-      context: {
-        messages,
-        ...(request.context.tools === undefined ? {} : { tools: request.context.tools }),
-      },
-      model: request.model,
-    };
+    if (messages === request.context.messages && tools === request.context.tools) return undefined;
+    return { context: { messages, tools }, model: request.model };
   };
 
   #finishTurn: FinishTurn = async (turn) => {
@@ -1652,17 +1736,17 @@ export class NativePiSessionRuntime {
     state.pendingInstall = null;
     const append = state.pendingAppend;
     state.pendingAppend = [];
-    if (install !== null) {
-      this.#agent.state.messages = install;
-      return {
-        context: {
-          messages: install,
-          ...(context.context.tools === undefined ? {} : { tools: context.context.tools }),
-        },
-        ...(append.length === 0 ? {} : { messages: append }),
-      };
-    }
-    return append.length === 0 ? undefined : { messages: append };
+    if (install !== null) this.#agent.state.messages = install;
+    const tools = this.#declaredTools();
+    this.#agent.state.tools = tools;
+    // The declared tools ride on the context, so a ToolSearch activation is callable next step.
+    return {
+      context: {
+        messages: install ?? context.context.messages,
+        tools,
+      },
+      ...(append.length === 0 ? {} : { messages: append }),
+    };
   };
 
   #evaluatePressure(
@@ -2069,6 +2153,8 @@ export class NativePiSessionRuntime {
   applyRuntimePolicy(policy: ProviderAdapterV2RuntimePolicy): void {
     this.#policy = policy;
     this.#permissions = this.#makePermissions();
+    // Plan mode requires SubmitPlan and asktool, so the declared loadout follows the mode.
+    this.#rebuildTools();
   }
 
   /** App threads can hand over new model context between turns; sections re-diff on the next request. */
@@ -2117,6 +2203,7 @@ export class NativePiSessionRuntime {
     this.#agent.state.messages = leading === undefined ? converted : [leading, ...converted];
     this.#todos = EMPTY_TODO_SNAPSHOT;
     this.#clearTrackers();
+    this.#registry.resetActivation();
     this.#rebuildTools();
   }
 
@@ -2129,6 +2216,7 @@ export class NativePiSessionRuntime {
     this.#agent.state.messages = leading === undefined ? kept : [leading, ...kept];
     this.#todos = restoreTodosFromMessages(kept);
     this.#clearTrackers();
+    this.#registry.resetActivation();
     this.#rebuildTools();
   }
 
@@ -2161,6 +2249,8 @@ export class NativePiSessionRuntime {
     if (contextText !== undefined && contextText.trim() !== "") {
       this.#contextText = contextText;
     }
+    this.#registry.resetActivation();
+    this.#rebuildTools();
   }
 
   getSnapshot(): NativeSessionSnapshot {
