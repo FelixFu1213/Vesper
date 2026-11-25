@@ -1083,6 +1083,16 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
             status: event.status,
           });
           return;
+        case "phase":
+          emit({
+            type: "turn_phase.updated",
+            driver: DRIVER,
+            threadId: turn.input.threadId,
+            runId: turn.input.runId,
+            phase: event.phase,
+            ...(event.detail === undefined ? {} : { detail: event.detail }),
+          });
+          return;
       }
     };
 
@@ -2121,10 +2131,31 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
             ? {}
             : { resolveExtractedTextPath: hostService.resolveExtractedTextPath }),
         });
+        // Steering keeps images for a vision binding, exactly as a turn's first message does.
+        const steerBinding = resolvePiNativeModelBinding(
+          options.settings,
+          args.modelSelection ?? state.modelSelection,
+        );
+        const images = steerBinding.supportsImages
+          ? yield* Effect.tryPromise({
+              try: () =>
+                readAttachmentImages(args.message.attachments, hostService.resolveAttachmentPath),
+              catch: (cause) =>
+                new ProviderAdapter.ProviderAdapterProtocolError({
+                  driver: DRIVER,
+                  detail: "Pi Native could not read the steering attachment images.",
+                  cause,
+                }),
+            })
+          : [];
         const accepted = yield* Effect.sync(() =>
           state.runtime === null
             ? ("declined" as const)
-            : state.runtime.steer({ messageId: args.message.messageId, text }),
+            : state.runtime.steer({
+                messageId: args.message.messageId,
+                text,
+                ...(images.length === 0 ? {} : { images }),
+              }),
         );
         if (accepted === "declined") {
           return yield* new ProviderAdapter.ProviderAdapterSteerDeclinedError({
@@ -2159,6 +2190,14 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
         Effect.promise(async () => {
           const turn = findThread(args.providerThread)?.activeTurn ?? null;
           if (turn === null || turn.providerTurn.id !== args.providerTurnId) return;
+          if (args.mode === "graceful") {
+            const result = turn.state.runtime?.requestGracefulStop();
+            if (result?.requested !== true) {
+              turn.interrupted = true;
+            }
+            await Promise.race([turn.done, stoppedDeadline(options.scheduleTimer)]);
+            return;
+          }
           turn.interrupted = true;
           await turn.state.runtime?.abort();
           // A provider that never settles must not block Stop; its terminal still follows.

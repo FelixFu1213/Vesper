@@ -2,6 +2,7 @@
 import { assert, describe, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
+  ChatAttachmentId,
   EnvironmentId,
   MessageId,
   NodeId,
@@ -19,6 +20,7 @@ import {
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import * as TestProviderHost from "@t3tools/provider-testing/TestProviderHost";
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 import type { AssistantMessageEventStream, Model, Api } from "@earendil-works/pi-ai";
@@ -721,6 +723,7 @@ describe("makePiNativeAdapterV2", () => {
         "provider_turn.updated",
         (event) => event.providerTurn.status === "running",
       );
+      yield* Effect.promise(() => gated.firstRequest);
       yield* harness.runtime
         .interruptTurn({
           providerThread: harness.providerThread,
@@ -738,6 +741,117 @@ describe("makePiNativeAdapterV2", () => {
         turnItems(harness).every((item) => item.status !== "running" && item.status !== "waiting"),
       );
       void settled;
+    }).pipe(Effect.provide(testLayer())),
+  );
+
+  it.effect("stops a turn gracefully at its next boundary", () =>
+    Effect.gen(function* () {
+      const gated = gatedStream();
+      const harness = yield* makeHarness({ streamFn: gated.streamFn });
+      yield* startTurnOn(harness);
+      const providerTurn = yield* harness.takeEvent(
+        "provider_turn.updated",
+        (event) => event.providerTurn.status === "running",
+      );
+      yield* Effect.promise(() => gated.firstRequest);
+      yield* harness.runtime
+        .interruptTurn({
+          providerThread: harness.providerThread,
+          providerTurnId: providerTurn.providerTurn.id,
+          mode: "graceful",
+        })
+        .pipe(Effect.forkScoped);
+      yield* harness.takeEvent("turn_phase.updated", (event) => event.phase === "stopping");
+      gated.release(scriptedTextResponse("wrapping up"));
+      const terminal = yield* harness.takeEvent("turn.terminal");
+      assert.equal(terminal.status, "interrupted");
+      assert.isNull(terminal.failure);
+      assert.deepStrictEqual(assistantTexts(harness), ["wrapping up"]);
+      assert.equal(gated.requestCount(), 1);
+      assert.include(
+        harness.all.flatMap((event) => (event.type === "turn_phase.updated" ? [event.phase] : [])),
+        "stopping",
+      );
+    }).pipe(Effect.provide(testLayer())),
+  );
+
+  it.effect("keeps steering images for a vision model", () =>
+    Effect.gen(function* () {
+      const host = yield* ProviderHost.ProviderHost;
+      const attachmentId = ChatAttachmentId.make("steer-image");
+      yield* Effect.promise(() =>
+        NodeFSP.writeFile(NodePath.join(host.paths.attachmentsDir, attachmentId), "png-bytes"),
+      );
+      const contexts: Array<{ readonly messages: ReadonlyArray<unknown> }> = [];
+      const gated = gatedStream();
+      const streamFn: StreamFn = (model, context, options) => {
+        contexts.push(context);
+        return gated.streamFn(model, context, options);
+      };
+      const harness = yield* makeHarness({ streamFn });
+      yield* startTurnOn(harness);
+      const providerTurn = yield* harness.takeEvent(
+        "provider_turn.updated",
+        (event) => event.providerTurn.status === "running",
+      );
+      yield* Effect.promise(() => gated.firstRequest);
+      yield* harness.runtime.steerTurn({
+        threadId,
+        runId: RunId.make("run-1"),
+        providerThread: harness.providerThread,
+        providerTurnId: providerTurn.providerTurn.id,
+        message: {
+          messageId: MessageId.make("message-steer-image"),
+          text: "what is this",
+          attachments: [
+            {
+              type: "image",
+              id: attachmentId,
+              name: "shot.png",
+              mimeType: "image/png",
+              sizeBytes: 9,
+            },
+          ],
+          createdBy: "user",
+          creationSource: "web",
+        },
+      });
+      yield* harness.takeEvent("steer.updated");
+      yield* Effect.promise(async () => {
+        gated.release(scriptedTextResponse("first"));
+        gated.release(scriptedTextResponse("second"));
+      });
+      yield* harness.takeEvent("turn.terminal");
+      const steered = contexts[1]?.messages.find((message) => {
+        const content = (message as { readonly content?: unknown }).content;
+        return (
+          Array.isArray(content) &&
+          content.some((block) => (block as { readonly type?: unknown }).type === "image")
+        );
+      });
+      assert.isDefined(steered);
+    }).pipe(Effect.provide(testLayer())),
+  );
+
+  it.effect("forwards ephemeral turn phases", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({ steps: [scriptedTextResponse("hello")] });
+      yield* startTurnOn(harness);
+      yield* harness.takeEvent("turn.terminal");
+      const phases = harness.all.flatMap((event) =>
+        event.type === "turn_phase.updated" ? [event.phase] : [],
+      );
+      assert.deepStrictEqual(phases.slice(0, 4), [
+        "starting",
+        "preparing",
+        "waiting-model",
+        "streaming",
+      ]);
+      assert.isTrue(
+        harness.all
+          .filter((event) => event.type === "turn_phase.updated")
+          .every((event) => event.threadId === threadId),
+      );
     }).pipe(Effect.provide(testLayer())),
   );
 
