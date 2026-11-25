@@ -44,6 +44,7 @@ import { deletedProjectOverridePatch } from "../provider/ProjectSettingsOverride
 import { makeIsManagedWorktreePath } from "../worktreesDirectory.ts";
 import * as ProcessRunner from "../processRunner.ts";
 import * as ProjectEnrichmentService from "./ProjectEnrichmentService.ts";
+import * as ProjectMemoryService from "./ProjectMemoryService.ts";
 import { makeIsWorktreeContainer } from "./worktreeContainer.ts";
 import { isWithinRoot } from "../workspace/KnownWorkspaces.ts";
 import {
@@ -739,6 +740,16 @@ export const make = Effect.gen(function* () {
     );
   });
 
+  const deleteProjectMemory = (projectId: ProjectId) =>
+    Effect.serviceOption(ProjectMemoryService.ProjectMemoryService).pipe(
+      Effect.flatMap((memory) =>
+        Option.isNone(memory) ? Effect.void : memory.value.delete(projectId),
+      ),
+      Effect.catchCause((cause) =>
+        Effect.logWarning(`Failed to delete memory for deleted project ${projectId}.`, cause),
+      ),
+    );
+
   // Best-effort cleanup releases disabled instances kept alive by overrides; crashes have no replay to revisit deletion.
   const clearProjectSettingsOverrides = (projectId: ProjectId) =>
     serverSettings.getSettings.pipe(
@@ -774,6 +785,7 @@ export const make = Effect.gen(function* () {
       yield* commit({ type: "project.delete", commandId: input.commandId, projectId });
       if (isFirstDelete) {
         yield* clearProjectSettingsOverrides(projectId);
+        yield* deleteProjectMemory(projectId);
       }
       yield* projectEnrichment.invalidate([existing.value.workspaceRoot]);
       return yield* readCommitted(projectId);

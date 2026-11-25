@@ -123,6 +123,12 @@ export function createProjectEnvironmentAtoms<R, E>(
             : fileMetadata.rememberFile(input.cwd, result, isCurrent),
       ),
   });
+  const getMemory = createEnvironmentRpcQueryAtomFamily(runtime, {
+    label: "environment-data:projects:get-memory",
+    tag: WS_METHODS.projectsGetMemory,
+    staleTimeMs: 30_000,
+    idleTtlMs: 5 * 60_000,
+  });
   const projectConcurrency = {
     mode: "serial" as const,
     key: ({ environmentId, input }: { environmentId: string; input: { projectId: string } }) =>
@@ -250,6 +256,17 @@ export function createProjectEnvironmentAtoms<R, E>(
         Effect.sync(() => {
           for (const path of writtenFilePaths(input, result))
             fileMetadata.refreshPath(environmentId, path, registry);
+        }),
+    }),
+    getMemory,
+    setMemory: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:projects:set-memory",
+      tag: WS_METHODS.projectsSetMemory,
+      scheduler: projectScheduler,
+      concurrency: projectConcurrency,
+      onSuccess: ({ environmentId, input }, registry) =>
+        Effect.sync(() => {
+          registry.refresh(getMemory({ environmentId, input: { projectId: input.projectId } }));
         }),
     }),
   };

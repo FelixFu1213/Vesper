@@ -170,6 +170,28 @@ describe("buildT3SystemSections", () => {
     assert.include(sections.tool_activation ?? "", 'workflow_command name="review"');
   });
 
+  it("renders project memory after app context and omits blank memory", () => {
+    const sections = buildT3SystemSections({
+      harness: "Pi Native",
+      context: "app notes",
+      projectMemory: "Use the staging database.",
+      contextBudget: "budget note",
+    });
+
+    assert.include(sections.project_memory ?? "", "# Project memory");
+    assert.include(sections.project_memory ?? "", "user-provided context");
+    assert.include(sections.project_memory ?? "", "Use the staging database.");
+    assert.deepEqual(Object.keys(sections), [
+      "runtime",
+      "context",
+      "project_memory",
+      "context_budget",
+    ]);
+    assert.isUndefined(
+      buildT3SystemSections({ harness: "Pi Native", projectMemory: "  \n " }).project_memory,
+    );
+  });
+
   it("only renders an active goal, and only while the directive belongs to the turn", () => {
     const paused = buildT3SystemSections({
       harness: "Pi Native",

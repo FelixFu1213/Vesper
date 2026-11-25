@@ -240,6 +240,7 @@ interface ThreadState {
   policy: ProviderAdapter.ProviderAdapterV2RuntimePolicy;
   appThreadId: ThreadId;
   contextText: string | undefined;
+  projectMemory: string | undefined;
   activeTurn: ActiveTurn | null;
   lastTurn: ActiveTurn | null;
   latestTodoPlan: Extract<OrchestrationV2PlanArtifact, { readonly kind: "todo_list" }> | null;
@@ -1367,6 +1368,7 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
         policy: args.runtimePolicy,
         appThreadId: args.threadId,
         contextText: undefined,
+        projectMemory: undefined,
         activeTurn: null,
         lastTurn: null,
         latestTodoPlan: null,
@@ -1398,6 +1400,7 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
       if (state.runtime !== null) {
         state.runtime.applyRuntimePolicy(state.policy);
         state.runtime.applyModelSelection(state.modelSelection);
+        state.runtime.applyProjectMemory(state.projectMemory);
         // The adapter owns the goal across runtimes, so a reused runtime adopts it silently.
         if (state.runtime.goal !== state.goal) state.runtime.setGoal(state.goal, { emit: false });
         return state.runtime;
@@ -1412,6 +1415,7 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
         threadId: state.appThreadId,
         ...(mcpSession === undefined ? {} : { mcpSession }),
         ...(state.contextText === undefined ? {} : { contextText: state.contextText }),
+        ...(state.projectMemory === undefined ? {} : { projectMemory: state.projectMemory }),
         readOnlyRoots: [hostService.paths.attachmentsDir],
         onEvent: (event) => handleRuntimeEvent(state, event),
         requestApproval,
@@ -1854,6 +1858,8 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
         state.contextText = contextText;
         state.runtime?.applyContextText(contextText);
       }
+      state.projectMemory = turnInput.projectMemory;
+      state.runtime?.applyProjectMemory(state.projectMemory);
       state.activeTurn = turn;
       state.lastTurn = turn;
       activeTurn = turn;

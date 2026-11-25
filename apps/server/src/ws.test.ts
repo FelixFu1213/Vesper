@@ -183,6 +183,7 @@ import * as OrchestrationEventStore from "./persistence/OrchestrationEventStore.
 import * as SqlitePersistence from "./persistence/Sqlite.ts";
 import * as ExternalLauncher from "./process/externalLauncher.ts";
 import * as ProjectEnrichment from "./project/ProjectEnrichmentService.ts";
+import * as ProjectMemoryService from "./project/ProjectMemoryService.ts";
 import * as ProjectService from "./project/ProjectService.ts";
 import {
   layerWsRpc,
@@ -864,6 +865,7 @@ const layerUnusedConfigRpcServices = Layer.mergeAll(
   Layer.mock(ProcessDiagnostics.ProcessDiagnostics)({}),
   Layer.mock(ProcessResourceMonitor.ProcessResourceMonitor)({}),
   Layer.mock(ProjectCloneTracker.ProjectCloneTracker)({}),
+  Layer.mock(ProjectMemoryService.ProjectMemoryService)({}),
   Layer.mock(ProjectService.ProjectService)({}),
   Layer.mock(ProjectSetupScriptRunner.ProjectSetupScriptRunner)({}),
   Layer.mock(ProjectStore.ProjectStoreV2)({}),

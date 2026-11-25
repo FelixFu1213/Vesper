@@ -206,6 +206,50 @@ export const ProjectSnapshot = Schema.Struct({
 });
 export type ProjectSnapshot = typeof ProjectSnapshot.Type;
 
+/** Plain-text ceiling for a project's rendered memory, so one project cannot flood a prompt. */
+export const PROJECT_MEMORY_MAX_BYTES = 32 * 1024;
+
+/** One note a user keeps for a project; an untitled entry renders as its content alone. */
+export const ProjectMemoryEntry = Schema.Struct({
+  id: TrimmedNonEmptyString,
+  title: Schema.String,
+  content: Schema.String,
+});
+export type ProjectMemoryEntry = typeof ProjectMemoryEntry.Type;
+
+/** The structured entries a project keeps plus the plain-text projection providers receive. */
+export const ProjectMemory = Schema.Struct({
+  projectId: ProjectId,
+  content: Schema.String,
+  entries: Schema.Array(ProjectMemoryEntry),
+  updatedAt: Schema.NullOr(IsoDateTime),
+});
+export type ProjectMemory = typeof ProjectMemory.Type;
+
+export const ProjectGetMemoryInput = Schema.Struct({ projectId: ProjectId });
+export type ProjectGetMemoryInput = typeof ProjectGetMemoryInput.Type;
+
+export const ProjectGetMemoryResult = Schema.Struct({ memory: ProjectMemory });
+export type ProjectGetMemoryResult = typeof ProjectGetMemoryResult.Type;
+
+export const ProjectSetMemoryInput = Schema.Struct({
+  projectId: ProjectId,
+  entries: Schema.Array(ProjectMemoryEntry),
+});
+export type ProjectSetMemoryInput = typeof ProjectSetMemoryInput.Type;
+
+export const ProjectSetMemoryResult = Schema.Struct({ memory: ProjectMemory });
+export type ProjectSetMemoryResult = typeof ProjectSetMemoryResult.Type;
+
+export class ProjectMemoryError extends Schema.TaggedError<ProjectMemoryError>()(
+  "ProjectMemoryError",
+  {
+    projectId: Schema.optional(ProjectId),
+    message: Schema.String,
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {}
+
 export const ProjectCreatePayload = Schema.Struct({
   title: TrimmedNonEmptyString,
   workspaceRoot: TrimmedNonEmptyString,

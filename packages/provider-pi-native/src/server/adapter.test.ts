@@ -212,6 +212,7 @@ const makeHarness = Effect.fnUntraced(function* (input: {
     ordinal = 1,
     selection: ModelSelection = modelSelection,
     text = "Hello Pi",
+    projectMemory?: string,
   ) {
     const now = yield* DateTime.now;
     const appThread: OrchestrationV2AppThread = {
@@ -256,6 +257,7 @@ const makeHarness = Effect.fnUntraced(function* (input: {
       modelSelection: selection,
       runtimePolicy: policy,
       ...(input.appContext === undefined ? {} : { appContext: input.appContext }),
+      ...(projectMemory === undefined ? {} : { projectMemory }),
     } satisfies ProviderAdapter.ProviderAdapterV2TurnInput;
   });
   const providerTurnNativeId = (ordinal: number): string =>
@@ -1111,6 +1113,53 @@ describe("makePiNativeAdapterV2", () => {
       yield* harness.takeEvent("turn.terminal");
       const prompt = JSON.stringify(streamFn.calls[0]?.context.messages ?? []);
       assert.include(prompt, "<external_notes>remember the release checklist</external_notes>");
+    }).pipe(Effect.provide(testLayer())),
+  );
+
+  it.effect("applies updated and cleared project memory on later requests", () =>
+    Effect.gen(function* () {
+      const streamFn = createScriptedStreamFn(
+        [
+          scriptedTextResponse("first"),
+          scriptedTextResponse("second"),
+          scriptedTextResponse("third"),
+        ],
+        { now: () => 0 },
+      );
+      const harness = yield* makeHarness({ streamFn });
+      const startTurn = (ordinal: number, projectMemory?: string) =>
+        harness
+          .turnInput(ordinal, harness.selection, `turn ${ordinal}`, projectMemory)
+          .pipe(Effect.flatMap(harness.runtime.startTurn));
+
+      yield* startTurn(1, "Use the staging database.");
+      yield* harness.takeEvent("turn.terminal");
+      yield* startTurn(2, "Use the production database.");
+      yield* harness.takeEvent("turn.terminal");
+      yield* startTurn(3);
+      yield* harness.takeEvent("turn.terminal");
+
+      // A delta carries the change, so fold the system messages to read what each request sees.
+      const prompts = streamFn.calls.map((call) => {
+        let memory: string | null | undefined;
+        for (const message of call.context.messages) {
+          if (
+            message.role !== "system" ||
+            typeof message !== "object" ||
+            !("sections" in message)
+          ) {
+            continue;
+          }
+          const sections =
+            (message as { readonly sections?: Record<string, string | null> }).sections ?? {};
+          if (Object.hasOwn(sections, "project_memory")) memory = sections["project_memory"];
+        }
+        return memory;
+      });
+      assert.include(prompts[0] ?? "", "Use the staging database.");
+      assert.include(prompts[1] ?? "", "Use the production database.");
+      assert.notInclude(prompts[1] ?? "", "Use the staging database.");
+      assert.isNull(prompts[2] ?? null);
     }).pipe(Effect.provide(testLayer())),
   );
 

@@ -17,6 +17,7 @@ import * as ProviderInstallationGate from "../provider/ProviderInstallationGate.
 import * as AgentSessionImporter from "../project/AgentSessionImporter.ts";
 import * as AgentSessionScanner from "../project/AgentSessionScanner.ts";
 import * as ProjectService from "../project/ProjectService.ts";
+import * as ProjectMemoryService from "../project/ProjectMemoryService.ts";
 import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
 import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
 import * as ScratchThreadPromotion from "../project/ScratchThreadPromotion.ts";
@@ -116,6 +117,10 @@ export const layerProjectService = ProjectService.layer.pipe(
       layerLegacyV1ThreadImporterProvided,
     ),
   ),
+);
+
+const layerProjectMemoryService = ProjectMemoryService.layer.pipe(
+  Layer.provide(layerProjectService),
 );
 
 const layerProviderEventIngestorProvided = ProviderEventIngestor.layer.pipe(
@@ -438,6 +443,7 @@ export const layerProduction = Layer.mergeAll(
 ).pipe(
   Layer.provide(ResourceCleanupService.layer.pipe(Layer.provide(layerScheduledTaskProvided))),
   Layer.provideMerge(layerProjectService),
+  Layer.provideMerge(layerProjectMemoryService),
   Layer.provide(Scheduler.layer),
   Layer.provideMerge(layerEventInfrastructure),
 );

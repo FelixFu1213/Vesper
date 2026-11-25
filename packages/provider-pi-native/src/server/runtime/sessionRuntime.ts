@@ -81,6 +81,7 @@ import {
   SystemTranscriptManager,
   type SystemSectionMap,
 } from "./systemTranscript.ts";
+import { projectMemoryPrompt } from "./projectMemoryPrompt.ts";
 import {
   createPiNativeTools,
   EMPTY_TODO_SNAPSHOT,
@@ -231,6 +232,8 @@ export interface NativePiSessionRuntimeOptions {
   readonly threadId?: string | undefined;
   readonly mcpSession?: McpProviderSessionConfig | undefined;
   readonly contextText?: string | undefined;
+  /** Durable user-authored notes for the project, rendered after app context. */
+  readonly projectMemory?: string | undefined;
   /** Roots the session may read but never write, such as the host's attachments folder. */
   readonly readOnlyRoots?: ReadonlyArray<string> | undefined;
   readonly onEvent: (event: NativeSessionEvent) => void;
@@ -595,6 +598,7 @@ export class NativePiSessionRuntime {
   #abortPromise: Promise<void> | null = null;
   #disposed = false;
   #contextText: string | undefined;
+  #projectMemory: string | undefined;
   #sequence = 0;
 
   private constructor(options: NativePiSessionRuntimeOptions, binding: ResolvedModelBinding) {
@@ -608,6 +612,7 @@ export class NativePiSessionRuntime {
     this.#selection = options.modelSelection;
     this.#policy = options.runtimePolicy;
     this.#contextText = options.contextText;
+    this.#projectMemory = options.projectMemory;
     const initialGoal = options.initialGoal ?? null;
     this.#goal =
       initialGoal === null
@@ -980,6 +985,9 @@ export class NativePiSessionRuntime {
       ...(this.#contextText === undefined || this.#contextText === ""
         ? {}
         : { context: this.#contextText }),
+      ...(this.#projectMemory === undefined || this.#projectMemory === ""
+        ? {}
+        : { projectMemory: this.#projectMemory }),
       ...(contextBudget === undefined ? {} : { contextBudget }),
       toolActivation: this.#options.settings.enableSubagents
         ? "<tool_activation>Task, TaskWait, TaskList, and TaskStop delegate self-contained work to in-process subagents.</tool_activation>"
@@ -989,6 +997,8 @@ export class NativePiSessionRuntime {
       ...sections,
       // Explicitly null out cleared tool_activation so SystemTranscriptManager emits a reset delta and re-arms future turns.
       tool_activation: sections.tool_activation ?? null,
+      // Likewise for cleared memory, so the next request cannot keep a stale note.
+      project_memory: sections.project_memory ?? null,
     };
   }
 
@@ -1741,6 +1751,11 @@ export class NativePiSessionRuntime {
   /** App threads can hand over new model context between turns; sections re-diff on the next request. */
   applyContextText(contextText: string): void {
     this.#contextText = contextText;
+  }
+
+  /** Updated or cleared project memory lands on the next request as a section delta. */
+  applyProjectMemory(content: string | undefined): void {
+    this.#projectMemory = projectMemoryPrompt(content) === undefined ? undefined : content;
   }
 
   #leadingSystem(): AgentMessage | undefined {

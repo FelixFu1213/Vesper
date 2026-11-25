@@ -67,6 +67,7 @@ const makeRuntime = async (
     };
     readonly initialGoal?: OrchestrationV2ProviderGoal | null;
     readonly maxGoalChecks?: number;
+    readonly projectMemory?: string;
     readonly streamFn?: StreamFn;
   } = {},
 ): Promise<RuntimeHarness> => {
@@ -89,6 +90,7 @@ const makeRuntime = async (
     requestUserInput: async () => input.answers ?? { answer: "yes" },
     ...(input.initialGoal === undefined ? {} : { initialGoal: input.initialGoal }),
     ...(input.maxGoalChecks === undefined ? {} : { maxGoalChecks: input.maxGoalChecks }),
+    ...(input.projectMemory === undefined ? {} : { projectMemory: input.projectMemory }),
     now: () => 0,
     streamFn: input.streamFn ?? streamFn,
     scheduleTimer: () => () => undefined,
@@ -845,6 +847,35 @@ describe("NativePiSessionRuntime", () => {
     assert.match(requests[0]?.activation ?? "", /workflow_command name="review"/u);
     assert.equal(requests[1]?.reasoning, undefined);
     assert.isNull(requests[1]?.activation ?? null);
+    await harness.runtime.dispose();
+  });
+
+  it("applies project memory updates and clears it on the next request", async () => {
+    const prompts: Array<string | null | undefined> = [];
+    const streamFn: StreamFn = async (model, context) => {
+      // A delta carries the change, so fold the system messages to read what this request sees.
+      let memory: string | null | undefined;
+      for (const message of context.messages) {
+        if (message.role !== "system" || typeof message !== "object" || !("sections" in message)) {
+          continue;
+        }
+        const sections =
+          (message as { readonly sections?: Record<string, string | null> }).sections ?? {};
+        if (Object.hasOwn(sections, "project_memory")) memory = sections["project_memory"];
+      }
+      prompts.push(memory);
+      return renderScriptedTurn(model, scriptedTextResponse("ok"), 0);
+    };
+    const harness = await makeRuntime({ streamFn, projectMemory: "Use staging." });
+    await harness.runtime.runTurn({ text: "first" });
+    harness.runtime.applyProjectMemory("Use production.");
+    await harness.runtime.runTurn({ text: "second" });
+    harness.runtime.applyProjectMemory(undefined);
+    await harness.runtime.runTurn({ text: "third" });
+    assert.include(prompts[0] ?? "", "Use staging.");
+    assert.include(prompts[1] ?? "", "Use production.");
+    assert.notInclude(prompts[1] ?? "", "Use staging.");
+    assert.isNull(prompts[2] ?? null);
     await harness.runtime.dispose();
   });
 

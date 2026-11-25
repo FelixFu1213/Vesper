@@ -231,6 +231,7 @@ import { linkCreatedPullRequest } from "./git/linkCreatedPullRequest.ts";
 import * as ReviewService from "./review/ReviewService.ts";
 import * as ProjectEnrichmentService from "./project/ProjectEnrichmentService.ts";
 import * as ProjectService from "./project/ProjectService.ts";
+import * as ProjectMemoryService from "./project/ProjectMemoryService.ts";
 import { threadWorkspaceRoot } from "./project/threadWorkspaceRoot.ts";
 import * as ManagedProjectFolders from "./project/ManagedProjectFolders.ts";
 import * as ScratchThreadPromotion from "./project/ScratchThreadPromotion.ts";
@@ -1461,6 +1462,7 @@ export const layerWsRpc = (
       const applicationEvents = yield* OrchestrationEventStore.OrchestrationEventStore;
       const projectStore = yield* ProjectStore.ProjectStoreV2;
       const projectService = yield* ProjectService.ProjectService;
+      const projectMemory = yield* ProjectMemoryService.ProjectMemoryService;
       const managedFolders = yield* ManagedProjectFolders.ManagedProjectFolders;
       const scratchThreadPromotion = yield* ScratchThreadPromotion.ScratchThreadPromotion;
       const eventLoopMonitor = yield* EventLoopMonitor.EventLoopMonitor;
@@ -3097,6 +3099,12 @@ export const layerWsRpc = (
                 }),
             ),
           ),
+        [WS_METHODS.projectsGetMemory]: (input) =>
+          projectMemory.get(input.projectId).pipe(Effect.map((memory) => ({ memory }))),
+        [WS_METHODS.projectsSetMemory]: (input) =>
+          projectMemory
+            .set(input.projectId, input.entries)
+            .pipe(Effect.map((memory) => ({ memory }))),
         [WS_METHODS.shellOpenInEditor]: (input) => externalLauncher.launchEditor(input),
         [WS_METHODS.filesystemGetMetadata]: (input) => workspaceFileSystem.getMetadata(input),
         [WS_METHODS.filesystemBrowse]: (input) =>

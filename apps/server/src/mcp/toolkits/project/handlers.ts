@@ -7,6 +7,7 @@ import {
   ProjectId,
   type TaskFolderError,
   type Project as ProjectRecord,
+  type ProjectMemoryError,
   type ServerProvider,
   T3_PROJECT_FILE_NAME,
 } from "@t3tools/contracts";
@@ -22,6 +23,7 @@ import * as ThreadLaunch from "../../../orchestration-v2/ThreadLaunchService.ts"
 import * as ThreadMessageIntake from "../../../orchestration-v2/ThreadMessageIntake.ts";
 import * as Claims from "../../../orchestration-v2/AttachmentClaims.ts";
 import * as Project from "../../../project/ProjectService.ts";
+import * as ProjectMemory from "../../../project/ProjectMemoryService.ts";
 import * as ProjectCloneTracker from "../../../project/ProjectCloneTracker.ts";
 import { mutateProjectWithClone } from "../../../project/ProjectMutation.ts";
 import * as ManagedProjectFolders from "../../../project/ManagedProjectFolders.ts";
@@ -57,6 +59,13 @@ function projectFailure(error: Project.ProjectServiceError) {
           ? "The workspace is already registered to a project."
           : "The project is not empty; force=true is required to delete it.";
   return new OrchestratorMcpFailure({ code: "invalid_request", message });
+}
+
+function projectMemoryFailure(error: ProjectMemoryError) {
+  // Validation and domain refusals carry no cause; a failed read or write does.
+  return error.cause === undefined
+    ? new OrchestratorMcpFailure({ code: "invalid_request", message: error.message })
+    : unavailable();
 }
 
 function worktreeCheckHint(
@@ -619,5 +628,25 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
       }),
     // An existing destination is never adopted.
     { linkedCallers: "allowed" },
+  ),
+  t3_project_memory_read: McpToolAccess.reads((input) =>
+    Effect.gen(function* () {
+      const context = yield* readCaller();
+      const projectId = yield* resolveProjectId(context, input.projectId);
+      return yield* ProjectMemory.ProjectMemoryService.pipe(
+        Effect.flatMap((memory) => memory.get(projectId)),
+        Effect.mapError(projectMemoryFailure),
+      );
+    }),
+  ),
+  t3_project_memory_set: McpToolAccess.writesEnvironment((input, check) =>
+    Effect.gen(function* () {
+      const context = yield* check;
+      const projectId = yield* resolveProjectId(context, input.projectId);
+      return yield* ProjectMemory.ProjectMemoryService.pipe(
+        Effect.flatMap((memory) => memory.set(projectId, input.entries)),
+        Effect.mapError(projectMemoryFailure),
+      );
+    }),
   ),
 });
