@@ -153,3 +153,87 @@ describe("copying a table as HTML", () => {
     }
   });
 });
+
+describe("wide table navigation", () => {
+  it("shows a sticky horizontal scrollbar when overflowing and scrolls on track click", async () => {
+    const columns = Array.from({ length: 10 }, (_, idx) => `Column_${idx + 1}`);
+    await using screen = await render(
+      <div style={{ width: "260px" }} className="chat-markdown">
+        <MarkdownTable>
+          <thead>
+            <tr>
+              {columns.map((col) => (
+                <th key={col} style={{ whiteSpace: "nowrap" }}>
+                  {col}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              {columns.map((col) => (
+                <td key={col} style={{ whiteSpace: "nowrap" }}>
+                  {col}_value
+                </td>
+              ))}
+            </tr>
+          </tbody>
+        </MarkdownTable>
+      </div>,
+      // The table renders no links and reads no route.
+      { router: false },
+    );
+
+    const scrollbar = screen.getByRole("scrollbar", { name: "Scroll table horizontally" });
+    await expect.element(scrollbar).toBeInTheDocument();
+
+    const viewport = document.querySelector<HTMLElement>(
+      '.chat-markdown-table-container [data-slot="scroll-area-viewport"]',
+    );
+    expect(viewport).not.toBeNull();
+    expect(viewport!.scrollLeft).toBe(0);
+
+    const trackEl = scrollbar.element();
+    const rect = trackEl.getBoundingClientRect();
+    trackEl.dispatchEvent(
+      new PointerEvent("pointerdown", {
+        bubbles: true,
+        button: 0,
+        clientX: rect.left + rect.width * 0.85,
+        clientY: rect.top + rect.height / 2,
+      }),
+    );
+
+    await vi.waitFor(() => {
+      expect(viewport!.scrollLeft).toBeGreaterThan(0);
+    });
+  });
+
+  it("opens the table in a right-side sheet", async () => {
+    await using screen = await render(
+      <div className="chat-markdown">
+        <MarkdownTable>
+          <thead>
+            <tr>
+              <th>Metric</th>
+              <th>Value</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Throughput</td>
+              <td>42 req/s</td>
+            </tr>
+          </tbody>
+        </MarkdownTable>
+      </div>,
+      // The table renders no links and reads no route.
+      { router: false },
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "Open table in side panel" }));
+    const dialog = page.getByRole("dialog");
+    await expect.element(dialog).toBeInTheDocument();
+    await expect.element(dialog.getByRole("cell", { name: "42 req/s" })).toBeInTheDocument();
+  });
+});

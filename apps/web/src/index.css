@@ -2322,13 +2322,22 @@ code {
   max-width: none;
 }
 
-/* Keep overflow discoverable when the edge fade falls between columns. */
+/* StickyTableScrollbar handles horizontal scrolling for wide tables. */
 .chat-markdown
   .chat-markdown-table-container
   [data-slot="scroll-area-scrollbar"][data-orientation="horizontal"] {
-  opacity: 1;
-  --app-scrollbar-thumb: color-mix(in srgb, var(--muted-foreground) 60%, transparent);
-  --app-scrollbar-thumb-hover: color-mix(in srgb, var(--muted-foreground) 80%, transparent);
+  display: none;
+}
+
+.chat-markdown-sheet-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--popover);
+}
+
+.chat-markdown-sheet-table :is(th, td) {
+  max-width: 32rem;
 }
 
 :root {
