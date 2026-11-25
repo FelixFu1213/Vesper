@@ -591,7 +591,6 @@ export class NativePiSessionRuntime {
   readonly #systemManager: SystemTranscriptManager;
   readonly #calibration: ContextEstimateCalibration;
   readonly #reminders = new ContextBudgetReminderTracker();
-  readonly #midConversationSystem: boolean;
   readonly #coalescer: StreamDeltaCoalescer<string>;
   readonly #pool: ProviderHttpPool;
   readonly #sandbox: WorkspaceSandbox;
@@ -642,7 +641,6 @@ export class NativePiSessionRuntime {
     // A goal carried over from a previous runtime resumes its clock only while already active.
     this.#goalActiveStartedAtMs = initialGoal?.status === "active" ? this.#now() : null;
     this.#calibration = options.calibration ?? new ContextEstimateCalibration();
-    this.#midConversationSystem = supportsMidConversationSystemMessages(binding.model);
     this.#pool = new ProviderHttpPool({ now: this.#now });
     this.#sandbox = new WorkspaceSandbox({
       cwd: options.runtimePolicy.cwd,
@@ -1272,7 +1270,7 @@ export class NativePiSessionRuntime {
     const reminder = this.#reminders.select({
       remainingTokens: pressure.remainingTokens,
       hardLimit: pressure.hardLimit,
-      midConversationSystem: this.#midConversationSystem,
+      midConversationSystem: supportsMidConversationSystemMessages(this.#binding.model),
     });
     const delta = this.#systemManager.diffSections(
       this.#desiredSections(reminder?.role === "system" ? reminder.text : undefined),
