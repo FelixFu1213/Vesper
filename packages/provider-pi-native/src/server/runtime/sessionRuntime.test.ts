@@ -24,6 +24,7 @@ import {
   type NativeSessionEvent,
 } from "./sessionRuntime.ts";
 import type { ToolApprovalRequest } from "./permissions.ts";
+import type { PiNativeSkillDef } from "./skillsDiscovery.ts";
 
 const decodeSettings = Schema.decodeSync(PiNativeSettings);
 
@@ -68,6 +69,8 @@ const makeRuntime = async (
     readonly initialGoal?: OrchestrationV2ProviderGoal | null;
     readonly maxGoalChecks?: number;
     readonly streamFn?: StreamFn;
+    readonly skills?: ReadonlyArray<PiNativeSkillDef>;
+    readonly discoverSkills?: () => Promise<ReadonlyArray<PiNativeSkillDef>>;
     readonly piAgentDir?: string;
   } = {},
 ): Promise<RuntimeHarness> => {
@@ -97,6 +100,11 @@ const makeRuntime = async (
     scheduleTimer: () => () => undefined,
     sleep: async () => undefined,
     ...(input.fetch === undefined ? {} : { fetch: input.fetch }),
+    // A developer's own installed skills must never reach a unit test.
+    discoverSkills:
+      input.discoverSkills !== undefined
+        ? async () => ({ skills: await input.discoverSkills!(), serverSkills: [] })
+        : async () => ({ skills: input.skills ?? [], serverSkills: [] }),
     ...(input.mcpSession === undefined
       ? {}
       : {
@@ -848,6 +856,207 @@ describe("NativePiSessionRuntime", () => {
     assert.include(calls[0] ?? [], "UpdateGoalStatus");
     assert.notInclude(calls[1] ?? [], "UpdateGoalStatus");
     assert.include(calls[2] ?? [], "UpdateGoalStatus");
+    await harness.runtime.dispose();
+  });
+
+  it("prompts with one system section per discovered skill", async () => {
+    const skills: ReadonlyArray<PiNativeSkillDef> = [
+      {
+        id: "review",
+        name: "Review",
+        description: "Reviews changes",
+        path: "/workspace/.agents/skills/review/SKILL.md",
+        rootDir: "/workspace/.agents/skills/review",
+        scope: "project",
+        enabled: true,
+        disableModelInvocation: false,
+      },
+      {
+        id: "manual",
+        name: "Manual",
+        path: "/workspace/.agents/skills/manual/SKILL.md",
+        rootDir: "/workspace/.agents/skills/manual",
+        scope: "project",
+        enabled: true,
+        disableModelInvocation: true,
+      },
+    ];
+    const harness = await makeRuntime({ steps: [scriptedTextResponse("ok")], skills });
+    await harness.runtime.runTurn({ text: "hi" });
+    const system = harness.runtime.messages.find((message) => message.role === "system");
+    const sections =
+      system !== undefined && "sections" in system
+        ? ((system as { readonly sections?: Record<string, string | null> }).sections ?? {})
+        : {};
+    assert.deepInclude(sections, {
+      "skill:review": "- `review`: Review (Reviews changes)",
+    });
+    assert.notProperty(sections, "skill:manual");
+    assert.include(
+      harness.runtime.skills.map((skill) => skill.id),
+      "manual",
+    );
+    await harness.runtime.dispose();
+  });
+
+  it("loads a /skill:<id> invocation for one turn and clears it afterwards", async () => {
+    const skills: ReadonlyArray<PiNativeSkillDef> = [
+      {
+        id: "review",
+        name: "Review",
+        path: "/workspace/.agents/skills/review/SKILL.md",
+        rootDir: "/workspace/.agents/skills/review",
+        scope: "project",
+        enabled: true,
+        disableModelInvocation: false,
+      },
+    ];
+    const root = await workspace({
+      "SKILL.md": "---\nname: Review\n---\n\nRead the diff first.\n",
+    });
+    const skill = {
+      ...(skills[0] as PiNativeSkillDef),
+      path: NodePath.join(root, "SKILL.md"),
+      rootDir: root,
+    };
+    const activations: Array<string | null> = [];
+    const streamFn: StreamFn = async (model, context) => {
+      const systems = context.messages.filter((message) => message.role === "system");
+      const last = systems.at(-1);
+      const sections =
+        last !== undefined && typeof last === "object" && "sections" in last
+          ? ((last as { readonly sections?: Record<string, string | null> }).sections ?? {})
+          : {};
+      activations.push(sections["tool_activation"] ?? null);
+      return renderScriptedTurn(model, scriptedTextResponse("ok"), 0);
+    };
+    const harness = await makeRuntime({ streamFn, skills: [skill] });
+
+    await harness.runtime.runTurn({ text: "review this", skillIds: ["review"] });
+    await harness.runtime.runTurn({ text: "plain turn" });
+
+    assert.match(activations[0] ?? "", /<skill_content id="review"/u);
+    assert.match(activations[0] ?? "", /Read the diff first\./u);
+    assert.isNull(activations[1] ?? null);
+    await harness.runtime.dispose();
+  });
+
+  it("activates the skill behind a $<id> mention the composer inserted", async () => {
+    const root = await workspace({
+      "SKILL.md": "---\nname: Review\n---\n\nRead the diff first.\n",
+    });
+    const skills: ReadonlyArray<PiNativeSkillDef> = [
+      {
+        id: "review",
+        name: "Review",
+        path: NodePath.join(root, "SKILL.md"),
+        rootDir: root,
+        scope: "project",
+        enabled: true,
+        disableModelInvocation: false,
+      },
+    ];
+    const activations: Array<string | null> = [];
+    const streamFn: StreamFn = async (model, context) => {
+      const systems = context.messages.filter((message) => message.role === "system");
+      const last = systems.at(-1);
+      const sections =
+        last !== undefined && typeof last === "object" && "sections" in last
+          ? ((last as { readonly sections?: Record<string, string | null> }).sections ?? {})
+          : {};
+      activations.push(sections["tool_activation"] ?? null);
+      return renderScriptedTurn(model, scriptedTextResponse("ok"), 0);
+    };
+    const harness = await makeRuntime({ streamFn, skills });
+
+    await harness.runtime.runTurn({ text: "use $review on this branch" });
+    await harness.runtime.runTurn({ text: "budget is $5" });
+
+    assert.match(activations[0] ?? "", /<skill_content id="review"/u);
+    assert.isNull(activations[1] ?? null);
+    await harness.runtime.dispose();
+  });
+
+  it("declares the Skill tool and loads a skill through it", async () => {
+    const root = await workspace({
+      "SKILL.md": "---\nname: Review\n---\n\nRead the diff first.\n",
+    });
+    const skills: ReadonlyArray<PiNativeSkillDef> = [
+      {
+        id: "review",
+        name: "Review",
+        path: NodePath.join(root, "SKILL.md"),
+        rootDir: root,
+        scope: "project",
+        enabled: true,
+        disableModelInvocation: false,
+      },
+    ];
+    const harness = await makeRuntime({
+      skills,
+      steps: [
+        scriptedToolCallResponse([{ name: "Skill", arguments: { id: "review" } }]),
+        scriptedTextResponse("done"),
+      ],
+    });
+
+    await harness.runtime.runTurn({ text: "review" });
+
+    assert.deepEqual(toolNames(harness.events), ["Skill"]);
+    const loaded = harness.events.find((event) => event.type === "tool" && event.phase === "end");
+    assert.match(
+      loaded?.type === "tool" ? (loaded.output ?? "") : "",
+      /<skill_content id="review"[^>]*>\nRead the diff first\./u,
+    );
+    await harness.runtime.dispose();
+  });
+
+  it("clears the skills header when the last skill is revoked and loads user-only skills on $id", async () => {
+    const root = await workspace({
+      "SKILL.md":
+        "---\nname: Manual\ndisable-model-invocation: true\n---\n\nManual instructions.\n",
+    });
+    let current: ReadonlyArray<PiNativeSkillDef> = [
+      {
+        id: "review",
+        name: "Review",
+        path: "/workspace/.agents/skills/review/SKILL.md",
+        rootDir: "/workspace/.agents/skills/review",
+        scope: "project",
+        enabled: true,
+        disableModelInvocation: false,
+      },
+      {
+        id: "manual",
+        name: "Manual",
+        path: NodePath.join(root, "SKILL.md"),
+        rootDir: root,
+        scope: "project",
+        enabled: true,
+        disableModelInvocation: true,
+      },
+    ];
+    const deltas: Array<Record<string, string | null>> = [];
+    const streamFn: StreamFn = async (model, context) => {
+      const last = context.messages.filter((message) => message.role === "system").at(-1);
+      const sections =
+        last !== undefined && typeof last === "object" && "sections" in last
+          ? ((last as { readonly sections?: Record<string, string | null> }).sections ?? {})
+          : {};
+      deltas.push(sections);
+      return renderScriptedTurn(model, scriptedTextResponse("ok"), 0);
+    };
+    const harness = await makeRuntime({ streamFn, discoverSkills: async () => current });
+
+    await harness.runtime.runTurn({ text: "run $manual" });
+    assert.match(deltas[0]?.tool_activation ?? "", /<skill_content id="manual"/u);
+
+    current = [];
+    await harness.runtime.runTurn({ text: "after removal" });
+    assert.isTrue(Object.hasOwn(deltas[1] ?? {}, "skills"));
+    assert.isNull(deltas[1]?.skills);
+    assert.isTrue(Object.hasOwn(deltas[1] ?? {}, "skill:review"));
+    assert.isNull(deltas[1]?.["skill:review"]);
     await harness.runtime.dispose();
   });
 

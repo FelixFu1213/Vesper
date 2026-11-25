@@ -41,6 +41,7 @@ import * as DateTime from "effect/DateTime";
 import * as Schema from "effect/Schema";
 
 import type { PiNativeSettings } from "../../settings.ts";
+import { piNativeSkillMentions } from "../commands.ts";
 import {
   buildCompactionCheckpoint,
   CompactionBudgetError,
@@ -85,6 +86,15 @@ import {
   type ProviderRetrySleep,
 } from "./providerRetry.ts";
 import { WorkspaceSandbox } from "./sandbox.ts";
+import {
+  discoverPiNativeSkills,
+  piNativeSkillsDigest,
+  piNativeSkillsPromptSections,
+  type DiscoverPiNativeSkillsInput,
+  type PiNativeSkillDef,
+  type PiNativeSkillDiscovery,
+} from "./skillsDiscovery.ts";
+import { formatPiNativeSkillContent, loadPiNativeSkill } from "./skillTool.ts";
 import { StreamDeltaCoalescer, type ScheduleTimer } from "./streamCoalescer.ts";
 import { makeSubagentManager, type SubagentManager, type SubagentRecord } from "./subagent.ts";
 import {
@@ -215,6 +225,26 @@ export type NativeSessionEvent =
 /** T3 reports the goal banner from these, so the loop stops itself after this many checks. */
 const DEFAULT_MAX_GOAL_CHECKS = 8;
 
+/** Discovers the workspace catalog, or nothing when the session has no workspace folder. */
+const discoverSkillCatalog = async (
+  options: NativePiSessionRuntimeOptions,
+): Promise<ReadonlyArray<PiNativeSkillDef>> => {
+  const cwd = options.runtimePolicy.cwd;
+  const discover = options.discoverSkills;
+  // Without a workspace folder only an injected catalog still applies.
+  if (discover === undefined && (cwd === null || cwd.trim() === "")) return [];
+  try {
+    const discovery = await (discover ?? discoverPiNativeSkills)({
+      cwd: cwd === null || cwd.trim() === "" ? process.cwd() : cwd,
+      environment: options.environment ?? process.env,
+    });
+    return discovery.skills;
+  } catch {
+    // A broken catalog must never fail the turn; the session keeps the skills it had.
+    return [];
+  }
+};
+
 export interface NativeSessionFailure {
   readonly failure: OrchestrationV2ProviderFailure;
   readonly retry: OrchestrationV2ProviderRetry | null;
@@ -263,6 +293,10 @@ export interface NativePiSessionRuntimeOptions {
   readonly shell?: ShellSpec | undefined;
   readonly environment?: NodeJS.ProcessEnv | undefined;
   readonly calibration?: ContextEstimateCalibration | undefined;
+  /** Discovery seam: tests inject a fixed catalog instead of walking the real filesystem. */
+  readonly discoverSkills?:
+    | ((input: DiscoverPiNativeSkillsInput) => Promise<PiNativeSkillDiscovery>)
+    | undefined;
 }
 
 export interface NativeSnapshotMessage {
@@ -634,6 +668,7 @@ export class NativePiSessionRuntime {
   #mcpTools: ReadonlyArray<McpAgentTool> = [];
   #mcpReadOnly: (toolName: string) => boolean = () => false;
   #mcpAvailable = false;
+  #skills: ReadonlyArray<PiNativeSkillDef>;
   #subagents: SubagentManager | null = null;
   #active: ActiveTurnState | null = null;
   #tailRace: Array<{ readonly messageId: string; readonly message: UserMessage }> = [];
@@ -647,9 +682,11 @@ export class NativePiSessionRuntime {
   private constructor(
     options: NativePiSessionRuntimeOptions,
     binding: ResolvedModelBinding,
+    skills: ReadonlyArray<PiNativeSkillDef>,
     prompts: ResolvedSessionPrompts,
   ) {
     this.#options = options;
+    this.#skills = skills;
     this.#now = options.now ?? (() => host.Date.now());
     this.#sessionId =
       options.threadId !== undefined && options.threadId.trim() !== ""
@@ -716,6 +753,7 @@ export class NativePiSessionRuntime {
     const runtime = new NativePiSessionRuntime(
       options,
       resolvePiNativeModelBinding(options.settings, options.modelSelection),
+      await discoverSkillCatalog(options),
       { customPrompt, instructions },
     );
     await runtime.#connectMcp();
@@ -753,6 +791,21 @@ export class NativePiSessionRuntime {
 
   get todos(): TodoSnapshot {
     return cloneTodoSnapshot(this.#todos);
+  }
+
+  /** The catalog this workspace offers, for `/skill:<id>` validation in the adapter. */
+  get skills(): ReadonlyArray<PiNativeSkillDef> {
+    return this.#skills;
+  }
+
+  /**
+   * Rescans the workspace so skills added, edited, or removed mid-session reach the
+   * transcript: the prompt sections append a minimal delta and revoked ones go null.
+   */
+  async refreshSkills(): Promise<void> {
+    const discovered = await discoverSkillCatalog(this.#options);
+    if (piNativeSkillsDigest(discovered) === piNativeSkillsDigest(this.#skills)) return;
+    this.#skills = discovered;
   }
 
   /** The goal with its elapsed active time folded in, so callers never see a stale clock. */
@@ -912,6 +965,7 @@ export class NativePiSessionRuntime {
         if (this.#active !== null) this.#active.manualCompactionRequested = reason ?? "manual";
       },
       isPlanMode: () => this.#policy.interactionMode === "plan",
+      skills: () => this.#skills,
       ...(this.#options.threadId === undefined ? {} : { threadId: this.#options.threadId }),
       ...(this.#options.shell === undefined ? {} : { shell: this.#options.shell }),
       ...(this.#options.environment === undefined
@@ -1047,6 +1101,7 @@ export class NativePiSessionRuntime {
         ? {}
         : { context: this.#contextText }),
       ...(contextBudget === undefined ? {} : { contextBudget }),
+      skillSections: piNativeSkillsPromptSections(this.#skills),
       ...(this.#customAppend === undefined ? {} : { customAppend: this.#customAppend }),
       ...(projectInstructions === undefined ? {} : { projectInstructions }),
       toolActivation: this.#options.settings.enableSubagents
@@ -1055,10 +1110,32 @@ export class NativePiSessionRuntime {
     });
     return {
       ...sections,
-      // Explicitly null empty sections so a cleared one emits a reset delta instead of staying cached.
+      // Explicitly null empty sections so a cleared one (or revoked last skill) emits a reset delta instead of staying cached.
+      skills: sections.skills ?? null,
       tool_activation: sections.tool_activation ?? null,
       project_instructions: sections.project_instructions ?? null,
     };
+  }
+
+  /**
+   * Loads the skills this turn invoked: `/skill:<id>` explicitly, or the `$<id>` tokens the
+   * composer inserted. The document rides one turn's system directive, like a workflow command.
+   */
+  async #skillDirective(
+    text: string,
+    explicitSkillIds: ReadonlyArray<string>,
+  ): Promise<string | undefined> {
+    const installed = this.#skills.map((skill) => skill.id);
+    const requested = [
+      ...new Set([...explicitSkillIds, ...piNativeSkillMentions(text, installed)]),
+    ];
+    const documents: Array<string> = [];
+    for (const id of requested) {
+      const loaded = await loadPiNativeSkill(this.#skills, id, { allowModelDisabled: true });
+      if (!loaded.ok) continue;
+      documents.push(formatPiNativeSkillContent(loaded.skill, loaded.body));
+    }
+    return documents.length === 0 ? undefined : documents.join("\n\n");
   }
 
   #emit(event: NativeSessionEvent): void {
@@ -1680,11 +1757,14 @@ export class NativePiSessionRuntime {
     readonly workflowDirective?: string | undefined;
     /** `/boost` runs the turn at the highest thinking level the model accepts. */
     readonly boostThinking?: boolean | undefined;
+    /** Skills the user invoked explicitly, such as `/skill:<id>`. */
+    readonly skillIds?: ReadonlyArray<string> | undefined;
     /** Test seam: runs in the window between loop settle and lock release. */
     readonly onLoopSettled?: () => void;
   }): Promise<NativeTurnOutcome> {
     if (this.#active !== null) throw new Error("A Pi Native turn is already running.");
     this.#ensureSubagents();
+    await this.refreshSkills();
     const state = newTurnState();
     this.#active = state;
     this.#tailRace = [];
@@ -1702,7 +1782,13 @@ export class NativePiSessionRuntime {
         previousThinkingLevel === "low" ||
         previousThinkingLevel === "medium");
     if (elevateThinking) this.#agent.state.thinkingLevel = "high";
-    this.#workflowDirective = input.workflowDirective;
+    const turnDirective = [
+      input.workflowDirective,
+      await this.#skillDirective(input.text, input.skillIds ?? []),
+    ]
+      .filter((part): part is string => part !== undefined && part !== "")
+      .join("\n\n");
+    this.#workflowDirective = turnDirective === "" ? undefined : turnDirective;
     const prompt: UserMessage = {
       role: "user",
       content: buildUserContent(input.text, input.images ?? []),

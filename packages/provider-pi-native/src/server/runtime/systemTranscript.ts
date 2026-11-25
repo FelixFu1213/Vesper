@@ -16,17 +16,44 @@ export const CANONICAL_SYSTEM_SECTIONS = [
   "context_budget",
 ] as const;
 
-export type SystemSectionName = (typeof CANONICAL_SYSTEM_SECTIONS)[number];
+/** Skills own one section each, appended as `skill:<id>` right after the catalog header. */
+export const SKILL_SECTION_PREFIX = "skill:";
+
+export type SystemSectionName =
+  | (typeof CANONICAL_SYSTEM_SECTIONS)[number]
+  | `${typeof SKILL_SECTION_PREFIX}${string}`;
 
 /** `null` removes a section; `undefined` leaves it untouched. */
-export type SystemSectionMap = Partial<Record<SystemSectionName, string | null>>;
+export type SystemSectionMap = Partial<Record<string, string | null>>;
+
+const isSkillSection = (name: string): boolean => name.startsWith(SKILL_SECTION_PREFIX);
+
+/** Canonical order, with the per-skill sections kept together behind the catalog header. */
+function orderedSectionNames(
+  sections: SystemSectionMap | undefined,
+  committed?: SystemSectionMap | undefined,
+): ReadonlyArray<string> {
+  const skillSections = new Set<string>();
+  for (const source of [committed, sections]) {
+    if (source === undefined) continue;
+    for (const name of Object.keys(source)) {
+      if (isSkillSection(name)) skillSections.add(name);
+    }
+  }
+  const names: Array<string> = [];
+  for (const name of CANONICAL_SYSTEM_SECTIONS) {
+    names.push(name);
+    if (name === "skills") names.push(...[...skillSections].sort());
+  }
+  return names;
+}
 
 function orderedSections(
   sections: SystemSectionMap | undefined,
 ): Record<string, string> | undefined {
   if (sections === undefined) return undefined;
   const ordered: Record<string, string> = {};
-  for (const name of CANONICAL_SYSTEM_SECTIONS) {
+  for (const name of orderedSectionNames(sections)) {
     const value = sections[name];
     if (typeof value === "string" && value !== "") ordered[name] = value;
   }
@@ -81,13 +108,22 @@ export class SystemTranscriptManager {
    */
   diffSections(next: SystemSectionMap, timestamp: number): SystemMessage | null {
     const changed: Record<string, string | null> = {};
-    for (const name of CANONICAL_SYSTEM_SECTIONS) {
+    for (const name of orderedSectionNames(next, this.#committed)) {
       const value = next[name];
-      if (value === undefined) continue;
-      if (this.#committed[name] === value) continue;
+      const committed = this.#committed[name];
+      if (value === undefined) {
+        // A skill that left the catalog is revoked explicitly; other sections stay untouched.
+        if (isSkillSection(name) && typeof committed === "string") changed[name] = null;
+        continue;
+      }
+      if (committed === value) continue;
       changed[name] = value === "" ? null : value;
     }
-    this.#committed = { ...this.#committed, ...next };
+    const committed: SystemSectionMap = { ...this.#committed, ...next };
+    for (const [name, value] of Object.entries(changed)) {
+      if (value === null) committed[name] = null;
+    }
+    this.#committed = committed;
     const names = Object.keys(changed);
     if (names.length === 0) return null;
     return { role: "system", content: "", sections: changed, timestamp };
@@ -175,8 +211,10 @@ export interface BuildT3SystemSectionsInput {
   readonly runtimePolicy?: Pick<ProviderAdapterV2RuntimePolicy, "cwd" | "workspace"> | undefined;
   readonly hasT3Mcp?: boolean | undefined;
   readonly hasDeviceTools?: boolean | undefined;
-  /** Skill names and descriptions available to this thread. */
+  /** Skill names and descriptions available to this thread, as one rendered block. */
   readonly skillSummary?: string | undefined;
+  /** Per-section skill catalog; `skill:<id>` keys append as the catalog changes. */
+  readonly skillSections?: Readonly<Record<string, string | null>> | undefined;
   /** `APPEND_SYSTEM.md`: after the base prompt and before project instructions. */
   readonly customAppend?: string | undefined;
   /** The rendered `AGENTS.md` chain: after the custom append and before skills. */
@@ -225,6 +263,7 @@ export function buildT3SystemSections(input: BuildT3SystemSectionsInput): System
     ...(input.skillSummary === undefined || input.skillSummary === ""
       ? {}
       : { skills: input.skillSummary }),
+    ...input.skillSections,
     ...(toolActivation === "" ? {} : { tool_activation: toolActivation }),
     ...(input.context === undefined || input.context === "" ? {} : { context: input.context }),
     ...(input.contextBudget === undefined || input.contextBudget === ""

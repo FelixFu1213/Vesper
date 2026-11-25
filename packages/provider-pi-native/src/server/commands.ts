@@ -118,3 +118,36 @@ export function parsePiNativeWorkflowCommand(text: string): PiNativeWorkflowComm
     boostThinking: definition.boostThinking,
   };
 }
+
+export interface PiNativeSkillCommand {
+  /** The exact id the composer's `$` menu and the `Skill` tool use. */
+  readonly skillId: string;
+  readonly args: string;
+}
+
+/** Reads an explicit `/skill:<id> [args]` invocation, the slash form of a `$<id>` mention. */
+export function parsePiNativeSkillCommand(text: string): PiNativeSkillCommand | null {
+  const match = /^\/skill:([^\s]+)(?:\s+([\s\S]*))?$/iu.exec(text.trim());
+  if (match === null) return null;
+  const skillId = (match[1] ?? "").trim();
+  if (skillId === "") return null;
+  return { skillId, args: (match[2] ?? "").trim() };
+}
+
+/**
+ * `$<id>` tokens the composer inserted, resolved against the installed catalog so a
+ * price such as `$5` or an unknown mention stays ordinary text.
+ */
+export function piNativeSkillMentions(
+  text: string,
+  skillIds: Iterable<string>,
+): ReadonlyArray<string> {
+  const installed = new Set(skillIds);
+  const found: Array<string> = [];
+  for (const match of text.matchAll(/\$([A-Za-z0-9][A-Za-z0-9_-]*)/gu)) {
+    const id = match[1] ?? "";
+    if (!installed.has(id) || found.includes(id)) continue;
+    found.push(id);
+  }
+  return found;
+}

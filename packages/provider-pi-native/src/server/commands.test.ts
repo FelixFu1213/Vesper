@@ -2,7 +2,9 @@ import { describe, expect, it } from "@effect/vitest";
 
 import {
   parsePiNativeCompactCommand,
+  parsePiNativeSkillCommand,
   parsePiNativeWorkflowCommand,
+  piNativeSkillMentions,
   PI_NATIVE_SLASH_COMMANDS,
 } from "./commands.ts";
 
@@ -95,5 +97,38 @@ describe("parsePiNativeWorkflowCommand", () => {
     expect(parsePiNativeWorkflowCommand("/reviewing")).toBeNull();
     expect(parsePiNativeWorkflowCommand("/compact")).toBeNull();
     expect(parsePiNativeWorkflowCommand("review")).toBeNull();
+  });
+});
+
+describe("parsePiNativeSkillCommand", () => {
+  it("reads /skill:<id> with its optional argument", () => {
+    expect(parsePiNativeSkillCommand("/skill:review")).toEqual({ skillId: "review", args: "" });
+    expect(parsePiNativeSkillCommand("  /skill:release-notes  write the notes ")).toEqual({
+      skillId: "release-notes",
+      args: "write the notes",
+    });
+  });
+
+  it("ignores other commands and bare mentions", () => {
+    expect(parsePiNativeSkillCommand("/skill:")).toBeNull();
+    expect(parsePiNativeSkillCommand("/skills:review")).toBeNull();
+    expect(parsePiNativeSkillCommand("$review")).toBeNull();
+    expect(parsePiNativeSkillCommand("/review")).toBeNull();
+  });
+});
+
+describe("piNativeSkillMentions", () => {
+  it("resolves only installed `$<id>` tokens, once each", () => {
+    expect(piNativeSkillMentions("use $review and $review again", ["review", "notes"])).toEqual([
+      "review",
+    ]);
+    expect(piNativeSkillMentions("$notes then $review", ["review", "notes"])).toEqual([
+      "notes",
+      "review",
+    ]);
+  });
+
+  it("leaves prices and unknown mentions alone", () => {
+    expect(piNativeSkillMentions("budget is $5 for $unknown", ["review"])).toEqual([]);
   });
 });

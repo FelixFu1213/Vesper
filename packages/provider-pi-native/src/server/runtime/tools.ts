@@ -58,6 +58,8 @@ import {
   type SearchFileAnchorSink,
   type SearchOutputMode,
 } from "./searchTools.ts";
+import { createSkillTool } from "./skillTool.ts";
+import type { PiNativeSkillDef } from "./skillsDiscovery.ts";
 
 const T3CODE_THREAD_ID_ENV = "T3CODE_THREAD_ID";
 
@@ -146,6 +148,8 @@ export interface PiNativeToolDeps {
     | ((update: GoalStatusUpdate) => Promise<GoalStatusUpdateResult> | GoalStatusUpdateResult)
     | undefined;
   readonly isPlanMode: () => boolean;
+  /** The session's live skill catalog; the `Skill` tool always resolves against it. */
+  readonly skills?: (() => ReadonlyArray<PiNativeSkillDef>) | undefined;
   readonly mcpSession?: McpProviderSessionConfig;
   readonly threadId?: string;
   readonly environment?: NodeJS.ProcessEnv;
@@ -1542,6 +1546,7 @@ export const createPiNativeTools = (deps: PiNativeToolDeps): ReadonlyArray<Agent
     globTool,
     grepTool,
     bashTool,
+    createSkillTool({ skills: () => deps.skills?.() ?? [] }),
     askTool,
     submitPlanTool,
     todoTool,
