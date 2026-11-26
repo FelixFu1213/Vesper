@@ -268,6 +268,27 @@ describe("command permissions", () => {
         expect(denied._tag).toBe("EnvironmentAuthorizationError");
       }),
   );
+  it.effect("guards the context breakdown read with the orchestration read scope", () =>
+    Effect.gen(function* () {
+      const registry = yield* setup;
+      const permissions = createCommandPermissions(
+        runtime,
+        ORCHESTRATION_V2_WS_METHODS.getThreadContextBreakdown,
+      );
+      const readOnly = {
+        ...grant(true),
+        scopes: [AuthOrchestrationReadScope],
+        permissions: [AuthOrchestrationReadScope],
+      };
+      registry.set(sessions(env), AsyncResult.success(readOnly));
+      expect(registry.get(permissions.permissionAtom(env))).toBe(true);
+      yield* permissions.authorize(registry, env);
+      registry.set(sessions(env), AsyncResult.success(grant(true)));
+      expect(registry.get(permissions.permissionAtom(env))).toBe(false);
+      const denied = yield* permissions.authorize(registry, env).pipe(Effect.flip);
+      expect(denied._tag).toBe("EnvironmentAuthorizationError");
+    }),
+  );
   it.effect("waits for an initial grant", () =>
     Effect.gen(function* () {
       const registry = yield* setup;

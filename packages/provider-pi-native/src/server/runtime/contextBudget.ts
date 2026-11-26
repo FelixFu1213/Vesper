@@ -1,3 +1,8 @@
+import {
+  estimateCjkAwareTextTokens,
+  estimateToolSchemaTokens as estimateSharedToolSchemaTokens,
+  IMAGE_TOKEN_ESTIMATE,
+} from "@t3tools/shared/contextTokens";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type {
   Api,
@@ -12,13 +17,7 @@ import type {
 
 import type { ContextCalibration, ContextEstimateCalibration } from "./contextCalibration.ts";
 
-/** Flat cost of one image block; providers bill an image as a fixed tile budget. */
-const IMAGE_TOKEN_ESTIMATE = 1_600;
-const CJK_TOKENS_PER_CHARACTER = 1.5;
-const LATIN_CHARACTERS_PER_TOKEN = 4;
-
-const CJK_CHARACTER =
-  /[\u2e80-\u2eff\u2f00-\u2fdf\u3000-\u303f\u3040-\u30ff\u3100-\u312f\u3130-\u318f\u31a0-\u31bf\u3400-\u4dbf\u4e00-\u9fff\ua960-\ua97f\uac00-\ud7af\uf900-\ufaff\uff00-\uffef\u{20000}-\u{3ffff}]/u;
+export { estimateCjkAwareTextTokens, IMAGE_TOKEN_ESTIMATE } from "@t3tools/shared/contextTokens";
 
 export interface ContextBudget {
   readonly contextWindow: number;
@@ -48,24 +47,6 @@ export function computeContextBudget(
     autoCompactThreshold: Math.floor(hardLimit * 0.9),
     warningThreshold: Math.floor(hardLimit * 0.75),
   };
-}
-
-/** CJK, Kana, and Hangul characters tokenize far denser than Latin text. */
-export function estimateCjkAwareTextTokens(text: string): number {
-  if (text === "") return 0;
-  let cjkCharacters = 0;
-  let otherCharacters = 0;
-  for (const character of text) {
-    if (CJK_CHARACTER.test(character)) {
-      cjkCharacters += 1;
-    } else {
-      otherCharacters += 1;
-    }
-  }
-  return (
-    Math.ceil(cjkCharacters * CJK_TOKENS_PER_CHARACTER) +
-    Math.ceil(otherCharacters / LATIN_CHARACTERS_PER_TOKEN)
-  );
 }
 
 function estimateTextContent(
@@ -192,13 +173,8 @@ export interface ContextProjection {
   readonly calibration: ContextCalibration;
 }
 
-function estimateToolSchemaTokens(tool: ContextRequestTool): number {
-  return (
-    estimateCjkAwareTextTokens(tool.name) +
-    (tool.description === undefined ? 0 : estimateCjkAwareTextTokens(tool.description)) +
-    (tool.parameters === undefined ? 0 : estimateCjkAwareTextTokens(safeJson(tool.parameters)))
-  );
-}
+const estimateToolSchemaTokens = (tool: ContextRequestTool): number =>
+  estimateSharedToolSchemaTokens(tool);
 
 /** Real prompt tokens the most recent usable assistant usage block reports. */
 function usageTokensOf(message: AssistantMessage): number {

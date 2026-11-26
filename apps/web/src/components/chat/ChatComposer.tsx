@@ -223,6 +223,8 @@ import {
 } from "./ComposerAttachmentStrip";
 import { CollapsedComposerStopAction, ComposerPrimaryActions } from "./ComposerPrimaryActions";
 import { ComposerFooterPrimaryActions } from "./ComposerFooterControls";
+import { ComposerContextPill } from "./ComposerContextPill";
+import type { ContextWindowSnapshot } from "@t3tools/client-runtime/state/context-window";
 import { ComposerPendingUserInputPanel } from "./ComposerPendingUserInputPanel";
 import { resolveComposerMenuActiveItemId } from "./composerMenuHighlight";
 import { buildPullRequestReferenceContext } from "../pullRequest/pullRequestDetail.logic";
@@ -494,6 +496,12 @@ export interface ChatComposerProps {
   onToggleDiffPanel?: (() => void) | undefined;
   /** Toggles the thread details panel from `/context`; absent where it cannot open. */
   onToggleContextPanel?: (() => void) | undefined;
+  /** Opens the context breakdown panel; absent where no server thread owns the composer. */
+  onOpenContextBreakdown?: (() => void) | undefined;
+  /** The context the stream already reports, for the composer's gauge. */
+  contextWindow?: ContextWindowSnapshot | null;
+  /** Whether the breakdown panel is the active surface, so the gauge reads pressed. */
+  contextBreakdownOpen?: boolean;
   onSelectActivePendingUserInputOption: (questionId: string, optionValue: string) => void;
   onAdvanceActivePendingUserInput: () => void;
   onDismissActivePendingUserInput: (requestId: RuntimeRequestId) => void;
@@ -604,6 +612,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     onToggleInteractionMode,
     onToggleDiffPanel,
     onToggleContextPanel,
+    onOpenContextBreakdown,
+    contextBreakdownOpen = false,
     onSelectActivePendingUserInputOption,
     onAdvanceActivePendingUserInput,
     onDismissActivePendingUserInput,
@@ -4088,6 +4098,13 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                       dictationTakesFooter && "hidden",
                     )}
                   >
+                    {onOpenContextBreakdown !== undefined ? (
+                      <ComposerContextPill
+                        usage={props.contextWindow ?? null}
+                        active={contextBreakdownOpen}
+                        onToggle={onOpenContextBreakdown}
+                      />
+                    ) : null}
                     {composerControls}
                   </div>
                   <ComposerFooterPrimaryActions

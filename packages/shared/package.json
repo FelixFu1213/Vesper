@@ -650,6 +650,10 @@
     "./assistantInsights": {
       "types": "./src/assistantInsights.ts",
       "import": "./src/assistantInsights.ts"
+    },
+    "./contextTokens": {
+      "types": "./src/contextTokens.ts",
+      "import": "./src/contextTokens.ts"
     }
   },
   "scripts": {

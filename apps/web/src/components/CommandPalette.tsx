@@ -74,6 +74,7 @@ import {
   LinkIcon,
   MessageSquareIcon,
   PaletteIcon,
+  PieChartIcon,
   RotateCcwIcon,
   SettingsIcon,
   MonitorIcon,
@@ -1530,6 +1531,20 @@ function OpenCommandPaletteDialog(props: {
       icon: <PullRequestGlyph.link className={ITEM_ICON_CLASS} />,
       run: async () => {
         useRightPanelStore.getState().open(threadRef, "pull-requests");
+      },
+    });
+  }
+
+  if (activeThread) {
+    const threadRef = scopeThreadRef(activeThread.environmentId, activeThread.id);
+    actionItems.push({
+      kind: "action",
+      value: "action:toggle-context-breakdown",
+      searchTerms: ["context", "tokens", "breakdown", "prompt", "system", "mcp", "tools"],
+      title: gt("Toggle context breakdown"),
+      icon: <PieChartIcon className={ITEM_ICON_CLASS} />,
+      run: async () => {
+        useRightPanelStore.getState().toggle(threadRef, "context");
       },
     });
   }

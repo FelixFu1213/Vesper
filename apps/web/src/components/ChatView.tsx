@@ -2558,6 +2558,7 @@ export default function ChatView(props: ChatViewProps) {
     : null;
   const {
     activateRightPanelSurfaceStable,
+    addContextSurfaceStable,
     addDeviceSurfaceStable,
     addDiffSurfaceStable,
     addFilesSurfaceStable,
@@ -2575,6 +2576,7 @@ export default function ChatView(props: ChatViewProps) {
     openChangesFromThreadPanelStable,
     openFileSurfaceStable,
     openPlanSurfaceStable,
+    toggleContextSurfaceStable,
     toggleRightPanelMaximizedStable,
     toggleRightPanelStable,
     toggleThreadPanelStable,
@@ -3278,7 +3280,8 @@ export default function ChatView(props: ChatViewProps) {
     acknowledgeActiveThreadWoke,
     onInteractionModeChange: handleInteractionModeChangeStable,
     onToggleDiffPanel: isServerThread && diffAvailable ? onToggleDiffStable : undefined,
-    onToggleContextPanel: activeThreadRef !== null ? toggleThreadPanelStable : undefined,
+    onToggleContextPanel:
+      activeThreadRef !== null && isServerThread ? toggleContextSurfaceStable : undefined,
     onRuntimeModeChange: handleRuntimeModeChangeStable,
     runtimeModeOptions: compatibleRuntimeModeOptions,
     onSideChat: sideChat.available ? sendSideChatStable : undefined,
@@ -4159,7 +4162,18 @@ export default function ChatView(props: ChatViewProps) {
                                   isServerThread && diffAvailable ? onToggleDiffStable : undefined
                                 }
                                 onToggleContextPanel={
-                                  activeThreadRef !== null ? toggleThreadPanelStable : undefined
+                                  activeThreadRef !== null && isServerThread
+                                    ? toggleContextSurfaceStable
+                                    : undefined
+                                }
+                                onOpenContextBreakdown={
+                                  activeThreadRef !== null && isServerThread
+                                    ? toggleContextSurfaceStable
+                                    : undefined
+                                }
+                                contextWindow={activeContextWindow}
+                                contextBreakdownOpen={
+                                  rightPanelOpen && activeRightPanelSurface?.kind === "context"
                                 }
                                 onSelectActivePendingUserInputOption={
                                   onSelectActivePendingUserInputOptionStable
@@ -4364,6 +4378,7 @@ export default function ChatView(props: ChatViewProps) {
                   {...(isServerThread && isGitRepo
                     ? { onOpenChanges: openChangesFromThreadPanelStable }
                     : {})}
+                  {...(isServerThread ? { onOpenContext: addContextSurfaceStable } : {})}
                   onRunProjectScript={runProjectScriptStable}
                   onAddProjectScript={saveProjectScriptStable}
                   onUpdateProjectScript={updateProjectScriptStable}
@@ -4458,6 +4473,7 @@ export default function ChatView(props: ChatViewProps) {
             onAddPullRequest={addPullRequestSurfaceStable}
             onAddPullRequests={addPullRequestsSurfaceStable}
             onAddDevice={addDeviceSurfaceStable}
+            onAddContext={addContextSurfaceStable}
             onAddSideChat={sideChatsOffered ? openSideChatStable : undefined}
             browserAvailable={canOperatePreview && browserAvailable}
             terminalAvailable={activeProject !== null && canOperateTerminal}
@@ -4466,6 +4482,7 @@ export default function ChatView(props: ChatViewProps) {
             pullRequestAvailable={pullRequestSurfaceAvailable}
             pullRequestsAvailable={linkedItemsSurfaceAvailable}
             deviceAvailable={activeThreadRef !== null}
+            contextAvailable={isServerThread}
             sideChatAvailable={sideChat.available}
             sideChatDisabledReason={sideChatDisabledReason}
           >

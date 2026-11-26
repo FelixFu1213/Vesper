@@ -38,6 +38,11 @@ const DevicePanel = lazy(() =>
   import("../device/DevicePanel").then((module) => ({ default: module.DevicePanel })),
 );
 const FilePreviewPanel = lazy(() => import("../files/FilePreviewPanel"));
+const ThreadContextPanel = lazy(() =>
+  import("./context/ThreadContextPanel").then((module) => ({
+    default: module.ThreadContextPanel,
+  })),
+);
 
 type RightPanelTerminalProps = Omit<
   PersistentThreadTerminalPanelProps,
@@ -269,6 +274,12 @@ export function RightPanelSurfaceContent(props: {
               useRightPanelStore.getState().show(threadRef);
             }}
           />
+        </Suspense>
+      );
+    case "context":
+      return (
+        <Suspense fallback={null}>
+          <ThreadContextPanel threadRef={threadRef} />
         </Suspense>
       );
     case "files":

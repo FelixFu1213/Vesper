@@ -115,6 +115,7 @@ import * as ServerConfig from "./config.ts";
 import * as EnvironmentTheme from "./environmentTheme.ts";
 import * as Keybindings from "./keybindings.ts";
 import * as ExternalLauncher from "./process/externalLauncher.ts";
+import * as ThreadContextBreakdownService from "./orchestration-v2/ThreadContextBreakdownService.ts";
 import * as ThreadManagementService from "./orchestration-v2/ThreadManagementService.ts";
 import * as ThreadViewers from "./orchestration-v2/ThreadViewers.ts";
 import * as CommandOutputHub from "./orchestration-v2/CommandOutputHub.ts";
@@ -1364,6 +1365,8 @@ export const layerWsRpc = (
       const currentSessionId = currentSession.sessionId;
       const sql = yield* SqlClient.SqlClient;
       const threadManagement = yield* ThreadManagementService.ThreadManagementService;
+      const threadContextBreakdown =
+        yield* ThreadContextBreakdownService.ThreadContextBreakdownService;
       const intakeContext = yield* Effect.context<
         | ThreadManagementService.ThreadManagementService
         | ThreadLaunchService.ThreadLaunchService
@@ -2093,6 +2096,17 @@ export const layerWsRpc = (
                       }),
                   ),
                 ),
+            ),
+          ),
+        [ORCHESTRATION_V2_WS_METHODS.getThreadContextBreakdown]: (input) =>
+          threadContextBreakdown.read(input.threadId).pipe(
+            Effect.mapError(
+              (cause) =>
+                new OrchestrationV2GetThreadProjectionError({
+                  threadId: input.threadId,
+                  message: "Failed to compute context breakdown",
+                  cause,
+                }),
             ),
           ),
         [ORCHESTRATION_V2_WS_METHODS.launchThread]: (input) =>
