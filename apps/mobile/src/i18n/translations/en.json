@@ -4511,6 +4511,7 @@
   "a70abf17e99c2d6d": "Remove some text or an attachment, then paste again.",
   "94f312446d9f210d": "Stop agent",
   "fbafbe78b5e37966": "Resume thread",
+  "65f28be14626d3b3": "Context {percent}%",
   "c19358bac32e58e8": "This connection cannot control this task. You can still edit your draft.",
   "1b30548ce8e56b75": "Edit task",
   "2269639b96d04225": "Could not start task",

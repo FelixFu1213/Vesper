@@ -80,6 +80,12 @@ import {
   ComposerInlineControl,
   ComposerToolbarRow,
 } from "../../components/ComposerToolbar";
+import {
+  formatTokensPerSecond,
+  resolveContextUsedPercentage,
+  type ContextWindowSnapshot,
+  type ReplySpeedSnapshot,
+} from "@t3tools/client-runtime/state/context-window";
 import { formatTokens } from "@t3tools/shared/usageFormat";
 import { ComposerModelControl } from "../../components/ComposerModelControl";
 import {
@@ -145,6 +151,8 @@ export interface ThreadComposerProps {
   readonly selectedThread: EnvironmentThreadShell;
   readonly reportedModelSelection?: ModelSelection | null;
   readonly hasCompactableConversation: boolean;
+  readonly contextWindow?: ContextWindowSnapshot | null;
+  readonly replySpeed?: ReplySpeedSnapshot | null;
   /** Set while the next send compacts the thread first. */
   readonly compactBeforeSend?: {
     readonly tokens: number;
@@ -1137,6 +1145,34 @@ export const ThreadComposer = function ThreadComposer(props: ThreadComposerProps
             </ComposerDictationToolbar>
           </Animated.View>
         </ComposerSurface>
+
+        {(() => {
+          const replySpeed = props.replySpeed ?? null;
+          const contextUsedPercent = resolveContextUsedPercentage(props.contextWindow);
+          if (replySpeed === null && contextUsedPercent === null) return null;
+          const contextToneClass =
+            contextUsedPercent === null
+              ? "text-foreground-muted"
+              : contextUsedPercent >= 90
+                ? "text-danger"
+                : contextUsedPercent >= 80
+                  ? "text-warning"
+                  : "text-foreground-muted";
+          return (
+            <View className="flex-row items-center justify-end gap-3 px-2 pt-1.5">
+              {replySpeed !== null ? (
+                <Text className="text-[11px] text-foreground-muted tabular-nums">
+                  {`${formatTokensPerSecond(replySpeed.tokensPerSecond)} tokens/s`}
+                </Text>
+              ) : null}
+              {contextUsedPercent !== null ? (
+                <Text className={`text-[11px] tabular-nums ${contextToneClass}`}>
+                  {gt("Context {percent}%", { percent: contextUsedPercent })}
+                </Text>
+              ) : null}
+            </View>
+          );
+        })()}
 
         {props.connectionState === "connected" && operateDenied ? (
           <Text className="pt-2 text-xs text-foreground-muted">

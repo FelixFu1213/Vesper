@@ -14,7 +14,12 @@ import {
 import * as DateTime from "effect/DateTime";
 import { describe, expect, it } from "vite-plus/test";
 
-import { compactBeforeSendTokens } from "./contextWindow.ts";
+import {
+  compactBeforeSendTokens,
+  deriveLatestReplySpeedSnapshot,
+  formatTokensPerSecond,
+  resolveContextUsedPercentage,
+} from "./contextWindow.ts";
 import type { ThreadStructure } from "./models.ts";
 import { v2Projection } from "./orchestrationV2TestFixtures.ts";
 
@@ -260,5 +265,125 @@ describe("compactBeforeSendTokens", () => {
     expect(compactBeforeSendTokens(sendInput(overrides as Parameters<typeof sendInput>[0]))).toBe(
       expected ? 293_611 : null,
     );
+  });
+});
+
+describe("deriveLatestReplySpeedSnapshot", () => {
+  const activeThreadId = ProviderThreadId.make("provider-thread-1");
+  const otherThreadId = ProviderThreadId.make("provider-thread-2");
+
+  it("computes tokens/s from the latest completed turn on the active provider thread", () => {
+    const speed = deriveLatestReplySpeedSnapshot(
+      [
+        {
+          providerThreadId: activeThreadId,
+          ordinal: 1,
+          startedAt: DateTime.makeUnsafe("2026-10-30T14:00:00.000Z"),
+          completedAt: DateTime.makeUnsafe("2026-10-30T14:00:02.000Z"),
+          turnTokenUsage: {
+            usageScope: "main_agent",
+            usageStatus: "complete",
+            inputTokens: 100,
+            outputTokens: 50,
+            hasSubagents: false,
+          },
+        },
+        {
+          providerThreadId: activeThreadId,
+          ordinal: 2,
+          startedAt: DateTime.makeUnsafe("2026-10-30T14:01:00.000Z"),
+          completedAt: DateTime.makeUnsafe("2026-10-30T14:01:04.000Z"),
+          turnTokenUsage: {
+            usageScope: "main_agent",
+            usageStatus: "complete",
+            inputTokens: 200,
+            outputTokens: 400,
+            hasSubagents: false,
+          },
+        },
+        {
+          providerThreadId: otherThreadId,
+          ordinal: 3,
+          startedAt: DateTime.makeUnsafe("2026-10-30T14:02:00.000Z"),
+          completedAt: DateTime.makeUnsafe("2026-10-30T14:02:01.000Z"),
+          turnTokenUsage: {
+            usageScope: "main_agent",
+            usageStatus: "complete",
+            inputTokens: 10,
+            outputTokens: 999,
+            hasSubagents: false,
+          },
+        },
+      ],
+      { id: activeThreadId, contextUsage: null },
+    );
+
+    expect(speed).toEqual({
+      tokensPerSecond: 100,
+      outputTokens: 400,
+      durationMs: 4000,
+    });
+  });
+
+  it("uses live tokenUsage.updatedAt while a turn is still running", () => {
+    const speed = deriveLatestReplySpeedSnapshot(
+      [
+        {
+          providerThreadId: activeThreadId,
+          ordinal: 1,
+          startedAt: DateTime.makeUnsafe("2026-10-30T14:00:00.000Z"),
+          completedAt: null,
+          tokenUsage: {
+            usedTokens: 500,
+            outputTokens: 75,
+            updatedAt: "2026-10-30T14:00:01.500Z",
+          },
+        },
+      ],
+      { id: activeThreadId, contextUsage: null },
+    );
+
+    expect(speed).toEqual({
+      tokensPerSecond: 50,
+      outputTokens: 75,
+      durationMs: 1500,
+    });
+  });
+
+  it("falls back to providerThread.contextUsage when turns lack outputTokens", () => {
+    const speed = deriveLatestReplySpeedSnapshot([], {
+      id: activeThreadId,
+      contextUsage: {
+        usedTokens: 1000,
+        lastOutputTokens: 120,
+        durationMs: 2000,
+      },
+    });
+
+    expect(speed).toEqual({
+      tokensPerSecond: 60,
+      outputTokens: 120,
+      durationMs: 2000,
+    });
+  });
+
+  it("returns null when no positive outputTokens and duration are available", () => {
+    expect(deriveLatestReplySpeedSnapshot([], null)).toBeNull();
+  });
+});
+
+describe("formatTokensPerSecond & resolveContextUsedPercentage", () => {
+  it("formats speeds cleanly across ranges", () => {
+    expect(formatTokensPerSecond(8.44)).toBe("8.4");
+    expect(formatTokensPerSecond(42.02)).toBe("42");
+    expect(formatTokensPerSecond(42.56)).toBe("42.6");
+    expect(formatTokensPerSecond(128.7)).toBe("129");
+  });
+
+  it("clamps and rounds context percentage only when maxTokens is known", () => {
+    expect(resolveContextUsedPercentage(null)).toBeNull();
+    expect(resolveContextUsedPercentage({ maxTokens: null, usedPercentage: 50 })).toBeNull();
+    expect(resolveContextUsedPercentage({ maxTokens: 200_000, usedPercentage: 42.6 })).toBe(43);
+    expect(resolveContextUsedPercentage({ maxTokens: 200_000, usedPercentage: 120 })).toBe(100);
   });
 });
