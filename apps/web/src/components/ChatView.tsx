@@ -366,14 +366,17 @@ import { useProactivePanels } from "../hooks/useProactivePanels";
 import { useIncrementalTimelineEntries } from "../hooks/useIncrementalTimelineEntries";
 import { useRightPanelSurfaceClose } from "../hooks/useRightPanelSurfaceClose";
 import { ComposerBannerStack, type ComposerBannerStackItem } from "./chat/ComposerBannerStack";
+import { ComposerMetricsStrip } from "./chat/ComposerMetricsStrip";
 import { modelFallbackBannerItem } from "./chat/ComposerUsageLimits";
 import { ComposerSurface } from "./chat/ComposerSurface";
 import { resolveThreadSyncPhase } from "../threadSync";
 import { hasAvailableCompactionProvider } from "./chat/compaction.logic";
 import {
   deriveLatestContextWindowSnapshot,
+  deriveLatestReplySpeedSnapshot,
   hasDismissedResumeCompaction,
   latestProviderTurnTokenUsage,
+  resolveContextUsedPercentage,
   shouldOfferResumeCompaction,
 } from "@t3tools/client-runtime/state/context-window";
 import {
@@ -1628,6 +1631,10 @@ export default function ChatView(props: ChatViewProps) {
     activeThreadLiveTokenUsage,
     activeProviderThread,
   );
+  const activeReplySpeed = deriveLatestReplySpeedSnapshot(
+    serverProjection?.providerTurns ?? [],
+    activeProviderThread,
+  );
   const pendingBackgroundTasks = deriveThreadPendingBackgroundTasks(serverProjection);
   const activeWorkStartedAt =
     deriveActiveWorkStartedAt(activeActivityRun, activeRuntime, localDispatchStartedAt) ??
@@ -1932,6 +1939,9 @@ export default function ChatView(props: ChatViewProps) {
           providerSubagentModels,
           reportedModelSelection,
         );
+  const showComposerMetricsStrip =
+    composerMounted &&
+    (activeReplySpeed !== null || resolveContextUsedPercentage(activeContextWindow) !== null);
   const showComposerContextStrip =
     !embedded &&
     shouldShowComposerContextStrip({
@@ -1941,6 +1951,7 @@ export default function ChatView(props: ChatViewProps) {
       isGitRepo,
       showEnvironmentIndicator: showComposerEnvironmentIndicator,
     });
+  const hasComposerBottomRow = showComposerContextStrip || showComposerMetricsStrip;
   const terminalShortcutLabelOptions = {
     context: {
       terminalFocus: true,
@@ -3061,7 +3072,7 @@ export default function ChatView(props: ChatViewProps) {
         : serverConfig === null
           ? gt("Side chats are not ready yet. Try again in a moment.")
           : serverConfig.environment.capabilities.sideChats !== true
-            ? gt("Update this environment's T3 Code server to use side chats.")
+            ? gt("Update this environment's Vesper server to use side chats.")
             : sideChatsOffered && !isServerThread
               ? gt("Side chats start after the first message.")
               : sideChat.available &&
@@ -3983,7 +3994,7 @@ export default function ChatView(props: ChatViewProps) {
                   >
                     <ChildThreadApprovals threadRef={activeThreadRef} />
                     <div className="relative">
-                      <ComposerSurface.Shell contextRow={showComposerContextStrip}>
+                      <ComposerSurface.Shell contextRow={hasComposerBottomRow}>
                         <ComposerSurface.Host
                           inert={queuedRunEdit.isSaving}
                           aria-busy={queuedRunEdit.isSaving}
@@ -4259,6 +4270,12 @@ export default function ChatView(props: ChatViewProps) {
                                       })}
                                 />
                               </div>
+                            )}
+                            {showComposerMetricsStrip && (
+                              <ComposerMetricsStrip
+                                contextWindow={activeContextWindow}
+                                replySpeed={activeReplySpeed}
+                              />
                             )}
                           </div>
                         </div>

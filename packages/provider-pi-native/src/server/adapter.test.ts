@@ -20,6 +20,7 @@ import {
 } from "@t3tools/contracts";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
+import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import * as TestProviderHost from "@t3tools/provider-testing/TestProviderHost";
@@ -126,6 +127,48 @@ const gatedStream = () => {
   };
 };
 
+const lastPromptOf = (context: Parameters<StreamFn>[1]): string => {
+  const user = context.messages.filter((message) => message.role === "user").at(-1);
+  return typeof user?.content === "string" ? user.content : JSON.stringify(user?.content ?? "");
+};
+
+/**
+ * A stream seam keyed by the turn's prompt that keeps each request open until the test
+ * releases it, so two sessions can be provably mid-request at the same moment.
+ */
+const heldStream = () => {
+  const waiting = new Map<
+    string,
+    { readonly model: Model<Api>; readonly stream: AssistantMessageEventStream }
+  >();
+  const requested = new Set<string>();
+  const startWaiters = new Map<string, Array<() => void>>();
+  const streamFn: StreamFn = (model, context) => {
+    const prompt = lastPromptOf(context);
+    const stream = createAssistantMessageEventStream();
+    waiting.set(prompt, { model, stream });
+    requested.add(prompt);
+    for (const resolve of startWaiters.get(prompt) ?? []) resolve();
+    startWaiters.delete(prompt);
+    return stream;
+  };
+  return {
+    streamFn,
+    waitForRequest: (prompt: string): Promise<void> =>
+      requested.has(prompt)
+        ? Promise.resolve()
+        : new Promise((resolve) => {
+            startWaiters.set(prompt, [...(startWaiters.get(prompt) ?? []), resolve]);
+          }),
+    release: (prompt: string, text: string): void => {
+      const entry = waiting.get(prompt);
+      if (entry === undefined) throw new Error(`No held provider request for "${prompt}".`);
+      waiting.delete(prompt);
+      pushScriptedTurn(entry.stream, entry.model, scriptedTextResponse(text), 0);
+    },
+  };
+};
+
 interface Harness {
   readonly runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime;
   readonly providerThread: OrchestrationV2ProviderThread;
@@ -157,24 +200,31 @@ const makeHarness = Effect.fnUntraced(function* (input: {
   readonly mcpEndpoint?: string;
   readonly appContext?: ProviderAdapter.ProviderAdapterV2TurnInput["appContext"];
   readonly sessionStore?: ReturnType<typeof makeInMemoryPiNativeSessionStore> | undefined;
+  /** A second session on the same adapter, for cross-session behaviour. */
+  readonly adapter?: ProviderAdapter.ProviderAdapterV2["Service"] | undefined;
+  readonly threadId?: ThreadId | undefined;
+  readonly providerSessionId?: ProviderSessionId | undefined;
 }) {
   const idAllocator = yield* IdAllocator.IdAllocatorV2;
   const policy = input.policy ?? runtimePolicy();
-  const adapter = yield* makePiNativeAdapterV2({
-    instanceId,
-    settings: input.settings ?? settings(),
-    streamFn: input.streamFn ?? createScriptedStreamFn(input.steps ?? [], { now: () => 0 }),
-    now: () => 0,
-    sleep: async () => undefined,
-    scheduleTimer: () => () => undefined,
-    ...(input.fetch === undefined ? {} : { fetch: input.fetch }),
-    ...(input.sessionStore === undefined ? {} : { sessionStore: input.sessionStore }),
-  });
+  const appThreadId = input.threadId ?? threadId;
+  const adapter =
+    input.adapter ??
+    (yield* makePiNativeAdapterV2({
+      instanceId,
+      settings: input.settings ?? settings(),
+      streamFn: input.streamFn ?? createScriptedStreamFn(input.steps ?? [], { now: () => 0 }),
+      now: () => 0,
+      sleep: async () => undefined,
+      scheduleTimer: () => () => undefined,
+      ...(input.fetch === undefined ? {} : { fetch: input.fetch }),
+      ...(input.sessionStore === undefined ? {} : { sessionStore: input.sessionStore }),
+    }));
   if (input.mcpEndpoint !== undefined) {
     yield* (yield* McpProviderSessions.McpProviderSessions).set({
       environmentId: EnvironmentId.make("env-1"),
-      threadId,
-      providerSessionId: "session-1",
+      threadId: appThreadId,
+      providerSessionId: input.providerSessionId ?? "session-1",
       providerInstanceId: instanceId,
       endpoint: input.mcpEndpoint,
       authorizationHeader: "Bearer test",
@@ -182,8 +232,8 @@ const makeHarness = Effect.fnUntraced(function* (input: {
     });
   }
   const runtime = yield* adapter.openSession({
-    threadId,
-    providerSessionId: ProviderSessionId.make("session-1"),
+    threadId: appThreadId,
+    providerSessionId: input.providerSessionId ?? ProviderSessionId.make("session-1"),
     modelSelection,
     runtimePolicy: policy,
   });
@@ -199,7 +249,7 @@ const makeHarness = Effect.fnUntraced(function* (input: {
     Effect.forkScoped,
   );
   const providerThread = yield* runtime.ensureThread({
-    threadId,
+    threadId: appThreadId,
     modelSelection,
     runtimePolicy: policy,
   });
@@ -230,7 +280,7 @@ const makeHarness = Effect.fnUntraced(function* (input: {
   ) {
     const now = yield* DateTime.now;
     const appThread: OrchestrationV2AppThread = {
-      id: threadId,
+      id: appThreadId,
       projectId: ProjectId.make("project-pi-native-test"),
       title: "Pi Native test",
       createdBy: "user",
@@ -242,7 +292,7 @@ const makeHarness = Effect.fnUntraced(function* (input: {
       branch: null,
       worktreePath: null,
       activeProviderThreadId: providerThread.id,
-      lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+      lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: appThreadId },
       forkedFrom: null,
       createdAt: now,
       updatedAt: now,
@@ -254,7 +304,7 @@ const makeHarness = Effect.fnUntraced(function* (input: {
     };
     return {
       appThread,
-      threadId,
+      threadId: appThreadId,
       runId: RunId.make(`run-${ordinal}`),
       runOrdinal: ordinal,
       providerTurnOrdinal: ordinal,
@@ -347,8 +397,8 @@ describe("makePiNativeAdapterV2", () => {
       assert.isFalse(capabilities.turns.supportsNativeResume);
       assert.isTrue(capabilities.turns.supportsNativeGoals);
       assert.equal(capabilities.identity.nativeTurnIds, "strong");
-      // One in-process session hosts a runtime per app thread.
-      assert.isTrue(capabilities.sessions.supportsMultipleProviderThreadsPerSession);
+      // One provider session owns exactly one app thread, so parallel threads need their own.
+      assert.isFalse(capabilities.sessions.supportsMultipleProviderThreadsPerSession);
     }).pipe(Effect.provide(testLayer())),
   );
 
@@ -1806,6 +1856,317 @@ describe("makePiNativeAdapterV2", () => {
       assert.equal((yield* harness.takeEvent("turn.terminal")).status, "completed");
       assert.match(requests[1]?.activation ?? "", /<skill_content id="dynamic"/u);
       assert.match(requests[1]?.activation ?? "", /Dynamic body\./u);
+    }).pipe(Effect.provide(testLayer())),
+  );
+
+  it.effect("runs two independent sessions on one adapter in parallel", () =>
+    Effect.gen(function* () {
+      const held = heldStream();
+      const adapter = yield* makePiNativeAdapterV2({
+        instanceId,
+        settings: settings(),
+        streamFn: held.streamFn,
+        now: () => 0,
+        sleep: async () => undefined,
+        scheduleTimer: () => () => undefined,
+      });
+      const first = yield* makeHarness({
+        adapter,
+        threadId: ThreadId.make("thread-pi-native-first"),
+        providerSessionId: ProviderSessionId.make("session-first"),
+      });
+      const second = yield* makeHarness({
+        adapter,
+        threadId: ThreadId.make("thread-pi-native-second"),
+        providerSessionId: ProviderSessionId.make("session-second"),
+      });
+      assert.notEqual(first.runtime.providerSessionId, second.runtime.providerSessionId);
+      assert.notEqual(first.providerThread.id, second.providerThread.id);
+      assert.notEqual(
+        first.providerThread.nativeThreadRef?.nativeId,
+        second.providerThread.nativeThreadRef?.nativeId,
+      );
+
+      yield* startTurnWithText(first, 1, "first session prompt");
+      yield* startTurnWithText(second, 1, "second session prompt");
+      yield* Effect.promise(() =>
+        Promise.all([
+          held.waitForRequest("first session prompt"),
+          held.waitForRequest("second session prompt"),
+        ]),
+      );
+      // Both turns reached the provider at once: one instance, two live sessions.
+      assert.isTrue(yield* first.runtime.hasPendingBackgroundWork!);
+      assert.isTrue(yield* second.runtime.hasPendingBackgroundWork!);
+
+      yield* Effect.sync(() => held.release("first session prompt", "first answer"));
+      assert.equal((yield* first.takeEvent("turn.terminal")).status, "completed");
+      // The sibling turn is untouched by the first settling.
+      assert.isFalse(second.all.some((event) => event.type === "turn.terminal"));
+      yield* Effect.sync(() => held.release("second session prompt", "second answer"));
+      assert.equal((yield* second.takeEvent("turn.terminal")).status, "completed");
+
+      assert.deepStrictEqual(assistantTexts(first), ["first answer"]);
+      assert.deepStrictEqual(assistantTexts(second), ["second answer"]);
+    }).pipe(Effect.provide(testLayer())),
+  );
+
+  it.effect("resolves concurrent pending requests in two sessions without cross-talk", () =>
+    Effect.gen(function* () {
+      const cwd = yield* Effect.promise(makeWorkspace);
+      const policy = runtimePolicy({ runtimeMode: "approval-required", cwd });
+      const calls = new Map<string, number>();
+      const asktoolCall = (question: string, optionLabel: string): ScriptedTurn =>
+        scriptedToolCallResponse([
+          {
+            name: "asktool",
+            arguments: {
+              questions: [
+                {
+                  id: "q1",
+                  header: "Pick",
+                  question,
+                  options: [{ label: optionLabel, description: optionLabel }],
+                },
+              ],
+            },
+          },
+        ]);
+      const streamFn: StreamFn = (model, context) => {
+        const prompt = lastPromptOf(context);
+        const call = (calls.get(prompt) ?? 0) + 1;
+        calls.set(prompt, call);
+        const isFirst = prompt === "first concurrent";
+        const turn =
+          call === 1
+            ? scriptedToolCallResponse([
+                {
+                  name: "Write",
+                  arguments: {
+                    path: isFirst ? "first.txt" : "second.txt",
+                    content: isFirst ? "one" : "two",
+                  },
+                },
+              ])
+            : call === 2
+              ? // asktool is on demand, so each session activates it before calling it.
+                scriptedToolCallResponse([{ name: "ToolSearch", arguments: { query: "asktool" } }])
+              : call === 3
+                ? asktoolCall(isFirst ? "First choice?" : "Second choice?", isFirst ? "A" : "B")
+                : scriptedTextResponse(isFirst ? "first done" : "second done");
+        return renderScriptedTurn(model, turn, 0);
+      };
+      const adapter = yield* makePiNativeAdapterV2({
+        instanceId,
+        settings: settings(),
+        streamFn,
+        now: () => 0,
+        sleep: async () => undefined,
+        scheduleTimer: () => () => undefined,
+      });
+      const first = yield* makeHarness({
+        adapter,
+        policy,
+        threadId: ThreadId.make("thread-pi-native-req-first"),
+        providerSessionId: ProviderSessionId.make("session-req-first"),
+      });
+      const second = yield* makeHarness({
+        adapter,
+        policy,
+        threadId: ThreadId.make("thread-pi-native-req-second"),
+        providerSessionId: ProviderSessionId.make("session-req-second"),
+      });
+
+      yield* startTurnWithText(first, 1, "first concurrent");
+      yield* startTurnWithText(second, 1, "second concurrent");
+
+      // Both PermissionEngines emit `approval-1`; only turn-scoping keeps their ids distinct.
+      const approval1 = yield* first.takeEvent(
+        "runtime_request.updated",
+        (event) =>
+          event.runtimeRequest.status === "pending" && event.runtimeRequest.kind === "file-change",
+      );
+      const approval2 = yield* second.takeEvent(
+        "runtime_request.updated",
+        (event) =>
+          event.runtimeRequest.status === "pending" && event.runtimeRequest.kind === "file-change",
+      );
+      assert.notEqual(approval1.runtimeRequest.id, approval2.runtimeRequest.id);
+
+      // Answering in reverse arrival order proves neither request settles the other.
+      yield* second.runtime.respondToRuntimeRequest({
+        requestId: approval2.runtimeRequest.id,
+        decision: "accept",
+      });
+      yield* first.runtime.respondToRuntimeRequest({
+        requestId: approval1.runtimeRequest.id,
+        decision: "accept",
+      });
+
+      // Both runtimes emit `input:1` for their first asktool call; turn-scoping separates them too.
+      const question1 = yield* first.takeEvent(
+        "runtime_request.updated",
+        (event) =>
+          event.runtimeRequest.status === "pending" && event.runtimeRequest.kind === "user_input",
+      );
+      const question2 = yield* second.takeEvent(
+        "runtime_request.updated",
+        (event) =>
+          event.runtimeRequest.status === "pending" && event.runtimeRequest.kind === "user_input",
+      );
+      assert.notEqual(question1.runtimeRequest.id, question2.runtimeRequest.id);
+
+      yield* second.runtime.respondToRuntimeRequest({
+        requestId: question2.runtimeRequest.id,
+        answers: { q1: "B" },
+      });
+      yield* first.runtime.respondToRuntimeRequest({
+        requestId: question1.runtimeRequest.id,
+        answers: { q1: "A" },
+      });
+
+      assert.equal((yield* first.takeEvent("turn.terminal")).status, "completed");
+      assert.equal((yield* second.takeEvent("turn.terminal")).status, "completed");
+
+      assert.deepStrictEqual(assistantTexts(first), ["first done"]);
+      assert.deepStrictEqual(assistantTexts(second), ["second done"]);
+      assert.isTrue(
+        turnItems(first).some((item) => item.type === "file_change" && item.status === "completed"),
+      );
+      assert.isTrue(
+        turnItems(second).some(
+          (item) => item.type === "file_change" && item.status === "completed",
+        ),
+      );
+      assert.equal(
+        turnItems(first)
+          .filter((item) => item.type === "user_input_request")
+          .at(-1)?.status,
+        "completed",
+      );
+      assert.equal(
+        turnItems(second)
+          .filter((item) => item.type === "user_input_request")
+          .at(-1)?.status,
+        "completed",
+      );
+      const [firstFile, secondFile] = yield* Effect.promise(() =>
+        Promise.all([
+          NodeFSP.readFile(NodePath.join(cwd, "first.txt"), "utf8"),
+          NodeFSP.readFile(NodePath.join(cwd, "second.txt"), "utf8"),
+        ]),
+      );
+      assert.equal(firstFile, "one");
+      assert.equal(secondFile, "two");
+    }).pipe(Effect.provide(testLayer())),
+  );
+
+  it.effect("rejects a second turn on a thread whose turn is still running", () =>
+    Effect.gen(function* () {
+      const held = heldStream();
+      const harness = yield* makeHarness({ streamFn: held.streamFn });
+      yield* startTurnWithText(harness, 1, "held prompt");
+      yield* Effect.promise(() => held.waitForRequest("held prompt"));
+
+      const error = yield* Effect.flip(startTurnWithText(harness, 2, "second prompt"));
+      assert.equal(error._tag, "ProviderAdapterTurnStartError");
+      const cause = (error as { readonly cause?: unknown }).cause;
+      assert.equal((cause as { readonly _tag?: string })._tag, "ProviderAdapterProtocolError");
+      assert.equal((cause as { readonly reason?: string }).reason, "previous_turn_active");
+      assert.include(
+        makeProviderFailure({ cause: error }).message,
+        "the previous turn is still running",
+      );
+
+      yield* Effect.sync(() => held.release("held prompt", "first answer"));
+      assert.equal((yield* harness.takeEvent("turn.terminal")).status, "completed");
+      assert.deepStrictEqual(assistantTexts(harness), ["first answer"]);
+    }).pipe(Effect.provide(testLayer())),
+  );
+
+  it.effect("forks a thread from a live sibling session without a session store", () =>
+    Effect.gen(function* () {
+      const adapter = yield* makePiNativeAdapterV2({
+        instanceId,
+        settings: settings(),
+        streamFn: createScriptedStreamFn([scriptedTextResponse("parent answer")], { now: () => 0 }),
+        now: () => 0,
+        sleep: async () => undefined,
+        scheduleTimer: () => () => undefined,
+      });
+      const parent = yield* makeHarness({
+        adapter,
+        threadId: ThreadId.make("thread-pi-native-parent"),
+        providerSessionId: ProviderSessionId.make("session-parent"),
+      });
+      const sibling = yield* makeHarness({
+        adapter,
+        threadId: ThreadId.make("thread-pi-native-sibling"),
+        providerSessionId: ProviderSessionId.make("session-sibling"),
+      });
+      yield* startTurnWithText(parent, 1, "parent question");
+      assert.equal((yield* parent.takeEvent("turn.terminal")).status, "completed");
+      // The sibling session never registered the parent thread itself.
+      assert.isFalse(
+        sibling.all.some(
+          (event) =>
+            event.type === "provider_thread.updated" &&
+            event.providerThread.id === parent.providerThread.id,
+        ),
+      );
+
+      const forked = yield* sibling.runtime.forkThread({
+        sourceProviderThread: parent.providerThread,
+        targetThreadId: ThreadId.make("thread-pi-native-live-fork"),
+      });
+      assert.equal(forked.forkedFrom?.providerThreadId, parent.providerThread.id);
+      assert.notEqual(forked.id, parent.providerThread.id);
+      const snapshot = yield* sibling.runtime.readThreadSnapshot({ providerThread: forked });
+      assert.deepStrictEqual(
+        snapshot.messages.map((entry) => entry.text),
+        ["parent question", "parent answer"],
+      );
+    }).pipe(Effect.provide(testLayer())),
+  );
+
+  it.effect("forks durably after the source session closed", () =>
+    Effect.gen(function* () {
+      const store = makeInMemoryPiNativeSessionStore({ durable: true });
+      const source = yield* Effect.scoped(
+        Effect.gen(function* () {
+          const parent = yield* makeHarness({
+            sessionStore: store,
+            streamFn: createScriptedStreamFn([scriptedTextResponse("persisted answer")], {
+              now: () => 0,
+            }),
+          });
+          yield* startTurnWithText(parent, 1, "persisted question");
+          assert.equal((yield* parent.takeEvent("turn.terminal")).status, "completed");
+          return parent.providerThread;
+        }),
+      );
+      const persisted = yield* store.loadThread(source.id);
+      assert.isNotNull(persisted);
+
+      const sibling = yield* makeHarness({
+        sessionStore: store,
+        streamFn: createScriptedStreamFn([scriptedTextResponse("fork answer")], { now: () => 0 }),
+      });
+      const forked = yield* sibling.runtime.forkThread({
+        sourceProviderThread: source,
+        targetThreadId: ThreadId.make("thread-pi-native-durable-fork"),
+      });
+      assert.equal(forked.forkedFrom?.providerThreadId, source.id);
+      const snapshot = yield* sibling.runtime.readThreadSnapshot({ providerThread: forked });
+      assert.deepStrictEqual(
+        snapshot.messages.map((entry) => entry.text),
+        ["persisted question", "persisted answer"],
+      );
+      assert.isNotNull(yield* store.loadThread(forked.id));
+
+      const forkedTurn = yield* sibling.turnInput(1, sibling.selection, "fork follow-up");
+      yield* sibling.runtime.startTurn({ ...forkedTurn, providerThread: forked });
+      assert.equal((yield* sibling.takeEvent("turn.terminal")).status, "completed");
     }).pipe(Effect.provide(testLayer())),
   );
 });

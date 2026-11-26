@@ -27,6 +27,7 @@ import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
 import { buildPiRpcLaunch, resolvePiLaunchArgs } from "./mcpInjection.ts";
+import { ensurePiProjectTrusted } from "./trust.ts";
 import {
   makePiRpcConnection,
   PiRpcError,
@@ -306,6 +307,11 @@ export const discoverPiCommandsForCwd = Effect.fn("discoverPiCommandsForCwd")(
     if (!launchArgs.ok) {
       return yield* new PiRpcError({ operation: "launch", detail: launchArgs.message });
     }
+    yield* ensurePiProjectTrusted({
+      cwd,
+      environment,
+      launchArgs: launchArgs.args,
+    });
     const connection = yield* makePiDiscoveryConnection(
       piSettings,
       providerProbeEnvironment(environment),
@@ -413,7 +419,7 @@ export const buildInitialPiProviderSnapshot = Effect.fn(
         version: null,
         status: "warning",
         auth: { status: "unknown" },
-        message: "Pi is disabled in T3 Code settings.",
+        message: "Pi is disabled in Vesper settings.",
       },
     });
   }
@@ -452,7 +458,7 @@ export const checkPiProviderStatus = Effect.fn("checkPiProviderStatus")(function
         version: null,
         status: "warning",
         auth: { status: "unknown" },
-        message: "Pi is disabled in T3 Code settings.",
+        message: "Pi is disabled in Vesper settings.",
       },
     });
   }
@@ -530,7 +536,7 @@ export const checkPiProviderStatus = Effect.fn("checkPiProviderStatus")(function
         version: null,
         status: "error",
         auth: { status: "unknown" },
-        message: "T3 Code could not determine the Pi version. Update Pi, then refresh its status.",
+        message: "Vesper could not determine the Pi version. Update Pi, then refresh its status.",
       },
     });
   }
@@ -605,7 +611,7 @@ export const checkPiProviderStatus = Effect.fn("checkPiProviderStatus")(function
         status: "ready",
         auth: { status: "unknown" },
         message:
-          "Pi is available, but T3 Code could not refresh its models and commands. The live session will retry startup.",
+          "Pi is available, but Vesper could not refresh its models and commands. The live session will retry startup.",
       },
     });
   }

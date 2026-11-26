@@ -385,6 +385,7 @@ describe("mergeLookupEnrichment", () => {
       contextWindow: 64_000,
       contextWindowSource: "user" as const,
       maxTokensSource: "user" as const,
+      supportsReasoningEffort: null,
       supportsImages: false,
       availableForSubagents: true,
       thinkingLevels: ["high"] as const,
@@ -396,6 +397,7 @@ describe("mergeLookupEnrichment", () => {
       alias: "fast one",
       contextWindow: 64_000,
       maxTokens: 8_192,
+      supportsReasoningEffort: null,
       supportsImages: false,
       // An explicit "follow the catalog" override is a choice the lookup must not replace.
       supportsDocuments: null,

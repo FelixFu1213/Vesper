@@ -346,11 +346,11 @@ describe("makePiNativeTextGeneration with configured bindings", () => {
     Effect.gen(function* () {
       const fake = captureStream(() => completedStream(assistantMessage()));
       const service = yield* makePiNativeTextGeneration(
-        settings({ headers: { "X-Title": "T3 Code", authorization: "Bearer evil" } }),
+        settings({ headers: { "X-Title": "Vesper", authorization: "Bearer evil" } }),
         { streamFn: fake.streamFn },
       );
       yield* service.generateThreadTitle(titleInput());
-      expect(fake.calls[0]?.options?.headers).toEqual({ "X-Title": "T3 Code" });
+      expect(fake.calls[0]?.options?.headers).toEqual({ "X-Title": "Vesper" });
     }),
   );
 

@@ -5,7 +5,12 @@ import * as Dialog from "../components/ui/Dialog";
 import { AuthOrchestrationOperateScope } from "@t3tools/contracts";
 import { readEnvironmentScope } from "./session";
 import { useAtomValue } from "@effect/atom-react";
-import { compactBeforeSendTokens } from "@t3tools/client-runtime/state/context-window";
+import {
+  compactBeforeSendTokens,
+  deriveLatestContextWindowSnapshot,
+  deriveLatestReplySpeedSnapshot,
+  latestProviderTurnTokenUsage,
+} from "@t3tools/client-runtime/state/context-window";
 import { threadRuntimeIsActive } from "@t3tools/client-runtime/state/shell";
 import type { ThreadCheckpointSummary } from "@t3tools/client-runtime/state/thread-checkpoints";
 import { threadSteersDuringCompaction } from "@t3tools/client-runtime/state/thread-workflows";
@@ -457,6 +462,31 @@ export function useThreadComposerState(input: {
 
   const providerSubagentStatus = selectedThreadProjection
     ? deriveProviderSubagentStatus(selectedThreadProjection.projection)
+    : null;
+
+  const activeProviderThread =
+    selectedThreadProjection?.projection.providerThreads.find(
+      (thread) => thread.id === selectedThreadProjection.projection.thread.activeProviderThreadId,
+    ) ?? null;
+  const activeThreadLiveTokenUsage = selectedThreadProjection
+    ? latestProviderTurnTokenUsage(
+        selectedThreadProjection.projection.providerTurns,
+        selectedThreadProjection.projection,
+        activeProviderThread,
+      )
+    : null;
+  const contextWindow = selectedThreadProjection
+    ? deriveLatestContextWindowSnapshot(
+        selectedThreadVisibleTurnItems,
+        activeThreadLiveTokenUsage,
+        activeProviderThread,
+      )
+    : null;
+  const replySpeed = selectedThreadProjection
+    ? deriveLatestReplySpeedSnapshot(
+        selectedThreadProjection.projection.providerTurns,
+        activeProviderThread,
+      )
     : null;
 
   const activeThreadBusy = threadRuntimeIsActive(selectedThreadRuntime);
@@ -958,7 +988,7 @@ export function useThreadComposerState(input: {
     if (serverConfig.environment.capabilities.sideChats !== true) {
       return resolve(
         msg("Update this environment's {product} server to use side chats.", {
-          product: "T3 Code",
+          product: "Vesper",
         }),
       );
     }
@@ -1061,6 +1091,8 @@ export function useThreadComposerState(input: {
     ),
     providerSubagentStatus,
     isCompacting,
+    contextWindow,
+    replySpeed,
     compactBeforeSend:
       compactTokens === null || selectedThreadKey === null
         ? null

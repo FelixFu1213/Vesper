@@ -1603,7 +1603,7 @@ export const createPiNativeTools = (deps: PiNativeToolDeps): ReadonlyArray<Agent
   const newContextTool: AgentTool<typeof NEW_CONTEXT_PARAMS, NewContextDetails> = {
     name: "new_context",
     label: "new_context",
-    description: "Ask T3 Code to compact this conversation into a fresh context.",
+    description: "Ask Vesper to compact this conversation into a fresh context.",
     parameters: NEW_CONTEXT_PARAMS,
     executionMode: "sequential",
     execute: async (_toolCallId, params) => {

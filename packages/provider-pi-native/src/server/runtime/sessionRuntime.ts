@@ -445,6 +445,8 @@ interface ActiveTurnState {
   outputTruncated: boolean;
   planSubmittedThisTurn: boolean;
   goalChecksThisTurn: number;
+  promptStarted: boolean;
+  readonly prePromptSteers: Array<{ readonly messageId: string; readonly message: UserMessage }>;
 }
 
 const emptyUsage = (): AssistantMessage["usage"] => ({
@@ -668,6 +670,8 @@ const newTurnState = (): ActiveTurnState => ({
   outputTruncated: false,
   planSubmittedThisTurn: false,
   goalChecksThisTurn: 0,
+  promptStarted: false,
+  prePromptSteers: [],
 });
 
 /** The instructions a tool run may widen; only file tools can reveal nested rules. */
@@ -1449,7 +1453,13 @@ export class NativePiSessionRuntime {
         return;
       case "message_end":
         this.#persistAsync([event.message]);
-        if (event.message.role === "assistant") this.#finishAssistantMessage(state, event.message);
+        if (event.message.role === "assistant") {
+          this.#finishAssistantMessage(state, event.message);
+          for (const entry of state.prePromptSteers.splice(0)) {
+            state.unreadSteers.set(entry.messageId, entry.message);
+            this.#agent.steer(entry.message);
+          }
+        }
         return;
       case "tool_execution_start":
         this.#startTool(state, event.toolCallId, event.toolName, event.args);
@@ -2080,6 +2090,10 @@ export class NativePiSessionRuntime {
       this.#agent.steer(message);
       return "accepted";
     }
+    if (!state.promptStarted) {
+      state.prePromptSteers.push({ messageId: input.messageId, message });
+      return "accepted";
+    }
     // The loop already decided to stop but the turn lock is still held: run one more turn.
     this.#tailRace.push({ messageId: input.messageId, message });
     return "accepted";
@@ -2101,17 +2115,12 @@ export class NativePiSessionRuntime {
     // A shell change between turns takes effect at the start of the next one.
     this.#turnShell = null;
     this.#ensureSubagents();
-    await this.refreshSkills();
     const state = newTurnState();
     this.#active = state;
     this.#phase = null;
     this.#emitPhase("starting");
     this.#tailRace = [];
     this.#agent.clearAllQueues();
-    // The goal clock measures active execution, not time spent idle between turns.
-    if (this.#goal?.status === "active" && this.#goalActiveStartedAtMs === null) {
-      this.#goalActiveStartedAtMs = this.#now();
-    }
     const previousThinkingLevel = this.#agent.state.thinkingLevel;
     const elevateThinking =
       input.boostThinking === true &&
@@ -2120,30 +2129,36 @@ export class NativePiSessionRuntime {
         previousThinkingLevel === "minimal" ||
         previousThinkingLevel === "low" ||
         previousThinkingLevel === "medium");
-    if (elevateThinking) this.#agent.state.thinkingLevel = "high";
-    const turnDirective = [
-      input.workflowDirective,
-      await this.#skillDirective(input.text, input.skillIds ?? []),
-    ]
-      .filter((part): part is string => part !== undefined && part !== "")
-      .join("\n\n");
-    this.#workflowDirective = turnDirective === "" ? undefined : turnDirective;
-    const prompt: UserMessage = {
-      role: "user",
-      content: buildUserContent(input.text, input.images ?? []),
-      timestamp: this.#now(),
-    };
-    // Durable before dispatch: a crash after this point must not lose the user turn.
-    await this.#appendNewRecords([prompt]);
     // `pi-agent-core` keeps the thinking level across turns, so a boost must not leak forward.
     try {
+      await this.refreshSkills();
+      // The goal clock measures active execution, not time spent idle between turns.
+      if (this.#goal?.status === "active" && this.#goalActiveStartedAtMs === null) {
+        this.#goalActiveStartedAtMs = this.#now();
+      }
+      if (elevateThinking) this.#agent.state.thinkingLevel = "high";
+      const turnDirective = [
+        input.workflowDirective,
+        await this.#skillDirective(input.text, input.skillIds ?? []),
+      ]
+        .filter((part): part is string => part !== undefined && part !== "")
+        .join("\n\n");
+      this.#workflowDirective = turnDirective === "" ? undefined : turnDirective;
+      const prompt: UserMessage = {
+        role: "user",
+        content: buildUserContent(input.text, input.images ?? []),
+        timestamp: this.#now(),
+      };
+      // Durable before dispatch: a crash after this point must not lose the user turn.
+      await this.#appendNewRecords([prompt]);
+      state.promptStarted = true;
       await this.#agent.prompt(prompt);
       await this.#agent.waitForIdle();
       await this.#recoverErrorOverflow(state);
       input.onLoopSettled?.();
       for (;;) {
         if (state.interrupted || state.gracefulStopRequested) break;
-        const pending = this.#tailRace.splice(0);
+        const pending = [...state.prePromptSteers.splice(0), ...this.#tailRace.splice(0)];
         if (pending.length === 0) break;
         for (const entry of pending) {
           state.unreadSteers.set(entry.messageId, entry.message);
@@ -2157,10 +2172,10 @@ export class NativePiSessionRuntime {
     } finally {
       if (elevateThinking) this.#agent.state.thinkingLevel = previousThinkingLevel;
       this.#workflowDirective = undefined;
+      this.#coalescer.flushAll();
+      this.#cancelUnreadSteers(state);
+      this.#active = null;
     }
-    this.#coalescer.flushAll();
-    this.#cancelUnreadSteers(state);
-    this.#active = null;
     await this.persistCurrentTranscript().catch(() => undefined);
     const outcome = this.#outcome(state);
     if (outcome.status === "interrupted" && this.#goal?.status === "active") {

@@ -576,13 +576,16 @@ export function mergeLookupEnrichment(
             : { thinkingProtocol: enriched.thinkingProtocol }),
         }
       : {}),
-    ...(current.supportsReasoningEffort == null && enriched.supportsReasoningEffort !== undefined
+    // `undefined` means never set; `null` is the user's explicit "follow the
+    // catalog" choice, which a late lookup must not replace.
+    ...(current.supportsReasoningEffort === undefined &&
+    enriched.supportsReasoningEffort !== undefined
       ? { supportsReasoningEffort: enriched.supportsReasoningEffort }
       : {}),
-    ...(current.supportsImages == null && enriched.supportsImages !== undefined
+    ...(current.supportsImages === undefined && enriched.supportsImages !== undefined
       ? { supportsImages: enriched.supportsImages }
       : {}),
-    ...(current.supportsDocuments == null && enriched.supportsDocuments !== undefined
+    ...(current.supportsDocuments === undefined && enriched.supportsDocuments !== undefined
       ? { supportsDocuments: enriched.supportsDocuments }
       : {}),
   };

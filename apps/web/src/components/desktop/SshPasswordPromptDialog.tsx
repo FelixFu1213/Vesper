@@ -177,8 +177,8 @@ function ActiveSshPasswordPrompt({
               <code>
                 <Var>{target}</Var>
               </code>
-              . T3 Code passes your response to the local SSH process and keeps it in memory to
-              reuse for this host. T3 Code does not write it to disk.
+              . Vesper passes your response to the local SSH process and keeps it in memory to reuse
+              for this host. Vesper does not write it to disk.
             </T>
           </DialogDescription>
         </DialogHeader>
