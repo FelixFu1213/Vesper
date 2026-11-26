@@ -1628,10 +1628,11 @@ export const providerInstanceConfigEnabledFlag = (config: unknown): boolean | un
   return typeof enabled === "boolean" ? enabled : undefined;
 };
 
-// Must match each driver's enabled decoding default.
+// Must match each driver's enabled decoding default. Pi Native stays out of this
+// list: its services are configured in the Models workbench and need no enable step.
 const DEFAULT_DISABLED_PROVIDER_DRIVERS: ReadonlySet<ProviderDriverKind> = new Set(
-  ["cursor", "grok", "fx", "kiro", "muse", "pi", "piNative", "opencode", "antigravity"].map(
-    (driver) => ProviderDriverKind.make(driver),
+  ["cursor", "grok", "fx", "kiro", "muse", "pi", "opencode", "antigravity"].map((driver) =>
+    ProviderDriverKind.make(driver),
   ),
 );
 

@@ -353,6 +353,17 @@ describe("provider enabled defaults", () => {
     expect(
       resolveProviderInstanceEnabled({ driver: ProviderDriverKind.make("ollama"), config: {} }),
     ).toBe(true);
+    // Pi Native services are configured wholly in Models settings, so a stored row
+    // without an explicit flag counts as on.
+    expect(
+      resolveProviderInstanceEnabled({ driver: ProviderDriverKind.make("piNative"), config: {} }),
+    ).toBe(true);
+    expect(
+      resolveProviderInstanceEnabled({
+        driver: ProviderDriverKind.make("piNative"),
+        config: { enabled: false },
+      }),
+    ).toBe(false);
     expect(resolveProviderInstanceEnabled({ driver: grok, enabled: true, config: {} })).toBe(true);
     expect(resolveProviderInstanceEnabled({ driver: codex, enabled: false, config: {} })).toBe(
       false,

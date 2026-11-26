@@ -57,7 +57,7 @@ export type PiNativeModelBinding = typeof PiNativeModelBinding.Type;
 export const PiNativeSettings = makeProviderSettingsSchema(
   {
     enabled: Schema.Boolean.pipe(
-      Schema.withDecodingDefault(Effect.succeed(false)),
+      Schema.withDecodingDefault(Effect.succeed(true)),
       Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
     ),
     apiStyle: PiNativeApiStyle.pipe(
