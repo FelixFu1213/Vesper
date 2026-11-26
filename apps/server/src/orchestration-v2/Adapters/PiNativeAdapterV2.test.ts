@@ -633,8 +633,15 @@ describe("PiNativeAdapterV2 through OrchestratorV2", () => {
 
   it.effect("answers a structured question and finishes the turn", () =>
     Effect.gen(function* () {
-      const streamFn = makeStreamFn((call) =>
-        call.serializedContext.includes("Which one?")
+      let stage = 0;
+      const streamFn = makeStreamFn((call) => {
+        stage += 1;
+        if (stage === 1) {
+          return scriptedToolCallResponse([
+            { name: "ToolSearch", arguments: { query: "asktool" } },
+          ]);
+        }
+        return call.serializedContext.includes("Which one?")
           ? scriptedTextResponse("thanks")
           : scriptedToolCallResponse([
               {
@@ -650,8 +657,8 @@ describe("PiNativeAdapterV2 through OrchestratorV2", () => {
                   ],
                 },
               },
-            ]),
-      );
+            ]);
+      });
       const { projection } = yield* runPiNativeScenario({
         name: "pi-native-structured-question",
         fixtureInput: {
@@ -1161,6 +1168,9 @@ describe("PiNativeAdapterV2 through OrchestratorV2", () => {
       const streamFn = makeStreamFn(() => {
         stage += 1;
         if (stage === 1) {
+          return scriptedToolCallResponse([{ name: "ToolSearch", arguments: { query: "todo" } }]);
+        }
+        if (stage === 2) {
           return scriptedToolCallResponse([
             {
               name: "TodoWrite",
@@ -1174,7 +1184,7 @@ describe("PiNativeAdapterV2 through OrchestratorV2", () => {
             },
           ]);
         }
-        if (stage === 2) {
+        if (stage === 3) {
           return scriptedToolCallResponse([
             {
               name: "TodoWrite",
@@ -1183,7 +1193,7 @@ describe("PiNativeAdapterV2 through OrchestratorV2", () => {
             { name: "TodoRead", arguments: {} },
           ]);
         }
-        if (stage === 3) {
+        if (stage === 4) {
           return scriptedToolCallResponse([
             {
               name: "TodoWrite",
@@ -1207,10 +1217,10 @@ describe("PiNativeAdapterV2 through OrchestratorV2", () => {
 
       assert.deepEqual(runIds(projection), ["completed"]);
       assert.include(
-        streamFn.calls[2]?.serializedContext ?? "",
+        streamFn.calls[3]?.serializedContext ?? "",
         "Current todo list (revision 1; 1/2 completed, 1 running, 0 pending):",
       );
-      assert.include(streamFn.calls[2]?.serializedContext ?? "", "- [running] (2) Verify output");
+      assert.include(streamFn.calls[3]?.serializedContext ?? "", "- [running] (2) Verify output");
 
       const todoPlans = projection.plans.filter((plan) => plan.kind === "todo_list");
       assert.deepEqual(

@@ -239,6 +239,9 @@ interface ActiveTurn {
   failure: NativeSessionFailure | null;
   outputTruncated: boolean;
   settled: boolean;
+  runTurnStarted: boolean;
+  started: Promise<void>;
+  resolveStarted: () => void;
   done: Promise<void>;
   resolveDone: () => void;
 }
@@ -1551,6 +1554,7 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
     ): Promise<void> => {
       if (turn.settled) return;
       turn.settled = true;
+      turn.resolveStarted();
       const state = turn.state;
       const status =
         forced ??
@@ -1791,9 +1795,12 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
               turn.state.goal = resumed;
               runtime.setGoal(resumed, { emit: false });
               updateThread(turn.state, { goal: resumed });
-              const outcome = await runtime.runTurn({
+              const outcomePromise = runtime.runTurn({
                 text: `Resume working on the active goal: ${resumed.objective}`,
               });
+              turn.runTurnStarted = true;
+              turn.resolveStarted();
+              const outcome = await outcomePromise;
               await finishTurn(turn, outcome);
               return;
             }
@@ -1808,9 +1815,12 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
               turn.state.goal = created;
               runtime.setGoal(created, { emit: false });
               updateThread(turn.state, { goal: created });
-              const outcome = await runtime.runTurn({
+              const outcomePromise = runtime.runTurn({
                 text: `Start working on the goal: ${created.objective}`,
               });
+              turn.runTurnStarted = true;
+              turn.resolveStarted();
+              const outcome = await outcomePromise;
               await finishTurn(turn, outcome);
               return;
             }
@@ -1889,7 +1899,7 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
           await finishTurn(turn, { status: "interrupted", failure: null, outputTruncated: false });
           return;
         }
-        const outcome = await runtime.runTurn({
+        const outcomePromise = runtime.runTurn({
           text,
           ...(images.length === 0 ? {} : { images }),
           ...(workflowCommand === null
@@ -1900,6 +1910,9 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
               }),
           ...(resolvedSkillCommand === null ? {} : { skillIds: [resolvedSkillCommand.skillId] }),
         });
+        turn.runTurnStarted = true;
+        turn.resolveStarted();
+        const outcome = await outcomePromise;
         await finishTurn(turn, outcome);
       } catch (cause) {
         await finishTurn(turn, {
@@ -1982,6 +1995,10 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
         startedAt: at(),
         completedAt: null,
       };
+      let resolveStarted: () => void = () => undefined;
+      const started = new Promise<void>((resolve) => {
+        resolveStarted = resolve;
+      });
       let resolveDone: () => void = () => undefined;
       const done = new Promise<void>((resolve) => {
         resolveDone = resolve;
@@ -2004,6 +2021,9 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
         failure: null,
         outputTruncated: false,
         settled: false,
+        runTurnStarted: false,
+        started,
+        resolveStarted,
         done,
         resolveDone,
       };
@@ -2248,8 +2268,20 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
           state === undefined ||
           turn === null ||
           turn.providerTurn.id !== args.providerTurnId ||
-          state.runtime === null
+          turn.settled ||
+          turn.interrupted
         ) {
+          return yield* new ProviderAdapter.ProviderAdapterSteerDeclinedError({
+            driver: DRIVER,
+            providerThreadId: args.providerThread.id,
+            providerTurnId: args.providerTurnId,
+          });
+        }
+        if (!turn.runTurnStarted) {
+          yield* Effect.promise(() => turn.started);
+        }
+        const runtime = state.runtime;
+        if (runtime === null || turn.settled || turn.interrupted || state.activeTurn !== turn) {
           return yield* new ProviderAdapter.ProviderAdapterSteerDeclinedError({
             driver: DRIVER,
             providerThreadId: args.providerThread.id,
@@ -2282,13 +2314,11 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
             })
           : [];
         const accepted = yield* Effect.sync(() =>
-          state.runtime === null
-            ? ("declined" as const)
-            : state.runtime.steer({
-                messageId: args.message.messageId,
-                text,
-                ...(images.length === 0 ? {} : { images }),
-              }),
+          runtime.steer({
+            messageId: args.message.messageId,
+            text,
+            ...(images.length === 0 ? {} : { images }),
+          }),
         );
         if (accepted === "declined") {
           return yield* new ProviderAdapter.ProviderAdapterSteerDeclinedError({
