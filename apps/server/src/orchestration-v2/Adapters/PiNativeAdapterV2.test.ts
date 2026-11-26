@@ -3,12 +3,20 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import {
   CommandId,
+  MessageId,
+  ProjectId,
   ProviderInstanceId,
   ThreadId,
   type ManagedPolicyDocument,
   type ModelSelection,
+  type OrchestrationV2AppThread,
+  type OrchestrationV2Command,
+  type OrchestrationV2DomainEvent,
+  type OrchestrationV2ProviderThread,
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2TurnItem,
+  type ProviderSessionId,
+  type ProviderThreadId,
 } from "@t3tools/contracts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
@@ -25,6 +33,11 @@ import {
 } from "@t3tools/provider-pi-native/testing";
 import * as TestProviderHost from "@t3tools/provider-testing/TestProviderHost";
 import { checkpointWorkspace } from "@t3tools/provider-testing/replayWorkspace";
+import {
+  makeProviderReplayGate,
+  type ProviderReplayGate,
+} from "@t3tools/provider-testing/replayGate";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
@@ -32,6 +45,7 @@ import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 
+import * as EventSink from "../EventSink.ts";
 import * as Orchestrator from "../Orchestrator.ts";
 import * as ProviderAdapterRegistry from "../ProviderAdapterRegistry.ts";
 import { provideDeterministicTestRuntime } from "../testkit/DeterministicRuntime.ts";
@@ -44,6 +58,7 @@ import {
   runOrchestratorV2Scenario,
   type OrchestratorV2Scenario,
   type OrchestratorV2ScenarioResult,
+  type OrchestratorV2ScenarioStep,
 } from "../testkit/OrchestratorScenario.ts";
 import { layerWithRegistry } from "../testkit/ProviderReplayHarness.ts";
 
@@ -170,6 +185,143 @@ interface ScenarioOutput extends OrchestratorV2ScenarioResult {
   readonly threadId: ThreadId;
   readonly workspace: string;
 }
+
+/** Runs a hand-built scenario, for behaviour two app threads of one instance share. */
+const runPiNativeThreads = (input: {
+  readonly name: string;
+  readonly workspace: string;
+  readonly streamFn: ProviderStreamFn;
+  readonly settings?: PiNativeSettings;
+  readonly commands: ReadonlyArray<OrchestrationV2Command>;
+  readonly steps: ReadonlyArray<OrchestratorV2ScenarioStep>;
+  readonly threadIds: ReadonlyArray<ThreadId>;
+  readonly replayGate?: ProviderReplayGate;
+}) =>
+  runOrchestratorV2Scenario(
+    {
+      name: input.name,
+      commands: input.commands,
+      steps: input.steps,
+      projectionThreadIds: input.threadIds,
+    },
+    input.replayGate === undefined ? {} : { replayGate: input.replayGate },
+  ).pipe(
+    Effect.provide(
+      layerWithRegistry(
+        { name: input.name, runtimePolicyOverride: { cwd: input.workspace } },
+        registryLayer({
+          streamFn: input.streamFn,
+          settings: input.settings ?? settings(),
+        }),
+      ),
+    ),
+    provideDeterministicTestRuntime,
+  );
+
+const createThreadCommand = (input: {
+  readonly commandId: CommandId;
+  readonly projectId: ProjectId;
+  readonly threadId: ThreadId;
+  readonly title: string;
+}): OrchestrationV2Command => ({
+  type: "thread.create",
+  createdBy: "user",
+  creationSource: "web",
+  commandId: input.commandId,
+  threadId: input.threadId,
+  projectId: input.projectId,
+  title: input.title,
+  modelSelection: MODEL_SELECTION,
+  runtimeMode: "full-access",
+  interactionMode: "default",
+  branch: null,
+  worktreePath: null,
+});
+
+const dispatchTextCommand = (input: {
+  readonly commandId: CommandId;
+  readonly threadId: ThreadId;
+  readonly messageId: MessageId;
+  readonly text: string;
+}): OrchestrationV2Command => ({
+  type: "message.dispatch",
+  createdBy: "user",
+  creationSource: "web",
+  commandId: input.commandId,
+  threadId: input.threadId,
+  messageId: input.messageId,
+  text: input.text,
+  attachments: [],
+  modelSelection: MODEL_SELECTION,
+  dispatchMode: { type: "start_immediately" },
+});
+
+const providerSessionOf = (projection: OrchestrationV2ThreadProjection) =>
+  projection.providerThreads.at(-1)?.providerSessionId ?? null;
+
+const legacyProviderThread = (input: {
+  readonly idAllocator: IdAllocator.IdAllocatorV2["Service"];
+  readonly threadId: ThreadId;
+  readonly nativeThreadId: string;
+  readonly providerSessionId: ProviderSessionId;
+  readonly now: DateTime.Utc;
+}): OrchestrationV2ProviderThread => ({
+  id: input.idAllocator.derive.providerThread({
+    driver: PI_NATIVE_DRIVER_KIND,
+    nativeThreadId: input.nativeThreadId,
+  }),
+  driver: PI_NATIVE_DRIVER_KIND,
+  providerInstanceId: INSTANCE_ID,
+  providerSessionId: input.providerSessionId,
+  appThreadId: input.threadId,
+  ownerNodeId: null,
+  nativeThreadRef: {
+    driver: PI_NATIVE_DRIVER_KIND,
+    nativeId: input.nativeThreadId,
+    strength: "strong",
+  },
+  nativeConversationHeadRef: null,
+  status: "idle",
+  firstRunOrdinal: null,
+  lastRunOrdinal: null,
+  handoffIds: [],
+  forkedFrom: null,
+  createdAt: input.now,
+  updatedAt: input.now,
+});
+
+const legacyAppThread = (input: {
+  readonly threadId: ThreadId;
+  readonly projectId: ProjectId;
+  readonly providerThreadId: ProviderThreadId;
+  readonly now: DateTime.Utc;
+}): OrchestrationV2AppThread => ({
+  id: input.threadId,
+  projectId: input.projectId,
+  title: "Pre-upgrade Pi Native thread",
+  createdBy: "user",
+  creationSource: "web",
+  providerInstanceId: INSTANCE_ID,
+  modelSelection: MODEL_SELECTION,
+  runtimeMode: "full-access",
+  interactionMode: "default",
+  branch: null,
+  worktreePath: null,
+  activeProviderThreadId: input.providerThreadId,
+  lineage: {
+    parentThreadId: null,
+    relationshipToParent: null,
+    rootThreadId: input.threadId,
+  },
+  forkedFrom: null,
+  createdAt: input.now,
+  updatedAt: input.now,
+  archivedAt: null,
+  settledOverride: null,
+  settledAt: null,
+  lastVisitedAt: null,
+  deletedAt: null,
+});
 
 /** Runs the real OrchestratorV2 + ingestor + SQLite projections against the in-process adapter. */
 const runPiNativeScenario = (input: ScenarioOptions) =>
@@ -1078,6 +1230,310 @@ describe("PiNativeAdapterV2 through OrchestratorV2", () => {
       assert.isTrue(
         dynamicTools.some((item) => item.toolName === "TodoRead" && item.status === "completed"),
       );
+    }).pipe(Effect.provide(testLayer), Effect.scoped),
+  );
+
+  it.effect("runs two app threads of one piNative instance in parallel", () =>
+    Effect.gen(function* () {
+      const workspace = yield* checkpointWorkspace("pi-native-v2-parallel-threads");
+      const idAllocator = yield* IdAllocator.IdAllocatorV2;
+      const projectId = yield* idAllocator.allocate.project({ fixtureName: "pi-native-parallel" });
+      const firstThreadId = yield* idAllocator.allocate.thread({
+        fixtureName: "pi-native-parallel-first",
+        projectId,
+      });
+      const secondThreadId = yield* idAllocator.allocate.thread({
+        fixtureName: "pi-native-parallel-second",
+        projectId,
+      });
+      const firstPrompt = "first thread question";
+      const secondPrompt = "second thread question";
+      const commands: Array<OrchestrationV2Command> = [
+        createThreadCommand({
+          commandId: yield* idAllocator.allocate.command({
+            fixtureName: "pi-native-parallel",
+            commandName: "create-first",
+          }),
+          projectId,
+          threadId: firstThreadId,
+          title: "First thread",
+        }),
+        createThreadCommand({
+          commandId: yield* idAllocator.allocate.command({
+            fixtureName: "pi-native-parallel",
+            commandName: "create-second",
+          }),
+          projectId,
+          threadId: secondThreadId,
+          title: "Second thread",
+        }),
+      ];
+      const firstMessage = dispatchTextCommand({
+        commandId: yield* idAllocator.allocate.command({
+          fixtureName: "pi-native-parallel",
+          commandName: "first-message",
+        }),
+        threadId: firstThreadId,
+        messageId: yield* idAllocator.allocate.message({ threadId: firstThreadId, ordinal: 1 }),
+        text: firstPrompt,
+      });
+      const secondMessage = dispatchTextCommand({
+        commandId: yield* idAllocator.allocate.command({
+          fixtureName: "pi-native-parallel",
+          commandName: "second-message",
+        }),
+        threadId: secondThreadId,
+        messageId: yield* idAllocator.allocate.message({ threadId: secondThreadId, ordinal: 1 }),
+        text: secondPrompt,
+      });
+      commands.push(firstMessage, secondMessage);
+      const firstRunId = idAllocator.derive.run({ threadId: firstThreadId, ordinal: 1 });
+      const secondRunId = idAllocator.derive.run({ threadId: secondThreadId, ordinal: 1 });
+
+      // The first thread's provider request stays open until after the second thread's run ends.
+      const gate = makeProviderReplayGate(["first-thread-turn"]);
+      const streamFn: ProviderStreamFn = (model, context) =>
+        JSON.stringify(context.messages).includes(firstPrompt)
+          ? gate
+              .beforeEmit("first-thread-turn")
+              .then(() => renderScriptedTurn(model, scriptedTextResponse("first answer"), 0))
+          : renderScriptedTurn(model, scriptedTextResponse("second answer"), 0);
+
+      const result = yield* runPiNativeThreads({
+        name: "pi-native-parallel-threads",
+        workspace,
+        streamFn,
+        commands,
+        threadIds: [firstThreadId, secondThreadId],
+        replayGate: gate,
+        steps: [
+          { type: "dispatch", command: commands[0]! },
+          { type: "dispatch", command: commands[1]! },
+          { type: "dispatch", command: firstMessage },
+          { type: "advance_clock", duration: "1 millis" },
+          {
+            type: "await_run_status",
+            threadId: firstThreadId,
+            runId: firstRunId,
+            status: "running",
+          },
+          { type: "dispatch", command: secondMessage },
+          { type: "advance_clock", duration: "1 millis" },
+          {
+            type: "await_run_status",
+            threadId: secondThreadId,
+            runId: secondRunId,
+            status: "completed",
+          },
+          { type: "release_replay_gate", label: "first-thread-turn" },
+          {
+            type: "await_run_status",
+            threadId: firstThreadId,
+            runId: firstRunId,
+            status: "completed",
+          },
+        ],
+      });
+
+      const first = result.projections.get(firstThreadId);
+      const second = result.projections.get(secondThreadId);
+      assert.isDefined(first);
+      assert.isDefined(second);
+      if (first === undefined || second === undefined) return;
+      assert.deepEqual(runIds(first), ["completed"]);
+      assert.deepEqual(runIds(second), ["completed"]);
+      assert.deepEqual(
+        itemsOf(first, "assistant_message").map((item) => item.text),
+        ["first answer"],
+      );
+      assert.deepEqual(
+        itemsOf(second, "assistant_message").map((item) => item.text),
+        ["second answer"],
+      );
+      const firstSession = providerSessionOf(first);
+      const secondSession = providerSessionOf(second);
+      assert.isString(firstSession);
+      assert.isString(secondSession);
+      assert.notEqual(firstSession, secondSession);
+    }).pipe(Effect.provide(testLayer), Effect.scoped),
+  );
+
+  it.effect("gives pre-upgrade threads sharing the legacy session their own sessions", () =>
+    Effect.gen(function* () {
+      const workspace = yield* checkpointWorkspace("pi-native-v2-legacy-sessions");
+      const idAllocator = yield* IdAllocator.IdAllocatorV2;
+      const now = yield* DateTime.now;
+      const projectId = yield* idAllocator.allocate.project({ fixtureName: "pi-native-legacy" });
+      const firstThreadId = yield* idAllocator.allocate.thread({
+        fixtureName: "pi-native-legacy-first",
+        projectId,
+      });
+      const secondThreadId = yield* idAllocator.allocate.thread({
+        fixtureName: "pi-native-legacy-second",
+        projectId,
+      });
+      // What an upgrade finds: two threads persisted against the one shared session.
+      const legacySharedSession = IdAllocator.derive.providerSession({
+        providerInstanceId: INSTANCE_ID,
+      });
+      const firstProviderThread = legacyProviderThread({
+        idAllocator,
+        threadId: firstThreadId,
+        nativeThreadId: "legacy-first",
+        providerSessionId: legacySharedSession,
+        now,
+      });
+      const secondProviderThread = legacyProviderThread({
+        idAllocator,
+        threadId: secondThreadId,
+        nativeThreadId: "legacy-second",
+        providerSessionId: legacySharedSession,
+        now,
+      });
+      const events: ReadonlyArray<OrchestrationV2DomainEvent> = [
+        {
+          id: yield* idAllocator.allocate.event({ threadId: firstThreadId }),
+          type: "thread.created",
+          threadId: firstThreadId,
+          occurredAt: now,
+          payload: legacyAppThread({
+            threadId: firstThreadId,
+            projectId,
+            providerThreadId: firstProviderThread.id,
+            now,
+          }),
+        },
+        {
+          id: yield* idAllocator.allocate.event({ threadId: firstThreadId }),
+          type: "provider-thread.updated",
+          threadId: firstThreadId,
+          occurredAt: now,
+          payload: firstProviderThread,
+        },
+        {
+          id: yield* idAllocator.allocate.event({ threadId: secondThreadId }),
+          type: "thread.created",
+          threadId: secondThreadId,
+          occurredAt: now,
+          payload: legacyAppThread({
+            threadId: secondThreadId,
+            projectId,
+            providerThreadId: secondProviderThread.id,
+            now,
+          }),
+        },
+        {
+          id: yield* idAllocator.allocate.event({ threadId: secondThreadId }),
+          type: "provider-thread.updated",
+          threadId: secondThreadId,
+          occurredAt: now,
+          payload: secondProviderThread,
+        },
+      ];
+
+      const firstPrompt = "first thread question";
+      const secondPrompt = "second thread question";
+      const firstMessage = dispatchTextCommand({
+        commandId: yield* idAllocator.allocate.command({
+          fixtureName: "pi-native-legacy",
+          commandName: "first-message",
+        }),
+        threadId: firstThreadId,
+        messageId: yield* idAllocator.allocate.message({ threadId: firstThreadId, ordinal: 1 }),
+        text: firstPrompt,
+      });
+      const secondMessage = dispatchTextCommand({
+        commandId: yield* idAllocator.allocate.command({
+          fixtureName: "pi-native-legacy",
+          commandName: "second-message",
+        }),
+        threadId: secondThreadId,
+        messageId: yield* idAllocator.allocate.message({ threadId: secondThreadId, ordinal: 1 }),
+        text: secondPrompt,
+      });
+      const firstRunId = idAllocator.derive.run({ threadId: firstThreadId, ordinal: 1 });
+      const secondRunId = idAllocator.derive.run({ threadId: secondThreadId, ordinal: 1 });
+
+      const gate = makeProviderReplayGate(["first-thread-turn"]);
+      const streamFn: ProviderStreamFn = (model, context) =>
+        JSON.stringify(context.messages).includes(firstPrompt)
+          ? gate
+              .beforeEmit("first-thread-turn")
+              .then(() => renderScriptedTurn(model, scriptedTextResponse("first answer"), 0))
+          : renderScriptedTurn(model, scriptedTextResponse("second answer"), 0);
+
+      const result = yield* Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        yield* eventSink.write({ events });
+        return yield* runOrchestratorV2Scenario(
+          {
+            name: "pi-native-legacy-sessions",
+            commands: [firstMessage, secondMessage],
+            steps: [
+              { type: "dispatch", command: firstMessage },
+              { type: "advance_clock", duration: "1 millis" },
+              {
+                type: "await_run_status",
+                threadId: firstThreadId,
+                runId: firstRunId,
+                status: "running",
+              },
+              { type: "dispatch", command: secondMessage },
+              { type: "advance_clock", duration: "1 millis" },
+              {
+                type: "await_run_status",
+                threadId: secondThreadId,
+                runId: secondRunId,
+                status: "completed",
+              },
+              { type: "release_replay_gate", label: "first-thread-turn" },
+              {
+                type: "await_run_status",
+                threadId: firstThreadId,
+                runId: firstRunId,
+                status: "completed",
+              },
+            ],
+            projectionThreadIds: [firstThreadId, secondThreadId],
+          },
+          { replayGate: gate },
+        );
+      }).pipe(
+        Effect.provide(
+          layerWithRegistry(
+            {
+              name: "pi-native-legacy-sessions",
+              runtimePolicyOverride: { cwd: workspace },
+            },
+            registryLayer({ streamFn, settings: settings() }),
+            {},
+          ),
+        ),
+        provideDeterministicTestRuntime,
+      );
+
+      const first = result.projections.get(firstThreadId);
+      const second = result.projections.get(secondThreadId);
+      assert.isDefined(first);
+      assert.isDefined(second);
+      if (first === undefined || second === undefined) return;
+      assert.deepEqual(runIds(first), ["completed"]);
+      assert.deepEqual(runIds(second), ["completed"]);
+      assert.deepEqual(
+        itemsOf(first, "assistant_message").map((item) => item.text),
+        ["first answer"],
+      );
+      assert.deepEqual(
+        itemsOf(second, "assistant_message").map((item) => item.text),
+        ["second answer"],
+      );
+      const firstSession = providerSessionOf(first);
+      const secondSession = providerSessionOf(second);
+      assert.isString(firstSession);
+      assert.isString(secondSession);
+      assert.notEqual(firstSession, secondSession);
+      assert.notEqual(firstSession, legacySharedSession);
+      assert.notEqual(secondSession, legacySharedSession);
     }).pipe(Effect.provide(testLayer), Effect.scoped),
   );
 });

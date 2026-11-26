@@ -106,8 +106,9 @@ export type PiNativeAdapterV2DriverEnv =
 const PI_NATIVE_CAPABILITIES = {
   runtimePolicy: { enforcement: "client-boundary" },
   sessions: {
-    // One in-process session hosts a runtime per app thread, like the Pi provider's threads.
-    supportsMultipleProviderThreadsPerSession: true,
+    // Each app thread runs its own isolated in-process session, so one provider session
+    // belongs to exactly one app thread and several can run in parallel.
+    supportsMultipleProviderThreadsPerSession: false,
     supportsModelSwitchInSession: true,
     supportsProviderSwitchingViaHandoff: true,
     supportsRuntimeModeSwitchInSession: false,
@@ -245,6 +246,8 @@ interface ActiveTurn {
 interface ThreadState {
   providerThread: OrchestrationV2ProviderThread;
   runtime: NativePiSessionRuntime | null;
+  /** Shared by concurrent callers so two turns cannot create two runtimes for one thread. */
+  runtimePromise: Promise<NativePiSessionRuntime> | null;
   modelSelection: ModelSelection;
   policy: ProviderAdapter.ProviderAdapterV2RuntimePolicy;
   appThreadId: ThreadId;
@@ -385,6 +388,23 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
     IdAllocator.IdAllocatorV2 | ProviderHost.ProviderHost | McpProviderSessions.McpProviderSessions
   >();
 
+  // Adapter-wide so a fork can reach a thread that is live in a sibling session, and so
+  // native thread and request ids never collide across parallel per-thread sessions.
+  const liveThreads = new Map<string, ThreadState>();
+  let nativeSequence = 0;
+
+  const findLiveThread = (
+    providerThread: OrchestrationV2ProviderThread,
+  ): ThreadState | undefined => {
+    const known = liveThreads.get(providerThread.id);
+    if (known !== undefined) return known;
+    const nativeId = providerThread.nativeThreadRef?.nativeId;
+    if (nativeId === undefined) return undefined;
+    return [...liveThreads.values()].find(
+      (state) => state.providerThread.nativeThreadRef?.nativeId === nativeId,
+    );
+  };
+
   const openSession = Effect.fn("PiNativeAdapter.openSession")(function* (
     input: ProviderAdapter.ProviderAdapterV2OpenSessionInput,
   ) {
@@ -400,10 +420,8 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
       { readonly decision?: ProviderApprovalDecision; readonly feedback?: string }
     >();
     const answersOutcome = new Map<string, Record<string, unknown>>();
-    let activeTurn: ActiveTurn | null = null;
     let closed = false;
     let tearingDown = false;
-    let nativeSequence = 0;
 
     const binding = resolvePiNativeModelBinding(options.settings, input.modelSelection);
     let session: OrchestrationV2ProviderSession = {
@@ -1242,13 +1260,16 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
     };
 
     const requestApproval = async (
+      state: ThreadState,
       request: ToolApprovalRequest,
       signal?: AbortSignal,
     ): Promise<ToolApprovalResponse> => {
-      const turn = activeTurn;
+      const turn = state.activeTurn;
       if (turn === null) return { decision: "cancel" };
       const itemId = `approval:${request.requestId}`;
-      const requestId = RuntimeRequestId.make(`runtime-request:${DRIVER}:${itemId}`);
+      const requestId = RuntimeRequestId.make(
+        `runtime-request:${DRIVER}:${nativeItemId(turn, itemId)}`,
+      );
       const emittedAt = nowMs();
       const base = baseItem(turn, itemId, emittedAt, emittedAt);
       const item: TurnItemOf<"approval_request"> = {
@@ -1294,11 +1315,14 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
     };
 
     const requestUserInput = async (
+      state: ThreadState,
       input: NativeUserInputRequest,
     ): Promise<Record<string, unknown>> => {
-      const turn = activeTurn;
+      const turn = state.activeTurn;
       if (turn === null) return {};
-      const requestId = RuntimeRequestId.make(`runtime-request:${DRIVER}:${input.itemId}`);
+      const requestId = RuntimeRequestId.make(
+        `runtime-request:${DRIVER}:${nativeItemId(turn, input.itemId)}`,
+      );
       const emittedAt = nowMs();
       const base = baseItem(turn, input.itemId, emittedAt, emittedAt);
       const item: TurnItemOf<"user_input_request"> = {
@@ -1352,14 +1376,28 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
         known.modelSelection = args.modelSelection;
         known.policy = args.runtimePolicy;
         known.appThreadId = args.threadId;
+        liveThreads.set(known.providerThread.id, known);
         return updateThread(known, {
-          status: known.runtime === null ? "not_loaded" : "idle",
+          status:
+            known.activeTurn !== null ? "active" : known.runtime === null ? "not_loaded" : "idle",
           providerSessionId: session.id,
         });
       }
-      const nativeThreadId =
-        existing?.nativeThreadRef?.nativeId ??
-        `pi-native:${options.instanceId}:${++nativeSequence}`;
+      // Independent sessions must not share a native id, but a fresh adapter re-registering
+      // the same app thread keeps the id a restarted process would derive.
+      const nativeThreadId = (() => {
+        const existingNativeId = existing?.nativeThreadRef?.nativeId ?? undefined;
+        if (existingNativeId !== undefined) return existingNativeId;
+        const base = `pi-native:${options.instanceId}:${existing?.id ?? args.threadId}`;
+        const taken = (candidate: string): boolean =>
+          [...threads.values(), ...liveThreads.values()].some(
+            (state) => state.providerThread.nativeThreadRef?.nativeId === candidate,
+          );
+        if (!taken(base)) return base;
+        let candidate = `${base}:${++nativeSequence}`;
+        while (taken(candidate)) candidate = `${base}:${++nativeSequence}`;
+        return candidate;
+      })();
       const createdAt = at();
       // The run's provider thread row is the identity the orchestrator tracks; adopt it
       // instead of minting a second row it would never see.
@@ -1397,9 +1435,10 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
               status: "not_loaded",
               updatedAt: createdAt,
             };
-      threads.set(providerThread.id, {
+      const state: ThreadState = {
         providerThread,
         runtime: null,
+        runtimePromise: null,
         modelSelection: args.modelSelection,
         policy: args.runtimePolicy,
         appThreadId: args.threadId,
@@ -1410,7 +1449,9 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
         latestTodoPlan: null,
         latestProposedPlan: null,
         goal: existing?.goal ?? null,
-      });
+      };
+      threads.set(providerThread.id, state);
+      liveThreads.set(providerThread.id, state);
       emit({ type: "provider_thread.updated", driver: DRIVER, providerThread });
       return providerThread;
     };
@@ -1432,42 +1473,75 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
       return state;
     };
 
-    const ensureRuntime = async (state: ThreadState): Promise<NativePiSessionRuntime> => {
-      if (state.runtime !== null) {
-        state.runtime.applyRuntimePolicy(state.policy);
-        state.runtime.applyModelSelection(state.modelSelection);
-        state.runtime.applyProjectMemory(state.projectMemory);
-        // The adapter owns the goal across runtimes, so a reused runtime adopts it silently.
-        if (state.runtime.goal !== state.goal) state.runtime.setGoal(state.goal, { emit: false });
-        return state.runtime;
-      }
-      updateSession("starting", null);
-      const mcpSession = await Effect.runPromiseWith(services)(mcpSessions.read(state.appThreadId));
-      const runtime = await NativePiSessionRuntime.create({
-        settings: options.settings,
-        modelSelection: state.modelSelection,
-        runtimePolicy: state.policy,
-        ...(state.goal === null ? {} : { initialGoal: state.goal }),
-        threadId: state.appThreadId,
-        ...(sessionStore === null ? {} : { sessionStore }),
-        providerThreadId: state.providerThread.id,
-        ...(mcpSession === undefined ? {} : { mcpSession }),
-        ...(state.contextText === undefined ? {} : { contextText: state.contextText }),
-        ...(state.projectMemory === undefined ? {} : { projectMemory: state.projectMemory }),
-        readOnlyRoots: [hostService.paths.attachmentsDir],
-        onEvent: (event) => handleRuntimeEvent(state, event),
-        requestApproval,
-        requestUserInput,
-        now: nowMs,
-        ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
-        ...(options.streamFn === undefined ? {} : { streamFn: options.streamFn }),
-        ...(options.sleep === undefined ? {} : { sleep: options.sleep }),
-        ...(options.scheduleTimer === undefined ? {} : { scheduleTimer: options.scheduleTimer }),
-        ...(options.random === undefined ? {} : { random: options.random }),
-      });
-      await runtime.restorePersistedSession();
-      state.runtime = runtime;
+    const applyState = (
+      state: ThreadState,
+      runtime: NativePiSessionRuntime,
+    ): NativePiSessionRuntime => {
+      runtime.applyRuntimePolicy(state.policy);
+      runtime.applyModelSelection(state.modelSelection);
+      runtime.applyProjectMemory(state.projectMemory);
+      // The adapter owns the goal across runtimes, so a reused runtime adopts it silently.
+      if (runtime.goal !== state.goal) runtime.setGoal(state.goal, { emit: false });
       return runtime;
+    };
+
+    const ensureRuntime = async (state: ThreadState): Promise<NativePiSessionRuntime> => {
+      if (state.runtime !== null) return applyState(state, state.runtime);
+      // Two turns arriving together (a fork hydrating while its first turn starts) must share
+      // one runtime instead of racing to create two for the same thread.
+      const inFlight = state.runtimePromise;
+      if (inFlight !== null) return applyState(state, await inFlight);
+      updateSession("starting", null);
+      const created = (async () => {
+        const mcpSession = await Effect.runPromiseWith(services)(
+          mcpSessions.read(state.appThreadId),
+        );
+        if (closed || tearingDown) {
+          throw new Error("The Pi Native session is closed.");
+        }
+        const runtime = await NativePiSessionRuntime.create({
+          settings: options.settings,
+          modelSelection: state.modelSelection,
+          runtimePolicy: state.policy,
+          ...(state.goal === null ? {} : { initialGoal: state.goal }),
+          threadId: state.appThreadId,
+          ...(sessionStore === null ? {} : { sessionStore }),
+          providerThreadId: state.providerThread.id,
+          ...(mcpSession === undefined ? {} : { mcpSession }),
+          ...(state.contextText === undefined ? {} : { contextText: state.contextText }),
+          ...(state.projectMemory === undefined ? {} : { projectMemory: state.projectMemory }),
+          readOnlyRoots: [hostService.paths.attachmentsDir],
+          onEvent: (event) => handleRuntimeEvent(state, event),
+          requestApproval: (request, signal) => requestApproval(state, request, signal),
+          requestUserInput: (input) => requestUserInput(state, input),
+          now: nowMs,
+          ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
+          ...(options.streamFn === undefined ? {} : { streamFn: options.streamFn }),
+          ...(options.sleep === undefined ? {} : { sleep: options.sleep }),
+          ...(options.scheduleTimer === undefined ? {} : { scheduleTimer: options.scheduleTimer }),
+          ...(options.random === undefined ? {} : { random: options.random }),
+        });
+        try {
+          if (closed || tearingDown) {
+            throw new Error("The Pi Native session is closed.");
+          }
+          await runtime.restorePersistedSession();
+          if (closed || tearingDown) {
+            throw new Error("The Pi Native session is closed.");
+          }
+        } catch (cause) {
+          await runtime.dispose();
+          throw cause;
+        }
+        state.runtime = runtime;
+        return runtime;
+      })();
+      state.runtimePromise = created;
+      try {
+        return applyState(state, await created);
+      } finally {
+        if (state.runtimePromise === created) state.runtimePromise = null;
+      }
     };
 
     const finishTurn = async (
@@ -1616,7 +1690,6 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
         });
       }
       state.activeTurn = null;
-      if (activeTurn === turn) activeTurn = null;
       turn.resolveDone();
     };
 
@@ -1880,8 +1953,22 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
       if (state === undefined) {
         throw new Error("Start a turn on a registered Pi Native thread.");
       }
-      state.providerThread = { ...state.providerThread, id: turnInput.providerThread.id };
-      if (activeTurn !== null) throw new Error("A Pi Native turn is already running.");
+      if (state.activeTurn !== null) {
+        throw new ProviderAdapter.ProviderAdapterProtocolError({
+          driver: DRIVER,
+          detail: "A Pi Native turn is already running on this thread.",
+          reason: "previous_turn_active",
+        });
+      }
+      // A `/clear` run adopts a new provider thread row for the same live state.
+      if (state.providerThread.id !== turnInput.providerThread.id) {
+        const previousId = state.providerThread.id;
+        if (threads.get(previousId) === state) threads.delete(previousId);
+        if (liveThreads.get(previousId) === state) liveThreads.delete(previousId);
+        state.providerThread = { ...state.providerThread, id: turnInput.providerThread.id };
+        threads.set(turnInput.providerThread.id, state);
+        liveThreads.set(turnInput.providerThread.id, state);
+      }
       const nativeTurnId = `${state.providerThread.nativeThreadRef?.nativeId ?? state.providerThread.id}:${turnInput.providerTurnOrdinal}`;
       const providerTurn: OrchestrationV2ProviderTurn = {
         id: idAllocator.derive.providerTurn({ driver: DRIVER, nativeTurnId }),
@@ -1935,7 +2022,6 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
       state.runtime?.applyProjectMemory(state.projectMemory);
       state.activeTurn = turn;
       state.lastTurn = turn;
-      activeTurn = turn;
       emit({
         type: "provider_turn.updated",
         driver: DRIVER,
@@ -2003,9 +2089,11 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
       tearingDown = true;
       for (const pending of pendingRequests.values()) pending.cancel();
       pendingRequests.clear();
-      const turn = activeTurn;
-      if (turn !== null) {
-        turn.interrupted = true;
+      const turns = [...threads.values()].flatMap((state) =>
+        state.activeTurn === null ? [] : [state.activeTurn],
+      );
+      for (const turn of turns) turn.interrupted = true;
+      for (const turn of turns) {
         await turn.state.runtime?.abort();
         // Settlement must still reach the queue, so the session closes after it.
         await finishTurn(
@@ -2014,7 +2102,9 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
           "cancelled",
         );
       }
-      for (const state of threads.values()) {
+      for (const [id, state] of threads) {
+        if (liveThreads.get(id) === state) liveThreads.delete(id);
+        await state.runtimePromise?.catch(() => undefined);
         await state.runtime?.dispose();
         state.runtime = null;
       }
@@ -2034,14 +2124,13 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
       canResumeAfterRestart: sessionStore?.durable === true,
       backgroundTasksEndWithProcess: true,
       events: Stream.fromQueue(queue),
-      hasPendingBackgroundWork: Effect.sync(
-        () =>
-          activeTurn !== null ||
-          [...threads.values()].some(
-            (state) =>
-              state.runtime?.subagents?.hasRunningSubagents() === true ||
-              state.runtime?.hasRunningBackgroundJobs === true,
-          ),
+      hasPendingBackgroundWork: Effect.sync(() =>
+        [...threads.values()].some(
+          (state) =>
+            state.activeTurn !== null ||
+            state.runtime?.subagents?.hasRunningSubagents() === true ||
+            state.runtime?.hasRunningBackgroundJobs === true,
+        ),
       ),
       hasPendingBackgroundWorkForThread: (providerThread, opts) =>
         Effect.sync(() => {
@@ -2140,7 +2229,17 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
               cause,
             }),
         });
-        yield* Effect.sync(() => beginTurn(args, runCompactionTurn));
+        yield* Effect.try({
+          try: () => beginTurn(args, runCompactionTurn),
+          catch: (cause) =>
+            new ProviderAdapter.ProviderAdapterTurnStartError({
+              driver: DRIVER,
+              threadId: args.threadId,
+              providerThreadId: args.providerThread.id,
+              runId: args.runId,
+              cause,
+            }),
+        });
       }),
       steerTurn: Effect.fn("PiNativeAdapter.steerTurn")(function* (args) {
         const state = findThread(args.providerThread);
@@ -2293,6 +2392,24 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
             }),
         }),
       rollbackThread: Effect.fn("PiNativeAdapter.rollbackThread")(function* (args) {
+        // A restarted process rolls back from the session store for a thread it never loaded.
+        if (findThread(args.providerThread) === undefined && sessionStore !== null) {
+          yield* Effect.try({
+            try: () =>
+              registerThread({
+                threadId: args.providerThread.appThreadId ?? input.threadId,
+                modelSelection: input.modelSelection,
+                runtimePolicy: input.runtimePolicy,
+                existingProviderThread: args.providerThread,
+              }),
+            catch: (cause) =>
+              new ProviderAdapter.ProviderAdapterRollbackThreadError({
+                driver: DRIVER,
+                providerThreadId: args.providerThread.id,
+                cause,
+              }),
+          });
+        }
         const state = yield* Effect.try({
           try: () => threadFor(args.providerThread),
           catch: (cause) =>
@@ -2349,15 +2466,6 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
         return snapshotOf(state, targetTurnCount);
       }),
       forkThread: Effect.fn("PiNativeAdapter.forkThread")(function* (args) {
-        const source = yield* Effect.try({
-          try: () => threadFor(args.sourceProviderThread),
-          catch: (cause) =>
-            new ProviderAdapter.ProviderAdapterForkThreadError({
-              driver: DRIVER,
-              providerThreadId: args.sourceProviderThread.id,
-              cause,
-            }),
-        });
         const targetTurnCount =
           args.providerTurnId === undefined
             ? undefined
@@ -2366,58 +2474,111 @@ export const makePiNativeAdapterV2 = Effect.fn("makePiNativeAdapterV2")(function
                 (args.sourceProviderTurns?.findIndex((turn) => turn.id === args.providerTurnId) ??
                   -1) + 1,
               );
-        const clone = source.runtime?.cloneForFork(targetTurnCount);
-        const forked = yield* Effect.try({
-          try: () =>
-            registerThread({
-              threadId: args.targetThreadId,
-              modelSelection: args.modelSelection ?? source.modelSelection,
-              runtimePolicy: args.runtimePolicy ?? source.policy,
-            }),
-          catch: (cause) =>
-            new ProviderAdapter.ProviderAdapterForkThreadError({
-              driver: DRIVER,
+        const source =
+          findThread(args.sourceProviderThread) ?? findLiveThread(args.sourceProviderThread);
+        const registerFork = (
+          modelSelection: ModelSelection,
+          policy: ProviderAdapter.ProviderAdapterV2RuntimePolicy,
+        ) =>
+          Effect.try({
+            try: () =>
+              registerThread({
+                threadId: args.targetThreadId,
+                modelSelection,
+                runtimePolicy: policy,
+              }),
+            catch: (cause) =>
+              new ProviderAdapter.ProviderAdapterForkThreadError({
+                driver: DRIVER,
+                providerThreadId: args.sourceProviderThread.id,
+                cause,
+              }),
+          });
+        const markForkedFrom = (state: ThreadState): void => {
+          state.providerThread = updateThread(state, {
+            forkedFrom: {
               providerThreadId: args.sourceProviderThread.id,
-              cause,
-            }),
-        });
-        const state = threadFor(forked);
-        state.providerThread = updateThread(state, {
-          forkedFrom: {
-            providerThreadId: args.sourceProviderThread.id,
-            ...(args.providerTurnId === undefined ? {} : { providerTurnId: args.providerTurnId }),
-          },
-        });
-        if (sessionStore !== null) {
-          if (source.runtime !== null) {
+              ...(args.providerTurnId === undefined ? {} : { providerTurnId: args.providerTurnId }),
+            },
+          });
+        };
+        const clonePersisted = (sourceProviderThreadId: string, targetProviderThreadId: string) =>
+          sessionStore === null
+            ? Effect.void
+            : sessionStore
+                .cloneThread({
+                  sourceProviderThreadId,
+                  targetProviderThreadId,
+                  ...(targetTurnCount === undefined ? {} : { targetTurnCount }),
+                })
+                .pipe(
+                  Effect.mapError(
+                    (cause) =>
+                      new ProviderAdapter.ProviderAdapterForkThreadError({
+                        driver: DRIVER,
+                        providerThreadId: args.sourceProviderThread.id,
+                        cause,
+                      }),
+                  ),
+                );
+
+        if (source !== undefined) {
+          const clone = source.runtime?.cloneForFork(targetTurnCount);
+          const forked = yield* registerFork(
+            args.modelSelection ?? source.modelSelection,
+            args.runtimePolicy ?? source.policy,
+          );
+          const state = threadFor(forked);
+          markForkedFrom(state);
+          if (sessionStore !== null && source.runtime !== null) {
             yield* Effect.promise(() => source.runtime!.persistCurrentTranscript());
           }
-          yield* sessionStore
-            .cloneThread({
-              sourceProviderThreadId: source.providerThread.id,
-              targetProviderThreadId: state.providerThread.id,
-              ...(targetTurnCount === undefined ? {} : { targetTurnCount }),
-            })
-            .pipe(
-              Effect.mapError(
-                (cause) =>
-                  new ProviderAdapter.ProviderAdapterForkThreadError({
-                    driver: DRIVER,
-                    providerThreadId: args.sourceProviderThread.id,
-                    cause,
-                  }),
-              ),
-            );
-        }
-        if (sessionStore !== null || clone !== undefined) {
-          const runtime = yield* Effect.promise(() => ensureRuntime(state));
-          if (!runtime.hasPersistedTranscript && clone !== undefined) {
-            yield* Effect.sync(() =>
-              runtime.installMessages(clone.messages, source.contextText, clone.todos),
-            );
-            yield* Effect.promise(() => runtime.persistCurrentTranscript());
+          yield* clonePersisted(source.providerThread.id, state.providerThread.id);
+          if (sessionStore !== null || clone !== undefined) {
+            const runtime = yield* Effect.promise(() => ensureRuntime(state));
+            if (!runtime.hasPersistedTranscript && clone !== undefined) {
+              yield* Effect.sync(() =>
+                runtime.installMessages(clone.messages, source.contextText, clone.todos),
+              );
+              yield* Effect.promise(() => runtime.persistCurrentTranscript());
+            }
           }
+          return state.providerThread;
         }
+
+        if (sessionStore === null) {
+          return yield* new ProviderAdapter.ProviderAdapterForkThreadError({
+            driver: DRIVER,
+            providerThreadId: args.sourceProviderThread.id,
+            cause: "This Pi Native thread is not loaded in the session.",
+          });
+        }
+        const persisted = yield* sessionStore.loadThread(args.sourceProviderThread.id).pipe(
+          Effect.mapError(
+            (cause) =>
+              new ProviderAdapter.ProviderAdapterForkThreadError({
+                driver: DRIVER,
+                providerThreadId: args.sourceProviderThread.id,
+                cause,
+              }),
+          ),
+        );
+        if (persisted === null) {
+          return yield* new ProviderAdapter.ProviderAdapterForkThreadError({
+            driver: DRIVER,
+            providerThreadId: args.sourceProviderThread.id,
+            cause: "This Pi Native thread has no persisted transcript to fork.",
+          });
+        }
+        const forked = yield* registerFork(
+          args.modelSelection ?? input.modelSelection,
+          args.runtimePolicy ?? input.runtimePolicy,
+        );
+        const state = threadFor(forked);
+        markForkedFrom(state);
+        yield* clonePersisted(args.sourceProviderThread.id, state.providerThread.id);
+        // Hydrating from the cloned snapshot is what carries the conversation into the fork.
+        yield* Effect.promise(() => ensureRuntime(state));
         return state.providerThread;
       }),
     };
