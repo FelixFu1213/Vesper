@@ -52,3 +52,19 @@ node_modules/
 .pnpm-store/
 
 /packages/ssh/.ssh-launcher-test-*/
+
+# Local IDE, hook, cache, and agent dot-directories
+.vite-hooks/
+.vscode/
+.claude/*
+!.claude/skills
+.codex/
+.opencode/
+.gemini/
+.antigravity/
+.agent/
+.playwright-mcp/
+.serena/
+.direnv/
+.cache/
+.tmp/
