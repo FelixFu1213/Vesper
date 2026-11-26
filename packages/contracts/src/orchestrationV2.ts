@@ -1,3 +1,4 @@
+import { ThreadContextBreakdown, ThreadContextBreakdownInput } from "./contextBreakdown.ts";
 import { OrchestrationMessageContext } from "./composerContext.ts";
 import { withRecordIdTable } from "./orchestrationV2IdTable.ts";
 import * as DateTime from "effect/DateTime";
@@ -4025,6 +4026,7 @@ export const ORCHESTRATION_V2_WS_METHODS = {
   getWorktreeThreadIds: "orchestration.getWorktreeThreadIds",
   getOlderSettledThreads: "orchestration.getOlderSettledThreads",
   getThreadProjection: "orchestration.getThreadProjection",
+  getThreadContextBreakdown: "orchestration.v2.getThreadContextBreakdown",
   getWorkflowScript: "orchestration.getWorkflowScript",
   getNativeChildWork: "orchestration.getNativeChildWork",
   stopWorkflow: "orchestration.stopWorkflow",
@@ -4724,6 +4726,10 @@ export const OrchestrationV2RpcSchemas = {
   getThreadProjection: {
     input: OrchestrationV2GetThreadProjectionInput,
     output: OrchestrationV2ThreadProjection,
+  },
+  getThreadContextBreakdown: {
+    input: ThreadContextBreakdownInput,
+    output: ThreadContextBreakdown,
   },
   stopWorkflow: {
     input: OrchestrationV2StopWorkflowInput,

@@ -373,7 +373,7 @@ export function useComposerMenuItems({
                 command: "context" as const,
                 label: "/context",
                 category: "panel" as const,
-                description: gt("Toggle thread details and context usage"),
+                description: gt("Toggle context breakdown panel for this thread"),
               },
             ]
           : []),

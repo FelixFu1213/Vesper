@@ -33,6 +33,7 @@ const RIGHT_PANEL_KINDS = [
   "thread",
   "linked-thread",
   "plan",
+  "context",
 ] as const;
 export type RightPanelKind = (typeof RIGHT_PANEL_KINDS)[number];
 
@@ -112,7 +113,9 @@ export type RightPanelSurface =
   /** A linked environment's thread, read through `viaEnvironmentId`; it has no thread here. */
   | LinkedThreadSurface
   /** A proposed plan of the panel's thread, shown in full beside the timeline. */
-  | PlanSurface;
+  | PlanSurface
+  /** The thread's prompt composition, measured on demand. */
+  | { id: "context"; kind: "context" };
 
 export type PlanSurface = {
   id: `plan:${string}`;
@@ -322,6 +325,8 @@ const singletonSurface = (
       return { id: "pull-requests", kind };
     case "device":
       return { id: "device", kind };
+    case "context":
+      return { id: "context", kind };
   }
 };
 

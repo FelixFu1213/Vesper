@@ -51,6 +51,7 @@ import {
   FileText,
   Globe2,
   MessagesSquare,
+  PieChartIcon,
   Plus,
   TerminalSquare,
   Volume2Icon,
@@ -158,6 +159,7 @@ export interface RightPanelTabsProps {
   onAddPullRequest: () => void;
   onAddPullRequests: () => void;
   onAddDevice: () => void;
+  onAddContext?: (() => void) | undefined;
   /** Absent where side chats are not offered. */
   onAddSideChat?: (() => void) | undefined;
   browserAvailable: boolean;
@@ -167,6 +169,7 @@ export interface RightPanelTabsProps {
   pullRequestAvailable: boolean;
   pullRequestsAvailable: boolean;
   deviceAvailable: boolean;
+  contextAvailable?: boolean;
   sideChatAvailable?: boolean;
   /** Overrides the default reason while side chats are available but cannot start. */
   sideChatDisabledReason?: string | null;
@@ -196,6 +199,7 @@ const SURFACE_DISABLED_REASONS = {
   pullRequest: msg("This thread's branch has no pull request yet."),
   pullRequests: msg("This thread has no linked items."),
   device: msg("Devices are only available from a thread."),
+  context: msg("Context breakdown is only available for server threads."),
   sideChat: msg("Side chats start after the first message."),
 } as const;
 
@@ -221,6 +225,7 @@ const SURFACE_UNAVAILABLE_HINTS = {
   pullRequest: msg("No pull request on this branch yet."),
   pullRequests: msg("No linked items available."),
   device: msg("Available from a thread."),
+  context: msg("Available for server threads."),
   sideChat: msg("Available after the first message."),
 } as const;
 
@@ -344,6 +349,7 @@ function RightPanelEmptyState(props: {
   onAddPullRequest: () => void;
   onAddPullRequests: () => void;
   onAddDevice: () => void;
+  onAddContext?: (() => void) | undefined;
   /** Absent where side chats are not offered. */
   onAddSideChat?: (() => void) | undefined;
   browserAvailable: boolean;
@@ -353,6 +359,7 @@ function RightPanelEmptyState(props: {
   pullRequestAvailable: boolean;
   pullRequestsAvailable: boolean;
   deviceAvailable: boolean;
+  contextAvailable: boolean;
   sideChatAvailable: boolean;
   sideChatDisabledReason: string | null;
 }) {
@@ -418,6 +425,19 @@ function RightPanelEmptyState(props: {
       disabledReason: messages(SURFACE_UNAVAILABLE_HINTS.device),
       onClick: props.onAddDevice,
     },
+    ...(props.onAddContext
+      ? [
+          {
+            label: msg("Context"),
+            description: msg("See what this thread's context is made of."),
+            icon: PieChartIcon,
+            shortcut: "C",
+            available: props.contextAvailable === true,
+            disabledReason: messages(SURFACE_UNAVAILABLE_HINTS.context),
+            onClick: props.onAddContext,
+          },
+        ]
+      : []),
     ...(props.onAddSideChat
       ? [
           {
@@ -623,6 +643,8 @@ function surfaceTitle(
       return /^\d+$/.test(surface.key) ? `#${surface.key}` : surface.key;
     case "device":
       return surface.title ?? surface.target?.name ?? resolve(msg("Device"));
+    case "context":
+      return resolve(msg("Context"));
     case "thread":
       // Until the thread's own title loads.
       return resolve(msg("Thread"));
@@ -729,6 +751,8 @@ function SurfaceIcon({
       return <MessagesSquare className="size-3 shrink-0" />;
     case "plan":
       return <FileText className="size-3 shrink-0" />;
+    case "context":
+      return <PieChartIcon className="size-3 shrink-0" />;
     case "device":
       return surface.target?.platform === "ios" ? (
         <AppleIcon className="size-3 shrink-0" />
@@ -1264,6 +1288,18 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
       disabledReason: messages(SURFACE_DISABLED_REASONS.device),
       onClick: props.onAddDevice,
     },
+    ...(props.onAddContext
+      ? [
+          {
+            label: msg("Context"),
+            icon: PieChartIcon,
+            shortcut: "C",
+            available: props.contextAvailable === true,
+            disabledReason: messages(SURFACE_DISABLED_REASONS.context),
+            onClick: props.onAddContext,
+          },
+        ]
+      : []),
     ...(props.onAddSideChat
       ? [
           {
@@ -1697,6 +1733,7 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
             onAddPullRequest={props.onAddPullRequest}
             onAddPullRequests={props.onAddPullRequests}
             onAddDevice={props.onAddDevice}
+            onAddContext={props.onAddContext}
             onAddSideChat={props.onAddSideChat}
             browserAvailable={props.browserAvailable}
             terminalAvailable={props.terminalAvailable}
@@ -1705,6 +1742,7 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
             pullRequestAvailable={props.pullRequestAvailable}
             pullRequestsAvailable={props.pullRequestsAvailable}
             deviceAvailable={props.deviceAvailable}
+            contextAvailable={props.contextAvailable === true}
             sideChatAvailable={props.sideChatAvailable === true}
             sideChatDisabledReason={props.sideChatDisabledReason ?? null}
           />

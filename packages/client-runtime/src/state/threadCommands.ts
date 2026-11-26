@@ -9,6 +9,7 @@ import {
   type OrchestrationV2ShellSnapshot,
 } from "@t3tools/contracts";
 
+import { createThreadContextBreakdownQuery } from "./contextBreakdown.ts";
 import { createOptimisticThreadLifecycle } from "./threadLifecycle.ts";
 import * as DateTime from "effect/DateTime";
 
@@ -80,6 +81,7 @@ export function createThreadEnvironmentAtoms<R, E>(
   snapshotAtom: (environmentId: EnvironmentId) => Atom.Atom<OrchestrationV2ShellSnapshot | null>,
 ) {
   const scheduler = createAtomCommandScheduler();
+  const contextBreakdown = createThreadContextBreakdownQuery(runtime);
   const concurrency = {
     mode: "serial" as const,
     key: ({ environmentId, input }: { environmentId: string; input: { threadId: string } }) =>
@@ -527,6 +529,7 @@ export function createThreadEnvironmentAtoms<R, E>(
   };
   return {
     ...commands,
+    contextBreakdown,
     regenerateTitle,
     rowActionsAtom,
     mcpSignedInAtom,

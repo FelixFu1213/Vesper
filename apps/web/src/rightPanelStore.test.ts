@@ -58,6 +58,22 @@ describe("rightPanelStore", () => {
     );
   });
 
+  it("opens a singleton context breakdown tab and restores it after reload", async () => {
+    const store = useRightPanelStore.getState();
+    store.open(refA, "context");
+    expect(selectActiveRightPanelSurface(useRightPanelStore.getState().byThreadKey, refA)).toEqual({
+      id: "context",
+      kind: "context",
+    });
+    await reloadRightPanelStore();
+    expect(selectActiveRightPanelSurface(useRightPanelStore.getState().byThreadKey, refA)).toEqual({
+      id: "context",
+      kind: "context",
+    });
+    useRightPanelStore.getState().toggle(refA, "context");
+    expect(selectActiveRightPanel(useRightPanelStore.getState().byThreadKey, refA)).toBeNull();
+  });
+
   it("records single and bulk tab closes, newest first", () => {
     const store = useRightPanelStore.getState();
     const pr = pullRequestSurface({

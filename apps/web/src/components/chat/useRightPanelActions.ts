@@ -177,6 +177,16 @@ export function useRightPanelActions(input: RightPanelActionsInput) {
     useRightPanelStore.getState().open(activeThreadRef, "device");
   };
   const addDeviceSurfaceStable = useStableCallback(addDeviceSurface);
+  const addContextSurface = () => {
+    if (!activeThreadRef || !isServerThread) return;
+    useRightPanelStore.getState().open(activeThreadRef, "context");
+  };
+  const addContextSurfaceStable = useStableCallback(addContextSurface);
+  const toggleContextSurface = () => {
+    if (!activeThreadRef || !isServerThread) return;
+    useRightPanelStore.getState().toggle(activeThreadRef, "context");
+  };
+  const toggleContextSurfaceStable = useStableCallback(toggleContextSurface);
   const openFileSurface = (relativePath: string) => {
     if (!activeThreadRef || !activeProject) return;
     useRightPanelStore.getState().openFile(activeThreadRef, relativePath);
@@ -363,6 +373,7 @@ export function useRightPanelActions(input: RightPanelActionsInput) {
     shortcuts,
     activateRightPanelSurfaceStable,
     addDeviceSurfaceStable,
+    addContextSurfaceStable,
     addDiffSurfaceStable,
     addFilesSurfaceStable,
     addPullRequestSurfaceStable,
@@ -379,6 +390,7 @@ export function useRightPanelActions(input: RightPanelActionsInput) {
     openChangesFromThreadPanelStable,
     openFileSurfaceStable,
     openPlanSurfaceStable,
+    toggleContextSurfaceStable,
     toggleRightPanelMaximizedStable,
     toggleRightPanelStable,
     toggleThreadPanelStable,

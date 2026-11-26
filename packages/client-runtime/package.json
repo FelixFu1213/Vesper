@@ -662,6 +662,10 @@
     "./pull-request-references": {
       "types": "./src/pullRequestReferences.ts",
       "default": "./src/pullRequestReferences.ts"
+    },
+    "./state/context-breakdown": {
+      "types": "./src/state/contextBreakdown.ts",
+      "default": "./src/state/contextBreakdown.ts"
     }
   },
   "scripts": {

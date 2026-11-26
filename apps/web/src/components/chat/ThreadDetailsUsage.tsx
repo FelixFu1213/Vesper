@@ -106,7 +106,13 @@ function InstanceRows({
 }
 
 /** The thread's context window. The bar fills as context is used; the tick marks auto-compaction. */
-export function ThreadDetailsContext({ usage }: { readonly usage: ContextWindowSnapshot }) {
+export function ThreadDetailsContext({
+  usage,
+  onOpenContext,
+}: {
+  readonly usage: ContextWindowSnapshot;
+  readonly onOpenContext?: (() => void) | undefined;
+}) {
   const maxTokens = usage.maxTokens != null && usage.maxTokens > 0 ? usage.maxTokens : null;
   const used =
     maxTokens !== null && usage.usedPercentage !== null
@@ -130,6 +136,7 @@ export function ThreadDetailsContext({ usage }: { readonly usage: ContextWindowS
       <div className="grid grid-cols-[auto_minmax(3rem,1fr)_auto] gap-x-3 text-xs">
         <UsageRow
           label={gt("Context", { $context: "context window row label" })}
+          {...(onOpenContext === undefined ? {} : { onOpen: onOpenContext })}
           fill={used}
           tone={used === null ? null : used >= 90 ? "error" : used >= 80 ? "warning" : null}
           tick={tick}
@@ -164,6 +171,9 @@ export function ThreadDetailsContext({ usage }: { readonly usage: ContextWindowS
                   {formatContextWindowCompactionMessage(threshold, m)}
                 </span>
               ) : null}
+              {onOpenContext === undefined ? null : (
+                <span className="text-muted-foreground">{gt("Inspect context breakdown")}</span>
+              )}
             </>
           }
         />
@@ -290,6 +300,7 @@ function UsageRow({
   tooltip,
   muted = false,
   opensUsage = false,
+  onOpen,
 }: {
   readonly label: string;
   /** Bar fill from 0 to 100. Null hides the bar. */
@@ -302,13 +313,14 @@ function UsageRow({
   readonly tooltip: ReactNode;
   readonly muted?: boolean;
   readonly opensUsage?: boolean;
+  readonly onOpen?: (() => void) | undefined;
 }) {
   const gt = useGT();
   const rowProps = {
     "aria-label": gt("{label}: {value}", { label, value: ariaValue }),
     className: cn(
       "col-span-3 grid h-6 grid-cols-subgrid items-center rounded-lg px-2.5 outline-none hover:bg-black/[0.035] focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring data-popup-open:bg-black/[0.035] dark:hover:bg-white/[0.08] dark:data-popup-open:bg-white/[0.08]",
-      opensUsage
+      opensUsage || onOpen !== undefined
         ? "group cursor-pointer active:bg-black/[0.06] dark:active:bg-white/[0.12]"
         : "cursor-default",
     ),
@@ -317,7 +329,13 @@ function UsageRow({
     <Tooltip>
       <TooltipTrigger
         render={
-          opensUsage ? <Link to="/usage" {...rowProps} /> : <div tabIndex={0} {...rowProps} />
+          opensUsage ? (
+            <Link to="/usage" {...rowProps} />
+          ) : onOpen !== undefined ? (
+            <button type="button" onClick={onOpen} {...rowProps} />
+          ) : (
+            <div tabIndex={0} {...rowProps} />
+          )
         }
       >
         <span className="max-w-28 truncate text-muted-foreground group-hover:text-foreground">

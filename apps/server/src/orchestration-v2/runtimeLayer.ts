@@ -56,6 +56,7 @@ import * as RunFinalizationService from "./RunFinalizationService.ts";
 import * as ResourceCleanupService from "./ResourceCleanupService.ts";
 import * as RuntimePolicy from "./RuntimePolicy.ts";
 import * as RuntimeRequestService from "./RuntimeRequestService.ts";
+import * as ThreadContextBreakdownService from "./ThreadContextBreakdownService.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 import * as ThreadLaunchService from "./ThreadLaunchService.ts";
 import * as ThreadForkService from "./ThreadForkService.ts";
@@ -402,6 +403,12 @@ const layerMcpSignInProvided = McpSignIn.layer.pipe(
   Layer.provide(Layer.merge(layerThreadManagementProvided, layerProviderSessionManagerProvided)),
 );
 
+const layerThreadContextBreakdownProvided = ThreadContextBreakdownService.layer.pipe(
+  Layer.provide(
+    Layer.mergeAll(ProjectionStore.layer, ProjectStore.layer, layerProjectMemoryService),
+  ),
+);
+
 export const layer = Layer.mergeAll(
   layerCommandOutputHubProvided,
   layerOrchestratorProvided,
@@ -417,6 +424,7 @@ export const layer = Layer.mergeAll(
 );
 
 export const layerProduction = Layer.mergeAll(
+  layerThreadContextBreakdownProvided,
   WorktreeBranchSync.layer.pipe(
     Layer.provide(Layer.merge(layerThreadManagementProvided, ProjectionStore.layer)),
   ),
