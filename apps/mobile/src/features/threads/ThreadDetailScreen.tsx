@@ -258,6 +258,8 @@ export interface ThreadDetailScreenProps {
   readonly providerSubagentStatus?: ProviderSubagentStatus | null;
   readonly extensionStatuses?: NonNullable<OrchestrationV2ProviderSession["extensionStatuses"]>;
   readonly isCompacting: boolean;
+  readonly contextWindow?: ThreadComposerProps["contextWindow"];
+  readonly replySpeed?: ThreadComposerProps["replySpeed"];
   /** Set while the next send compacts the thread first. */
   readonly compactBeforeSend?: ThreadComposerProps["compactBeforeSend"];
   readonly creationState:
@@ -1932,6 +1934,8 @@ function ThreadDetailBody(
                         environmentLabel={props.environmentLabel}
                         selectedThread={props.selectedThread}
                         compactBeforeSend={props.compactBeforeSend ?? null}
+                        contextWindow={props.contextWindow ?? null}
+                        replySpeed={props.replySpeed ?? null}
                         hasCompactableConversation={
                           hasCompactableConversation && !props.isCompacting
                         }

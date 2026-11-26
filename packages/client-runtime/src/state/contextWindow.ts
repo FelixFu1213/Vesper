@@ -238,6 +238,109 @@ export function deriveLatestContextWindowSnapshot(
   return null;
 }
 
+export interface ReplySpeedSnapshot {
+  readonly tokensPerSecond: number;
+  readonly outputTokens: number;
+  readonly durationMs: number;
+}
+
+/**
+ * Formats an output generation rate for compact display (e.g. `42.5`, `128`).
+ */
+export function formatTokensPerSecond(tokensPerSecond: number): string {
+  if (!Number.isFinite(tokensPerSecond) || tokensPerSecond <= 0) {
+    return "0";
+  }
+  if (tokensPerSecond >= 100) {
+    return `${Math.round(tokensPerSecond)}`;
+  }
+  if (tokensPerSecond >= 10) {
+    return tokensPerSecond.toFixed(1).replace(/\.0$/, "");
+  }
+  return tokensPerSecond.toFixed(1);
+}
+
+/**
+ * Resolves the rounded context-window percentage (0–100) when maxTokens is known.
+ */
+export function resolveContextUsedPercentage(
+  contextWindow: Pick<ContextWindowSnapshot, "maxTokens" | "usedPercentage"> | null | undefined,
+): number | null {
+  if (
+    contextWindow == null ||
+    contextWindow.maxTokens == null ||
+    contextWindow.maxTokens <= 0 ||
+    contextWindow.usedPercentage == null
+  ) {
+    return null;
+  }
+  return Math.round(Math.max(0, Math.min(100, contextWindow.usedPercentage)));
+}
+
+/**
+ * Derives the latest LLM reply output speed (tokens/s) on the active provider thread.
+ */
+export function deriveLatestReplySpeedSnapshot(
+  turns: ReadonlyArray<
+    Pick<
+      OrchestrationV2ProviderTurn,
+      "providerThreadId" | "ordinal" | "startedAt" | "completedAt" | "tokenUsage" | "turnTokenUsage"
+    >
+  >,
+  providerThread?: Pick<OrchestrationV2ProviderThread, "id" | "contextUsage"> | null,
+): ReplySpeedSnapshot | null {
+  let bestTurnOrdinal = -1;
+  let bestSnapshot: ReplySpeedSnapshot | null = null;
+
+  for (const turn of turns) {
+    if (providerThread != null && turn.providerThreadId !== providerThread.id) continue;
+    if (turn.startedAt === null) continue;
+    const outputTokens =
+      asFiniteNumber(turn.turnTokenUsage?.outputTokens) ??
+      asFiniteNumber(turn.tokenUsage?.outputTokens);
+    if (outputTokens === null || outputTokens <= 0) continue;
+
+    const startedAtMs = DateTime.toEpochMillis(turn.startedAt);
+    const endedAtMs =
+      turn.completedAt !== null
+        ? DateTime.toEpochMillis(turn.completedAt)
+        : turn.tokenUsage?.updatedAt !== undefined
+          ? Date.parse(turn.tokenUsage.updatedAt)
+          : Number.NaN;
+    if (!Number.isFinite(endedAtMs)) continue;
+
+    const durationMs = endedAtMs - startedAtMs;
+    if (durationMs <= 0) continue;
+
+    const tokensPerSecond = outputTokens / (durationMs / 1000);
+    if (!Number.isFinite(tokensPerSecond) || tokensPerSecond <= 0) continue;
+
+    if (turn.ordinal >= bestTurnOrdinal) {
+      bestTurnOrdinal = turn.ordinal;
+      bestSnapshot = { tokensPerSecond, outputTokens, durationMs };
+    }
+  }
+
+  if (bestSnapshot !== null) {
+    return bestSnapshot;
+  }
+
+  const providerUsage = providerThread?.contextUsage;
+  if (providerUsage != null) {
+    const outputTokens =
+      asFiniteNumber(providerUsage.lastOutputTokens) ?? asFiniteNumber(providerUsage.outputTokens);
+    const durationMs = asFiniteNumber(providerUsage.durationMs);
+    if (outputTokens !== null && outputTokens > 0 && durationMs !== null && durationMs > 0) {
+      const tokensPerSecond = outputTokens / (durationMs / 1000);
+      if (Number.isFinite(tokensPerSecond) && tokensPerSecond > 0) {
+        return { tokensPerSecond, outputTokens, durationMs };
+      }
+    }
+  }
+
+  return null;
+}
+
 export function hasDismissedResumeCompaction(
   activities: ReadonlyArray<{ readonly kind: string; readonly payload: unknown }>,
 ): boolean {

@@ -167,6 +167,12 @@ export function useProposedPlanActions(input: UseProposedPlanActionsInput) {
       },
     ]);
 
+    const finishPlanExecution = () => {
+      sendInFlightRef.current = false;
+      setIsApproving(false);
+      resetLocalDispatch();
+    };
+
     try {
       const settingsResult = await persistThreadSettingsForNextTurn({
         threadId: threadIdForSend,
@@ -206,7 +212,10 @@ export function useProposedPlanActions(input: UseProposedPlanActionsInput) {
         failure = startResult._tag === "Failure" ? startResult : null;
       }
 
-      if (failure === null) return true;
+      if (failure === null) {
+        finishPlanExecution();
+        return true;
+      }
 
       setOptimisticUserMessages((existing) =>
         existing.filter((message) => message.id !== messageIdForSend),
@@ -218,11 +227,11 @@ export function useProposedPlanActions(input: UseProposedPlanActionsInput) {
           error instanceof Error ? error.message : m(msg("Failed to start plan execution.")),
         );
       }
+      finishPlanExecution();
       return false;
-    } finally {
-      sendInFlightRef.current = false;
-      setIsApproving(false);
-      resetLocalDispatch();
+    } catch (error) {
+      finishPlanExecution();
+      throw error;
     }
   };
 
@@ -249,6 +258,12 @@ export function useProposedPlanActions(input: UseProposedPlanActionsInput) {
     sendInFlightRef.current = true;
     setIsApproving(true);
     beginLocalDispatch({ preparingWorktree: false });
+
+    const finishPlanExecution = () => {
+      sendInFlightRef.current = false;
+      setIsApproving(false);
+      resetLocalDispatch();
+    };
 
     try {
       const createResult = await createThread({
@@ -330,6 +345,7 @@ export function useProposedPlanActions(input: UseProposedPlanActionsInput) {
             interactionMode: "default",
           });
         }
+        finishPlanExecution();
         return;
       }
 
@@ -356,10 +372,10 @@ export function useProposedPlanActions(input: UseProposedPlanActionsInput) {
           }),
         );
       }
-    } finally {
-      sendInFlightRef.current = false;
-      setIsApproving(false);
-      resetLocalDispatch();
+      finishPlanExecution();
+    } catch (error) {
+      finishPlanExecution();
+      throw error;
     }
   };
 

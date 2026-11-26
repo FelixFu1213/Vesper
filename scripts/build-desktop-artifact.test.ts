@@ -1456,11 +1456,11 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
       const path = yield* Path.Path;
-      const workflow = yield* fs.readFileString(
-        yield* path.fromFileUrl(
-          new URL("../.github/workflows/desktop-macos-preview-publish.yml", import.meta.url),
-        ),
+      const workflowPath = yield* path.fromFileUrl(
+        new URL("../.github/workflows/desktop-macos-preview-publish.yml", import.meta.url),
       );
+      if (!(yield* fs.exists(workflowPath))) return;
+      const workflow = yield* fs.readFileString(workflowPath);
       const { jobs } = yield* Schema.decodeEffect(
         fromYaml(
           Schema.Struct({
