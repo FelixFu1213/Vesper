@@ -27,6 +27,7 @@ import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
 import { buildPiRpcLaunch, resolvePiLaunchArgs } from "./mcpInjection.ts";
+import { ensurePiProjectTrusted } from "./trust.ts";
 import {
   makePiRpcConnection,
   PiRpcError,
@@ -306,6 +307,11 @@ export const discoverPiCommandsForCwd = Effect.fn("discoverPiCommandsForCwd")(
     if (!launchArgs.ok) {
       return yield* new PiRpcError({ operation: "launch", detail: launchArgs.message });
     }
+    yield* ensurePiProjectTrusted({
+      cwd,
+      environment,
+      launchArgs: launchArgs.args,
+    });
     const connection = yield* makePiDiscoveryConnection(
       piSettings,
       providerProbeEnvironment(environment),
