@@ -419,7 +419,7 @@ export const buildInitialPiProviderSnapshot = Effect.fn(
         version: null,
         status: "warning",
         auth: { status: "unknown" },
-        message: "Pi is disabled in T3 Code settings.",
+        message: "Pi is disabled in Vesper settings.",
       },
     });
   }
@@ -458,7 +458,7 @@ export const checkPiProviderStatus = Effect.fn("checkPiProviderStatus")(function
         version: null,
         status: "warning",
         auth: { status: "unknown" },
-        message: "Pi is disabled in T3 Code settings.",
+        message: "Pi is disabled in Vesper settings.",
       },
     });
   }
@@ -536,7 +536,7 @@ export const checkPiProviderStatus = Effect.fn("checkPiProviderStatus")(function
         version: null,
         status: "error",
         auth: { status: "unknown" },
-        message: "T3 Code could not determine the Pi version. Update Pi, then refresh its status.",
+        message: "Vesper could not determine the Pi version. Update Pi, then refresh its status.",
       },
     });
   }
@@ -611,7 +611,7 @@ export const checkPiProviderStatus = Effect.fn("checkPiProviderStatus")(function
         status: "ready",
         auth: { status: "unknown" },
         message:
-          "Pi is available, but T3 Code could not refresh its models and commands. The live session will retry startup.",
+          "Pi is available, but Vesper could not refresh its models and commands. The live session will retry startup.",
       },
     });
   }
