@@ -1,16 +1,16 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>com.t3tools.t3code</id>
+  <id>com.t3tools.vesper</id>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>MIT</project_license>
-  <name>T3 Code</name>
+  <name>Vesper</name>
   <summary>Desktop GUI for coding agents</summary>
   <developer id="com.t3tools">
     <name>T3 Tools Inc.</name>
   </developer>
   <description>
     <p>
-      T3 Code is an open-source desktop app for coding agents. Work with your
+      Vesper is an open-source desktop app for coding agents. Work with your
       existing agent subscriptions, review code changes, and run commands in
       your projects.
     </p>
@@ -18,10 +18,10 @@
       Connect from desktop, web, or mobile to continue working remotely.
     </p>
   </description>
-  <launchable type="desktop-id">t3code.desktop</launchable>
-  <icon type="stock">t3code</icon>
+  <launchable type="desktop-id">vesper.desktop</launchable>
+  <icon type="stock">vesper</icon>
   <provides>
-    <binary>t3code</binary>
+    <binary>vesper</binary>
   </provides>
   <categories>
     <category>Development</category>

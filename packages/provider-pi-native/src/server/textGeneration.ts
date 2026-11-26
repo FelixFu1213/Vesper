@@ -34,7 +34,7 @@ import { resolvePiNativeBuiltinModel } from "./status.ts";
 const TEXT_GENERATION_TIMEOUT_MS = 180_000;
 
 const PI_NATIVE_TEXT_GENERATION_SYSTEM_PROMPT =
-  "You generate short machine-readable content for T3 Code. Reply with only the requested JSON object.";
+  "You generate short machine-readable content for Vesper. Reply with only the requested JSON object.";
 
 const REASONING_LEVELS: ReadonlySet<string> = new Set([
   "minimal",

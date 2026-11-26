@@ -205,7 +205,7 @@ describe("buildT3SystemSections", () => {
     });
 
     assert.include(sections.runtime ?? "", "runtime_info");
-    assert.include(sections.runtime ?? "", "T3 Code orchestration");
+    assert.include(sections.runtime ?? "", "Vesper orchestration");
     assert.equal(sections.custom_append, "append rules");
     assert.equal(sections.project_instructions, "project rules");
     assert.equal(sections.skills, "skill: orca-cli");
@@ -328,7 +328,7 @@ describe("buildT3SystemSections", () => {
     assert.isUndefined(sections.skills);
     assert.isUndefined(sections.tool_activation);
     assert.isUndefined(sections.context);
-    assert.notInclude(sections.runtime ?? "", "T3 Code orchestration");
+    assert.notInclude(sections.runtime ?? "", "Vesper orchestration");
     assert.deepEqual(
       Object.keys(sections),
       CANONICAL_SYSTEM_SECTIONS.filter((name) => sections[name] !== undefined),

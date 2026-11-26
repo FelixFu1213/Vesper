@@ -402,7 +402,7 @@ export const buildInitialPiNativeProviderSnapshot = (
         auth: { status: "unknown" },
         message: settings.enabled
           ? "Checking Pi Native availability..."
-          : "Pi Native is disabled in T3 Code settings.",
+          : "Pi Native is disabled in Vesper settings.",
       },
       false,
     ),
@@ -443,7 +443,7 @@ export const checkPiNativeProviderStatus = Effect.fn("checkPiNativeProviderStatu
         version: null,
         status: "warning",
         auth: { status: "unknown" },
-        message: "Pi Native is disabled in T3 Code settings.",
+        message: "Pi Native is disabled in Vesper settings.",
       },
       false,
       [],

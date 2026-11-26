@@ -191,8 +191,7 @@ function SidebarBrandMark({ onBackdrop }: { onBackdrop: boolean }) {
           onBackdrop ? "text-white" : "text-foreground",
         )}
       >
-        {/* oxlint-disable-next-line t3code/no-untranslated-copy -- product wordmark */}
-        {"Vesper"}
+        Vesper
       </span>
     </span>
   );
