@@ -206,6 +206,8 @@ export const PiDriver: ProviderDriver<PiSettings, PiDriverEnv, Path.Path> = {
               snapshot.getSnapshot,
               discoverPiCommandsForCwd(effectiveConfig, processEnv, workspaceCwd).pipe(
                 Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+                Effect.provideService(FileSystem.FileSystem, fileSystem),
+                Effect.provideService(Path.Path, pathService),
                 Effect.mapError(
                   (cause) =>
                     new ProviderDriverError({
