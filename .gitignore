@@ -56,8 +56,11 @@ node_modules/
 # Local IDE, hook, cache, and agent dot-directories
 .vite-hooks/
 .vscode/
-.claude/*
-!.claude/skills
+.claude/
+.cursor/
+.agents/
+.macroscope/
+.devcontainer/
 .codex/
 .opencode/
 .gemini/
