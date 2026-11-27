@@ -319,11 +319,9 @@ jobs:
               sys.stdout.write(line.encode("ascii", "backslashreplace").decode("ascii"))
           '
 
-  # The web suite is the largest outside the server. In the shared Test job it
-  # started last and ran alone for about 40s after everything else finished.
-  # Browser tests are bound by the Vite server transforming modules for each
-  # file, not by Chromium, so a second runner (and Vite server) halves the job
-  # that gated every run.
+  # The web suite is the largest outside the server. Splitting it across 4
+  # runners bounds per-runner Chromium memory usage on 16 GiB ubuntu-24.04
+  # runners and keeps the Vite transform/test wall time in line with server shards.
   test_web:
     name: Test Web ${{ matrix.shard }}
     needs: changes
@@ -333,7 +331,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2]
+        shard: [1, 2, 3, 4]
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
