@@ -292,10 +292,6 @@ function clearOutput(current: TerminalOutputState, maxBufferBytes: number): Term
 }
 
 /** Everything a fresh emulator replays: retained output from outside any control sequence. */
-export function terminalOutputReplay(output: TerminalOutputState): string {
-  const text = output.chunks.map((chunk) => chunk.data).join("");
-  return text.slice(terminalSequenceEnd(output.sequenceState, text));
-}
 
 /** The output as plain text, for surfaces that do not interpret escape sequences. */
 export function terminalOutputText(output: TerminalOutputState): string {
