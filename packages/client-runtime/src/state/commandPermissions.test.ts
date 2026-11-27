@@ -32,7 +32,11 @@ import * as Layer from "effect/Layer";
 import { Atom, AtomRegistry, AsyncResult } from "effect/reactivity";
 import { EnvironmentRegistry } from "../connection/registry.ts";
 import { createCommandPermissions } from "./commandPermissions.ts";
-import { createEnvironmentRpcCommand, runAtomCommand } from "./runtime.ts";
+import {
+  createEnvironmentRpcCommand,
+  createEnvironmentRpcQueryAtomFamily,
+  runAtomCommand,
+} from "./runtime.ts";
 import { AVAILABLE_CONNECTION_STATE, BearerConnectionTarget } from "../connection/model.ts";
 import { createPeerLinkEnvironmentAtoms } from "./peerLinks.ts";
 
@@ -641,5 +645,69 @@ it.effect("rejects protected unary and streamed RPCs outside a guarded command",
     }).pipe(Stream.runDrain, Effect.provideService(EnvironmentSupervisor, supervisor), Effect.flip);
     expect(streamed._tag).toBe("EnvironmentAuthorizationError");
     expect(writes).toBe(0);
+  }),
+);
+
+it.effect("lets a guarded read in a query atom use the session's own grant", () =>
+  Effect.gen(function* () {
+    const registry = yield* setup;
+    const threadId = ThreadId.make("thread");
+    const client = {
+      [ORCHESTRATION_V2_WS_METHODS.getThreadContextBreakdown]: vi.fn(() =>
+        Effect.succeed({
+          threadId,
+          driver: null,
+          model: null,
+          fidelity: "estimated" as const,
+          computedAt: DateTime.makeUnsafe(0),
+          window: {
+            usedTokens: 12,
+            maxTokens: null,
+            autoCompactThreshold: null,
+            reserveTokens: null,
+          },
+          categories: [],
+          items: [],
+        }),
+      ),
+    };
+    const supervisor = {
+      target: new BearerConnectionTarget({
+        environmentId: env,
+        label: "Test",
+        connectionId: "test",
+      }),
+      session: yield* SubscriptionRef.make(Option.some({ client } as unknown as RpcSession)),
+      state: yield* SubscriptionRef.make({
+        ...AVAILABLE_CONNECTION_STATE,
+        phase: "connected" as const,
+      }),
+    } as EnvironmentSupervisor["Service"];
+    const queryRuntime = Atom.runtime(
+      Layer.succeed(EnvironmentRegistry, {
+        run: (_id: EnvironmentId, effect: Effect.Effect<unknown>) =>
+          Effect.provideService(effect, EnvironmentSupervisor, supervisor),
+        followStream: (_id: EnvironmentId, stream: Stream.Stream<unknown>) =>
+          Stream.provideService(stream, EnvironmentSupervisor, supervisor),
+      } as unknown as EnvironmentRegistry["Service"]),
+    );
+    const breakdown = createEnvironmentRpcQueryAtomFamily(queryRuntime, {
+      label: "test:context-breakdown",
+      tag: ORCHESTRATION_V2_WS_METHODS.getThreadContextBreakdown,
+    });
+    const atom = breakdown({ environmentId: env, input: { threadId } });
+    registry.mount(atom);
+    registry.set(
+      sessions(env),
+      AsyncResult.success({
+        ...grant(false),
+        scopes: [AuthOrchestrationReadScope],
+        permissions: [AuthOrchestrationReadScope],
+      }),
+    );
+    expect(yield* AtomRegistry.getResult(registry, atom, { suspendOnWaiting: true })).toMatchObject(
+      { threadId, window: { usedTokens: 12 } },
+    );
+    expect(client[ORCHESTRATION_V2_WS_METHODS.getThreadContextBreakdown]).toHaveBeenCalledOnce();
   }),
 );
