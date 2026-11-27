@@ -19,7 +19,7 @@ export default defineConfig((ctx) => ({
     path_filters: ["!.repos/**"],
     path_instructions: [
       {
-        path: "{apps,packages,infra}/**/*.ts",
+        path: "{apps,packages}/**/*.ts",
         instructions: "Hold changed code to the rules in docs/internals/effect-services.md.",
       },
       {
@@ -36,9 +36,9 @@ export default defineConfig((ctx) => ({
   knowledge_base: {
     code_guidelines: {
       filePatterns: [
-        { files: "docs/internals/effect-services.md", applyTo: "{apps,packages,infra}/**/*.ts" },
+        { files: "docs/internals/effect-services.md", applyTo: "{apps,packages}/**/*.ts" },
         { files: "docs/internals/web-ui.md", applyTo: "apps/web/src/**/*.{tsx,css}" },
-        { files: "docs/internals/testing.md", applyTo: "{apps,packages,infra}/**/*.{ts,tsx}" },
+        { files: "docs/internals/testing.md", applyTo: "{apps,packages}/**/*.{ts,tsx}" },
       ],
     },
   },

@@ -105,8 +105,11 @@ const browserTestProject = {
   extends: true,
   // Pre-bundle lazy browser and worker dependencies to avoid mid-run reloads.
   optimizeDeps: {
+    entries: ["index.html", "../../packages/shared/src/markdownPipeline.ts"],
     include: [
       "vite-plus/test/browser",
+      "@effect/vitest",
+      "effect/testing",
       "@base-ui/react/autocomplete",
       "saxes",
       "@betteroffice/docx/editor",
