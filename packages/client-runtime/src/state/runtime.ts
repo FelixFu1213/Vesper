@@ -743,6 +743,21 @@ export function environmentSessionGenerationAtom<R, ER>(
   return family(environmentId);
 }
 
+/**
+ * The guard Reference denies by default, so each boundary that runs a guarded request installs
+ * it. Queries are boundaries too: without one here, a guarded read reports a scope the
+ * connection already holds.
+ */
+const permissionsGuardOf = <R, ER>(
+  runtime: Atom.AtomRuntime<EnvironmentRegistry.EnvironmentRegistry | R, ER>,
+  registry: AtomRegistry.AtomRegistry,
+) =>
+  RpcPermissionGuard.of({
+    authorize: Effect.fn("RpcPermissionGuard.authorize")((environmentId, method, input) =>
+      createCommandPermissions(runtime, method).authorize(registry, environmentId, input),
+    ),
+  });
+
 export function createEnvironmentQueryAtomFamily<R, ER, Input, A, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry.EnvironmentRegistry | R, ER>,
   options: EnvironmentQueryAtomOptions<
@@ -819,7 +834,13 @@ export function createEnvironmentQueryAtomFamily<R, ER, Input, A, E>(
                           AsyncResult.value,
                         ),
                       )
-                      .pipe(pendingOnceSessionReplaced(session.value)),
+                      .pipe(
+                        pendingOnceSessionReplaced(session.value),
+                        Effect.provideService(
+                          RpcPermissionGuard,
+                          permissionsGuardOf(runtime, get.registry),
+                        ),
+                      ),
                   )
                 : Effect.never;
             case "connecting":
@@ -1166,10 +1187,7 @@ export function createEnvironmentRpcCommand<
             options.execute?.(input, registry, environmentId) ?? requestGuarded(options.tag, input)
           );
         }),
-        Effect.provideService(RpcPermissionGuard, {
-          authorize: (id, method, payload) =>
-            createCommandPermissions(runtime, method).authorize(registry, id, payload),
-        }),
+        Effect.provideService(RpcPermissionGuard, permissionsGuardOf(runtime, registry)),
         Effect.tap(
           (result) => options.onSuccess?.(target, registry, result, started) ?? Effect.void,
         ),
